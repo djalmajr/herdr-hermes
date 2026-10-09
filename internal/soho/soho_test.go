@@ -587,3 +587,56 @@ func TestSohoEventsNonZeroExit(t *testing.T) {
 		t.Error("Events exit 3: err = nil, want error")
 	}
 }
+
+// TestSohoRunDrainDoneAfterLookPathFailure: after a Run whose LookPath
+// failed, DrainDone is non-nil and already closed, so a caller that
+// must not lose output can wait on it after any early return without
+// blocking; the same holds after a previous successful run on the same
+// Runner, and the failed run does not report the previous run's
+// channel.
+func TestSohoRunDrainDoneAfterLookPathFailure(t *testing.T) {
+	r := soho.Runner{Bin: "no-such-herdr-soho-binary", Environ: childEnv}
+	_, err := r.Run(context.Background(), []string{"job", "status", "--id", "J1"}, nil, io.Discard, io.Discard, 10*time.Second)
+	var ue *soho.ErrUnavailable
+	if !errors.As(err, &ue) {
+		t.Fatalf("Run: err = %v, want ErrUnavailable", err)
+	}
+	d := r.DrainDone()
+	if d == nil {
+		t.Fatalf("DrainDone after the failed LookPath = nil, want a closed channel")
+	}
+	select {
+	case <-d:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("DrainDone after the failed LookPath is not already closed")
+	}
+	// After a previous successful run on the same Runner: the failed
+	// run replaces the channel (it never refers to the previous run)
+	// and the new channel is already closed.
+	exe, _ := installFake(t, fakesoho.Rule{Argv: []string{"job", "status", "--id", "J1"}, Code: 0})
+	r2 := soho.Runner{Bin: exe, Environ: childEnv}
+	var out bytes.Buffer
+	if _, err := r2.Run(context.Background(), []string{"job", "status", "--id", "J1"}, nil, &out, io.Discard, 10*time.Second); err != nil {
+		t.Fatalf("successful Run: %v", err)
+	}
+	waitDrain(t, r2)
+	prev := r2.DrainDone()
+	if prev == nil {
+		t.Fatalf("DrainDone after the successful run = nil, want a channel")
+	}
+	r2.Bin = "no-such-herdr-soho-binary"
+	_, err = r2.Run(context.Background(), []string{"job", "status", "--id", "J1"}, nil, &out, io.Discard, 10*time.Second)
+	var ue2 *soho.ErrUnavailable
+	if !errors.As(err, &ue2) {
+		t.Fatalf("second Run: err = %v, want ErrUnavailable", err)
+	}
+	d = r2.DrainDone()
+	if d == nil || d == prev {
+		t.Fatalf("DrainDone after the failed run: got the previous run's channel (or nil), want a fresh closed channel")
+	}
+	select {
+	case <-d:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("DrainDone after the failed run is not already closed")
+	}
+}

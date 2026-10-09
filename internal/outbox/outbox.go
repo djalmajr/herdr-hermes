@@ -102,10 +102,7 @@ func Open(dir string, opts Options) (*Store, error) {
 		opts.LockTimeout = defaultLockTimeout
 	}
 	if !opts.ReadOnly {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, err
-		}
-		if err := os.Chmod(dir, 0o700); err != nil {
+		if err := ensureDir(dir); err != nil {
 			return nil, err
 		}
 	}
@@ -900,19 +897,34 @@ func WriteFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-// Friction appends one line "<ts>\t<cmd>\t<msg>" to friction.log in dir.
+// ensureDir creates dir with mode 0700 when missing (parents included)
+// and leaves it 0700: the state directory setup, shared by Open and
+// Friction.
+func ensureDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
+}
+
+// Friction appends one line "<ts>\t<cmd>\t<msg>" to friction.log in dir,
+// creating dir when it is missing (mode 0700, as the state directory is).
 // Best effort: errors are ignored. Callers must never pass secrets.
 func Friction(dir, cmd, msg string) {
 	scrub := func(s string) string {
 		return sanitize(s)
 	}
 	line := time.Now().Format(TSLayout) + "\t" + scrub(cmd) + "\t" + scrub(msg) + "\n"
+	if err := ensureDir(dir); err != nil {
+		return
+	}
 	f, err := os.OpenFile(filepath.Join(dir, "friction.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 	_, _ = f.WriteString(line)
+	_ = f.Sync()
 }
 
 // sanitize removes newlines and tabs so one friction line stays one line.

@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/djalmajr/herdr-hermes/internal/config"
@@ -152,50 +151,31 @@ func cmdJob(args []string, env Env) int {
 		return 2
 	}
 	runner := soho.Runner{Bin: cfg.HerdrSohoBin, Environ: childEnviron(env)}
-	// stalled records that the consumer of the child's output may still
-	// be stalled: the grace period fired on a zero exit, or the bounded
-	// delivery wait below tripped. From then on the forwarder's own lines
-	// are written without blocking the command, because a stalled stdout
-	// and stderr (often one pipe) must not hold it past its bounds; such a
-	// line may be lost if the consumer never resumes, and the friction
-	// line keeps the diagnostic.
-	var stalled atomic.Bool
-	emit := func(w io.Writer, line string) {
-		if stalled.Load() {
-			go func() { _, _ = io.WriteString(w, line) }()
-			return
-		}
-		_, _ = io.WriteString(w, line)
-	}
-	// diagnose records a possibly truncated output: one friction line
-	// (not under NOWRITE) and one stderr line.
-	diagnose := func(msg string) {
-		stalled.Store(true)
+	// pendingDiag remembers the one diagnostic the runner reports
+	// inside Run (a zero exit whose output did not drain within the
+	// runner's grace period): the friction line is written immediately
+	// when not under NOWRITE (a file write, never the CLI's stdout or
+	// stderr), and the stderr line is written once, synchronously,
+	// after the delivery has completed and before the command returns.
+	var pendingDiag string
+	runner.Diag = func(msg string) {
 		if !nowrite {
 			outbox.Friction(outbox.StateDir(env.ConfigDir), "job", msg)
 		}
-		emit(env.Stderr, "herdr-hermes: "+msg+"\n")
+		pendingDiag = msg
 	}
-	// A successful exit whose output did not drain within the grace
-	// period is diagnosed, under NOWRITE too, so the delivery wait below
-	// is skipped in that case (it would sit behind the stalled consumer).
-	runner.Diag = diagnose
-	// awaitDelivery waits for the runner's delivery of the child's
-	// output to the env's writers to finish, so the bytes on env.Stdout
+	// awaitDelivery waits for the delivery of the child's output to
+	// env.Stdout and env.Stderr to finish, so the bytes on the writers
 	// are complete before the command returns. The delivery to the
 	// capture buffer needs no wait (it is written on the copy path);
-	// this only orders the consumer delivery. It is skipped once the
-	// consumer may be stalled; when the bounded wait trips, the output
-	// is diagnosed and the command returns anyway.
+	// this only orders the consumer delivery. The child is bounded (the
+	// context deadline plus the runner's WaitDelay), so what it wrote is
+	// finite, and the delivery of it follows the consumer: a consumer
+	// that never reads holds the CLI exactly as it would hold
+	// herdr-soho run directly. No byte the child wrote is dropped and
+	// no exit code is returned before the delivery ends.
 	awaitDelivery := func() {
-		if stalled.Load() {
-			return
-		}
-		select {
-		case <-runner.DrainDone():
-		case <-time.After(deliveryWait):
-			diagnose(fmt.Sprintf("herdr-soho job %s output did not finish delivering within %s; output may be truncated", sub, deliveryWait))
-		}
+		<-runner.DrainDone()
 	}
 	var stdoutBuf bytes.Buffer
 	// The capture is written on the copy path, so the bookkeeping
@@ -225,32 +205,39 @@ func cmdJob(args []string, env Env) int {
 			// child's bytes stay as they are); the cause stays in the
 			// stderr diagnostic. No bookkeeping on this path. Await the
 			// delivery first so the forwarder's own lines do not
-			// interleave with the child's bytes on the env's writers.
+			// interleave with the child's bytes on the env's writers;
+			// they are written synchronously on this goroutine once the
+			// delivery is done.
 			awaitDelivery()
-			emit(env.Stderr, fmt.Sprintf("herdr-hermes: herdr-soho job %s killed after %s\n", sub, de.Bound))
+			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: herdr-soho job %s killed after %s\n", sub, de.Bound)
 			if stdoutBuf.Len() == 0 {
-				emit(env.Stdout, fmt.Sprintf(`{"status":"timeout","motivo":"herdr-soho job %s did not finish within %s"}`+"\n", sub, de.Bound))
+				_, _ = fmt.Fprintf(env.Stdout, `{"status":"timeout","motivo":"herdr-soho job %s did not finish within %s"}`+"\n", sub, de.Bound)
 			}
 			return jobapi.ExitUnavailable
 		}
 		awaitDelivery()
 		motivo := "herdr-soho job " + sub + ": " + rerr.Error()
-		emit(env.Stderr, "herdr-hermes: "+motivo+"\n")
-		emit(env.Stdout, mustJSON(errorLine{Status: itoa(2), Motivo: motivo})+"\n")
+		_, _ = io.WriteString(env.Stderr, "herdr-hermes: "+motivo+"\n")
+		_, _ = io.WriteString(env.Stdout, mustJSON(errorLine{Status: itoa(2), Motivo: motivo})+"\n")
 		return 2
 	}
 	// Bookkeeping after a successful forward; it never changes the exit
-	// code or the stdout above, and it is skipped under NOWRITE.
+	// code or the stdout above, and it is skipped under NOWRITE. It runs
+	// from the Capture buffer, before the delivery wait, so a successful
+	// start is tracked while the consumer delivery is still in flight.
 	if !nowrite {
 		bookkeepJob(sub, rest, cfg, env, &stdoutBuf, exit)
 	}
 	awaitDelivery()
+	// The pending diagnostic (if any) is written after the delivery and
+	// before the return: one stderr line, synchronously, under NOWRITE
+	// too (the friction line, when not under NOWRITE, was already
+	// written immediately inside Run).
+	if pendingDiag != "" {
+		_, _ = io.WriteString(env.Stderr, "herdr-hermes: "+pendingDiag+"\n")
+	}
 	return exit
 }
-
-// deliveryWait bounds how long the forwarder waits for the child's output
-// to reach its stdout and stderr after the child exited.
-var deliveryWait = 10 * time.Second
 
 // childEnviron returns the exact environment forwarded to subprocesses.
 func childEnviron(env Env) []string {

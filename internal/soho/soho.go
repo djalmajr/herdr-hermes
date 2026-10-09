@@ -73,11 +73,13 @@ type Runner struct {
 }
 
 // DrainDone returns a channel that closes when the most recent Run's
-// delivery of the child's output to the given writers has finished; it
-// is nil until the first Run. A caller that keeps using a writer after
-// Run returned (reading a buffered stdout, for instance) must wait on
-// it first; the Capture buffer needs no such wait, because it is
-// written on the copy path that Run has already waited for.
+// delivery of the child's output to the given writers has finished. It
+// is never nil: until Run replaces it, it is an already-closed channel,
+// so a caller that waits on it after any Run (including one that
+// returned early) blocks for nothing and a reused Runner never reports
+// a previous run's channel. A caller that must not lose output waits on
+// it after Run returned; the Capture buffer needs no such wait, because
+// it is written on the copy path that Run has already waited for.
 func (r *Runner) DrainDone() <-chan struct{} {
 	return r.drainDone
 }
@@ -118,8 +120,17 @@ func joinDone(a, b chan struct{}) chan struct{} {
 // live child; the deadline is decided from the cancel, because on
 // Windows the kill surfaces as an ordinary exit code (TerminateProcess).
 // ErrUnavailable is returned when the executable is missing or not
-// runnable.
+// runnable. Every byte Run read from the child is handed to the given
+// writers, but that delivery may still be in flight when Run returns,
+// so a caller that must not lose output waits on DrainDone after Run
+// returned.
 func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, bound time.Duration) (int, error) {
+	// DrainDone is an already-closed channel from the first line, so it
+	// is never nil and never refers to a previous run after any early
+	// return (a missing binary, a failed start, or a reused Runner).
+	drained := make(chan struct{})
+	close(drained)
+	r.drainDone = drained
 	if bound <= 0 {
 		bound = defaultBound
 	}
@@ -195,10 +206,10 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 // the capture holds everything the child wrote whenever Run does, no
 // matter how the consumer delivery lags. close never waits either — it
 // flips a flag: bytes already queued are still delivered, a delivery in
-// flight may finish into the wrapped writer after Run returned (the
-// caller must therefore not use a writer that can stall past the grace
-// period for anything else concurrently), and every Write that starts
-// after close is dropped.
+// flight may finish into the wrapped writer after Run returned (a
+// caller that must not lose output waits on the runner's DrainDone
+// after Run returned), and every Write that starts after close is
+// dropped.
 type guardedWriter struct {
 	w      io.Writer
 	cap    *bytes.Buffer

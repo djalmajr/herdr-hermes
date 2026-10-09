@@ -1038,3 +1038,63 @@ func TestOutboxUpdateSessionsAndAppend(t *testing.T) {
 		t.Fatalf("sessions.json = %+v, want the session change written", ss)
 	}
 }
+
+// TestOutboxFrictionCreatesMissingDir: Friction creates a missing state
+// directory (mode 0700 on POSIX) and writes friction.log (mode 0600 on
+// POSIX) with exactly the one line; a directory that cannot be created
+// (the parent is a regular file) creates nothing and does not panic.
+func TestOutboxFrictionCreatesMissingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	Friction(dir, "cmd", "exact message")
+	st, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("state dir: %v, want it created", err)
+	}
+	if !st.IsDir() {
+		t.Fatalf("state dir is not a directory: %v", st.Mode())
+	}
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o700 {
+		t.Errorf("state dir mode = %o, want 700", st.Mode().Perm())
+	}
+	logPath := filepath.Join(dir, "friction.log")
+	fst, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("friction.log: %v, want it created", err)
+	}
+	if runtime.GOOS != "windows" && fst.Mode().Perm() != 0o600 {
+		t.Errorf("friction.log mode = %o, want 600", fst.Mode().Perm())
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read friction.log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("friction.log has %d lines, want exactly 1: %q", len(lines), data)
+	}
+	fields := strings.Split(lines[0], "\t")
+	if len(fields) != 3 || fields[1] != "cmd" || fields[2] != "exact message" {
+		t.Fatalf("friction line = %q, want one line with cmd and the exact message", lines[0])
+	}
+	if _, perr := time.Parse(TSLayout, fields[0]); perr != nil {
+		t.Errorf("friction line timestamp %q is not the TSLayout: %v", fields[0], perr)
+	}
+	// A directory that cannot be created: the parent is a regular file,
+	// so nothing is created and nothing panics.
+	parent := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(parent, []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	Friction(filepath.Join(parent, "state"), "cmd", "msg")
+	// Nothing was created: the path is not a directory (on POSIX the
+	// stat fails with not-a-directory, elsewhere with not-exist), and
+	// the parent is still the regular file.
+	st2, err := os.Stat(filepath.Join(parent, "state"))
+	if err == nil && st2.IsDir() {
+		t.Fatalf("state under a regular file was created: %v", st2.Mode())
+	}
+	pst, err := os.Stat(parent)
+	if err != nil || !pst.Mode().IsRegular() {
+		t.Fatalf("parent file changed: %v (%v)", pst.Mode(), err)
+	}
+}
