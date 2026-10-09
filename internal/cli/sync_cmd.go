@@ -29,21 +29,29 @@ func isSyncTerminal(state string) bool {
 	return false
 }
 
-// cmdSync implements `sync [--job <id>] [--push-only]`: the capability
-// check, the per-job event sync and the push of pending records.
-func cmdSync(args []string, env Env) int {
-	jobID, pushOnly, ok := parseSyncArgs(args)
-	if !ok {
-		badUsage(env, "usage: sync [--job <id>] [--push-only]")
-		return 2
-	}
+// syncResult is the outcome of one sync run: the counts and the push step
+// result, plus the one-line reason (ErrMotivo) for the non-push failure
+// exits (2, 3 and 43).
+type syncResult struct {
+	Jobs      int
+	Novos     int
+	Enviados  int
+	Pendentes int
+	Status    string
+	ErrMotivo string
+}
+
+// runSync runs the sync: the capability check (skipped with pushOnly), the
+// per-job event sync and the push of pending records. It performs the
+// writes; the caller prints the CLI line. Exit codes: 2 (config or state
+// error, machine label), 3 (unknown --job), 43 (capabilities) or the push
+// code (0, 40, 41, 42).
+func runSync(ctx context.Context, env Env, jobID string, pushOnly bool) (syncResult, int) {
 	cfg, err := config.Load(env.ConfigDir)
 	if err != nil {
-		fail(env, 2, "config: "+err.Error())
-		return 2
+		return syncResult{ErrMotivo: "config: " + err.Error()}, 2
 	}
 	runner := soho.Runner{Bin: cfg.HerdrSohoBin, Environ: childEnviron(env)}
-	ctx := context.Background()
 	// The capability check comes first and is skipped with --push-only.
 	if !pushOnly {
 		caps, cerr := runner.Capabilities(ctx)
@@ -52,32 +60,26 @@ func cmdSync(args []string, env Env) int {
 			if cerr != nil {
 				motivo = cerr.Error()
 			}
-			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: %s\n", motivo)
-			_, _ = fmt.Fprintf(env.Stdout, `{"status":"capabilities_missing","motivo":"%s"}`+"\n", sanitizeJSON(motivo))
-			return 43
+			return syncResult{ErrMotivo: motivo}, 43
 		}
 	}
 	store, err := outbox.Open(outbox.StateDir(env.ConfigDir), outbox.Options{Now: env.Now})
 	if err != nil {
-		fail(env, 2, "sync: "+err.Error())
-		return 2
+		return syncResult{ErrMotivo: "sync: " + err.Error()}, 2
 	}
 	// The sync writes job_event records, so it needs the machine label;
 	// a --push-only run never writes a record and needs nothing.
 	if !pushOnly && cfg.MachineLabel == "" {
-		fail(env, 2, "machine_label not set")
-		return 2
+		return syncResult{ErrMotivo: "machine_label not set"}, 2
 	}
 	jobs, err := store.LoadJobs()
 	if err != nil {
-		fail(env, 2, "sync: "+err.Error())
-		return 2
+		return syncResult{ErrMotivo: "sync: " + err.Error()}, 2
 	}
 	var ids []string
 	if jobID != "" {
 		if _, known := jobs.Jobs[jobID]; !known {
-			_, _ = fmt.Fprintf(env.Stdout, `{"status":"not_found"}`+"\n")
-			return 3
+			return syncResult{ErrMotivo: "job not found"}, 3
 		}
 		ids = []string{jobID}
 	} else {
@@ -135,14 +137,46 @@ func cmdSync(args []string, env Env) int {
 		// Only a failed push (40, 41, 42) carries a status in the line.
 		status = res.Status
 	}
+	return syncResult{Jobs: jobCount, Novos: novos, Enviados: res.Sent, Pendentes: res.Pending, Status: status}, res.Code
+}
+
+// cmdSync implements `sync [--job <id>] [--push-only]`.
+func cmdSync(args []string, env Env) int {
+	jobID, pushOnly, ok := parseSyncArgs(args)
+	if !ok {
+		badUsage(env, "usage: sync [--job <id>] [--push-only]")
+		return 2
+	}
+	res, code := runSync(context.Background(), env, jobID, pushOnly)
+	printSyncOutcome(env, res, code)
+	return code
+}
+
+// printSyncOutcome prints the sync output line according to the exit code.
+func printSyncOutcome(env Env, res syncResult, code int) {
+	switch code {
+	case 3:
+		_, _ = fmt.Fprintf(env.Stdout, `{"status":"not_found"}`+"\n")
+	case 43:
+		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: %s\n", res.ErrMotivo)
+		_, _ = fmt.Fprintf(env.Stdout, `{"status":"capabilities_missing","motivo":"%s"}`+"\n", sanitizeJSON(res.ErrMotivo))
+	case 2:
+		fail(env, 2, res.ErrMotivo)
+	default:
+		printSyncLine(env, res)
+	}
+}
+
+// printSyncLine prints the sync counts line (with status on a non-zero
+// push outcome).
+func printSyncLine(env Env, res syncResult) {
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(struct {
 		Jobs      int    `json:"jobs"`
 		Novos     int    `json:"novos"`
 		Enviados  int    `json:"enviados"`
 		Pendentes int    `json:"pendentes"`
 		Status    string `json:"status,omitempty"`
-	}{jobCount, novos, res.Sent, res.Pending, status}))
-	return res.Code
+	}{res.Jobs, res.Novos, res.Enviados, res.Pendentes, res.Status}))
 }
 
 // parseSyncArgs accepts --job <id> and --push-only in any order, once each.

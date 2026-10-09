@@ -573,8 +573,15 @@ type Sessions struct {
 	Sessions map[string]*Session `json:"sessions"`
 }
 
-// LoadJobs returns jobs.json, or an empty set when the file is absent.
+// LoadJobs returns jobs.json, or an empty set when the file is absent. A
+// read-only store reads the file directly without the lock: the file is
+// only ever replaced by an atomic rename, so a lock-free read sees a
+// complete file, and taking the lock would create the lock file, which a
+// read-only store must never do.
 func (s *Store) LoadJobs() (*Jobs, error) {
+	if s.readOnly {
+		return s.loadJobsLocked()
+	}
 	l, err := s.lock()
 	if err != nil {
 		return nil, err
@@ -630,8 +637,12 @@ func (s *Store) UpdateJobs(mutate func(*Jobs) error) error {
 }
 
 // LoadSessions returns sessions.json, or an empty set when the file is
-// absent.
+// absent. A read-only store reads the file directly without the lock (see
+// LoadJobs).
 func (s *Store) LoadSessions() (*Sessions, error) {
+	if s.readOnly {
+		return s.loadSessionsLocked()
+	}
 	l, err := s.lock()
 	if err != nil {
 		return nil, err

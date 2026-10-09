@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/herdr-hermes/internal/plugin"
+	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
 )
 
 // runCLI runs Run with a hermetic env over a fresh ConfigDir and returns
@@ -194,6 +198,196 @@ func TestNowrite(t *testing.T) {
 		t.Fatalf("unknown command under NOWRITE: exit %d, want 2", exit)
 	}
 	assertDirEmpty(t, dir)
+
+	// Slice-4b read-only additions: doctor (fake herdr-soho, so it exits 0),
+	// auth status and plugin bridge status all work under NOWRITE and write
+	// nothing.
+	dir = t.TempDir()
+	exe, _ := installFakeSoho(t, capsRule(capsJSON, 0), fakesoho.Rule{Argv: []string{"config"}, Code: 0})
+	setSohoConfig(t, dir, exe, "machine-a")
+	before := dirEntries(t, dir)
+	stdout, _, exit = runCLI(t, dir, true, "doctor")
+	if exit != 0 {
+		t.Fatalf("doctor under NOWRITE: exit %d, want 0 (stdout %q)", exit, stdout)
+	}
+	if !strings.Contains(stdout, `"machine_label":true`) || !strings.Contains(stdout, `"outbox":{"ultimo_seq":0`) {
+		t.Errorf("doctor under NOWRITE stdout = %q", stdout)
+	}
+	if after := dirEntries(t, dir); after != before {
+		t.Errorf("doctor under NOWRITE wrote files: before %q after %q", before, after)
+	}
+	dir = t.TempDir()
+	stdout, _, exit = runCLI(t, dir, true, "auth", "status")
+	if exit != 0 || stdout != `{"configured":false,"store":"file"}`+"\n" {
+		t.Fatalf("auth status under NOWRITE: exit %d, stdout %q", exit, stdout)
+	}
+	assertDirEmpty(t, dir)
+	dir = t.TempDir()
+	stdout, _, exit = runCLI(t, dir, true, "plugin", "bridge", "status")
+	if exit != 0 {
+		t.Fatalf("plugin bridge status under NOWRITE: exit %d, want 0", exit)
+	}
+	if stdout != `{"jobs_abertos":0,"pendentes":0,"ultimo_push":null,"key_configured":false}`+"\n" {
+		t.Errorf("plugin bridge status under NOWRITE stdout = %q", stdout)
+	}
+	assertDirEmpty(t, dir)
+
+	// Every writing command refuses before any side effect (exit 2, the
+	// nowrite line, nothing written).
+	for _, args := range [][]string{
+		{"job", "start", "--id", "job-1", "--repo", "org/repo"},
+		{"job", "amend", "--id", "job-1"},
+		{"job", "send", "--id", "job-1"},
+		{"job", "ack", "--id", "job-1"},
+		{"job", "cancel", "--id", "job-1"},
+		{"job", "close", "--id", "job-1"},
+		{"wake"},
+		{"sync"},
+		{"push"},
+		{"session", "start", "--projeto", "org/repo"},
+		{"session", "update", "--projeto", "org/repo"},
+		{"session", "end", "--projeto", "org/repo"},
+		{"decision", "--projeto", "org/repo", "--motivo", "m", "--escopo", "global"},
+		{"auth", "login", "--key", "-"},
+		{"auth", "logout"},
+		{"plugin", "bridge", "sync"},
+	} {
+		dir = t.TempDir()
+		stdout, _, exit = runCLI(t, dir, true, args...)
+		if exit != 2 {
+			t.Fatalf("%v under NOWRITE: exit %d, want 2 (stdout %q)", args, exit, stdout)
+		}
+		if stdout != "{\"status\":\"nowrite\",\"motivo\":\"HERDR_HERMES_NOWRITE=1\"}\n" {
+			t.Errorf("%v under NOWRITE stdout = %q", args, stdout)
+		}
+		assertDirEmpty(t, dir)
+	}
+}
+
+// dirEntries returns the sorted entry names of a dir (one comma-joined
+// string; "" for an empty dir), so a test can prove no file was created.
+func dirEntries(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return strings.Join(names, ",")
+}
+
+// runPluginEventNowrite runs `plugin event` under NOWRITE with the two Herdr
+// event variables set.
+func runPluginEventNowrite(t *testing.T, cfgDir, event, eventJSON string) (string, string, int) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	env := Env{
+		Stdin:  strings.NewReader(""),
+		Stdout: &out,
+		Stderr: &errb,
+		Getenv: func(k string) string {
+			switch k {
+			case nowriteVar:
+				return "1"
+			case plugin.EnvEvent:
+				return event
+			case plugin.EnvEventJSON:
+				return eventJSON
+			}
+			return ""
+		},
+		Environ:   func() []string { return fakeChildEnv },
+		ConfigDir: cfgDir,
+		Now:       pluginTestNow,
+		Sleep:     sleepCtx,
+	}
+	exit := Run([]string{"plugin", "event"}, env)
+	return out.String(), errb.String(), exit
+}
+
+// TestNowriteExistingStateCreatesNoFiles: with the state directory already
+// existing, the read-only commands under NOWRITE create no file anywhere
+// under the config dir. The fresh-dir cases cannot catch this: the
+// read-only store open fails before anything is touched.
+func TestNowriteExistingStateCreatesNoFiles(t *testing.T) {
+	exe, _ := installFakeSoho(t, capsRule(capsJSON, 0), fakesoho.Rule{Argv: []string{"config"}, Code: 0})
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+		run   func(t *testing.T, dir string) int
+	}{
+		{
+			name: "plugin bridge status",
+			run: func(t *testing.T, dir string) int {
+				_, _, exit := runCLI(t, dir, true, "plugin", "bridge", "status")
+				return exit
+			},
+		},
+		{
+			name:  "doctor",
+			setup: func(t *testing.T, dir string) { setSohoConfig(t, dir, exe, "machine-a") },
+			run:   func(t *testing.T, dir string) int { _, _, exit := runCLI(t, dir, true, "doctor"); return exit },
+		},
+		{
+			name: "outbox",
+			run:  func(t *testing.T, dir string) int { _, _, exit := runCLI(t, dir, true, "outbox"); return exit },
+		},
+		{
+			name: "auth status",
+			run:  func(t *testing.T, dir string) int { _, _, exit := runCLI(t, dir, true, "auth", "status"); return exit },
+		},
+		{
+			name: "plugin event untracked workspace.closed",
+			run: func(t *testing.T, dir string) int {
+				_, _, exit := runPluginEventNowrite(t, dir, "workspace.closed", `{"workspace":{"label":"job-J9","workspace_id":"ws-9"}}`)
+				return exit
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.setup != nil {
+				tc.setup(t, dir)
+			}
+			before := filesUnder(t, dir)
+			if exit := tc.run(t, dir); exit != 0 {
+				t.Fatalf("exit %d, want 0", exit)
+			}
+			if after := filesUnder(t, dir); after != before {
+				t.Fatalf("created files: before %q after %q", before, after)
+			}
+		})
+	}
+}
+
+// filesUnder lists every file under root as a sorted comma-joined relative
+// path string, so a test can prove nothing was created.
+func filesUnder(t *testing.T, root string) string {
+	t.Helper()
+	var names []string
+	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			if rel, err := filepath.Rel(root, p); err == nil {
+				names = append(names, rel)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 // TestNoConfigDir: when the user config directory is unavailable (ConfigDir

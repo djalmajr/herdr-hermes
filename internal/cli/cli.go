@@ -49,7 +49,7 @@ var commands = []command{
 	{"capabilities", false, false, cmdCapabilities},
 	{"version", false, false, cmdVersion},
 	{"help", false, false, cmdHelp},
-	// slice 4: plugin
+	{"plugin", false, true, cmdPlugin},
 }
 
 // Run executes args[0] as a command and returns its exit code. An unknown
@@ -105,6 +105,10 @@ type errorLine struct {
 }
 
 const nowriteErrorJSON = `{"status":"nowrite","motivo":"HERDR_HERMES_NOWRITE=1"}`
+
+// nowriteMotivo is the motivo of the NOWRITE refusal and of the plugin
+// skipped line.
+const nowriteMotivo = "HERDR_HERMES_NOWRITE=1"
 
 const noConfigDirErrorJSON = `{"status":"no_config_dir","motivo":"user config directory unavailable"}`
 

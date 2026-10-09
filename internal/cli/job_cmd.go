@@ -57,6 +57,10 @@ var (
 // limits, forwards the subcommand to herdr-soho as an argv subprocess and
 // does the local bookkeeping after a successful forward. The forwarded
 // exit code and stdout are never changed by the bookkeeping.
+//
+// TODO(herdr-hermes): verify that the remote execution channel that runs
+// `herdr-hermes job` for the dispatcher forwards stdin and the exit code
+// unchanged; the forwarder itself is transparent.
 func cmdJob(args []string, env Env) int {
 	if len(args) == 0 {
 		badUsage(env, "usage: job <start|status|wait|events|collect|amend|send|ack|cancel|close|list> [args]")

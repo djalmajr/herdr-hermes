@@ -36,7 +36,7 @@ Records are pushed in `seq` order, one at a time. A 2xx advances the delivery cu
 | code | meaning |
 |------|---------|
 | 0 | success (forwarded commands: whatever `herdr-soho` returned) |
-| 2 | bad usage, input limit exceeded, unknown config key, internal job subcommand refused |
+| 2 | bad usage, input limit exceeded, unknown config key, internal job subcommand refused, a writing command under `HERDR_HERMES_NOWRITE=1`, no user config directory (`no_config_dir`), or a `wake` event that could not be made durable |
 | 3 | unknown job id in `herdr-hermes` bookkeeping (`sync --job`) |
 | 4 | `herdr-soho` not found, not runnable, or killed by the forwarding deadline |
 | 40 | no API key configured (push required) |

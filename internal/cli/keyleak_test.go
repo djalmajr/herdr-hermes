@@ -5,12 +5,15 @@ import (
 	"context"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/herdr-hermes/internal/plugin"
+	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
 )
 
 // TestKeyNeverLeaks proves the key-leak contract end to end: the sentinel
@@ -110,6 +113,25 @@ func TestKeyNeverLeaks(t *testing.T) {
 
 	// 3. Every owned command on the success path (dispatcher 200), and the
 	// slice-1 commands.
+	//
+	// The fake herdr-soho backs the slice-2 subprocess paths (job
+	// forwarding, sync, doctor) and the slice-4b plugin entry points added
+	// below; every child's argv, stdin and environment are captured in the
+	// fake's call log and swept for the key at the end.
+	fakeExe, fakeDir := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		fakesoho.Rule{Argv: []string{"config"}, Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "start", "--id", "job-2", "--repo", "org/repo"}, Stdout: `{"id":"job-2","status":"accepted"}` + "\n", Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "job-2"}, Stdout: `{"id":"job-2","status":"running"}` + "\n", Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "job-9"}, Stdout: `{"status":"not_found"}` + "\n", Code: 3},
+		fakesoho.Rule{Argv: []string{"job", "amend", "--id", "job-2"}, Stdout: `{"id":"job-2","status":"running"}` + "\n", Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "send", "--id", "job-2"}, Stdout: `{"id":"job-2","status":"running"}` + "\n", Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "close", "--id", "job-2"}, Stdout: `{"id":"job-2","status":"closed"}` + "\n", Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "events", "--id", "job-1"}, ArgvPrefix: true, Stdout: trailer(3, "running") + "\n", Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "events", "--id", "job-2"}, ArgvPrefix: true, Stdout: eventLine(1, "status", "working") + "\n" + trailer(1, "running") + "\n", Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "events", "--id", "J1"}, ArgvPrefix: true, Stdout: eventLine(1, "status", "working") + "\n" + trailer(1, "running") + "\n", Code: 0},
+	)
+	setSohoConfig(t, dir, fakeExe, "")
 	runTable([]leakCase{
 		{"wake first event", wakeEvent(1), jobVars, false, []string{"wake"}, 0},
 		{"wake second event", wakeEvent(2), map[string]string{jobapi.EnvJobID: "job-1"}, false, []string{"wake"}, 0},
@@ -150,6 +172,27 @@ func TestKeyNeverLeaks(t *testing.T) {
 		{"session bad projeto", "", nil, false, []string{"session", "start", "--projeto", "bad repo"}, 2},
 		{"decision extra flag", "resumo", nil, false, []string{"decision", "--projeto", "org/repo", "--extra"}, 2},
 		{"push extra args", "", nil, false, []string{"push", "extra"}, 2},
+	})
+
+	// 4b. The slice-2 subprocess paths (job forwarding, sync, doctor) and
+	// the slice-4b plugin entry points, against the fake herdr-soho; the
+	// call-log sweep below proves no child saw the key in its environment
+	// or stdin.
+	setConfig(t, dir, map[string]string{"dispatcher_url": srv200.URL})
+	runTable([]leakCase{
+		{"job start", "", nil, false, []string{"job", "start", "--id", "job-2", "--repo", "org/repo"}, 0},
+		{"job status", "", nil, false, []string{"job", "status", "--id", "job-2"}, 0},
+		{"job status forward failure", "", nil, false, []string{"job", "status", "--id", "job-9"}, 3},
+		{"job amend", "", nil, false, []string{"job", "amend", "--id", "job-2"}, 0},
+		{"job send", "note for the job", nil, false, []string{"job", "send", "--id", "job-2"}, 0},
+		{"job close", "", nil, false, []string{"job", "close", "--id", "job-2"}, 0},
+		{"sync against the 200 dispatcher", "", nil, false, []string{"sync"}, 0},
+		{"doctor", "", nil, false, []string{"doctor"}, 0},
+		{"plugin startup", "", nil, false, []string{"plugin", "startup"}, 0},
+		{"plugin event workspace.created", "", map[string]string{plugin.EnvEvent: "workspace.created", plugin.EnvEventJSON: `{"workspace":{"label":"job-J1","workspace_id":"ws-1"}}`}, false, []string{"plugin", "event"}, 0},
+		{"plugin event workspace.closed", "", map[string]string{plugin.EnvEvent: "workspace.closed", plugin.EnvEventJSON: `{"workspace":{"label":"job-J1","workspace_id":"ws-1"}}`}, false, []string{"plugin", "event"}, 0},
+		{"plugin bridge status", "", nil, false, []string{"plugin", "bridge", "status"}, 0},
+		{"plugin bridge sync", "", nil, false, []string{"plugin", "bridge", "sync"}, 0},
 	})
 
 	// 5. auth status prints the exact configured line.
@@ -213,6 +256,19 @@ func TestKeyNeverLeaks(t *testing.T) {
 		if strings.Contains(string(data), sentinelKey) {
 			t.Fatalf("%s leaked the key: %.300q", f, data)
 		}
+	}
+	// The subprocess audit: the fake call log captures every herdr-soho
+	// child's argv, stdin and full environment; the key must be in none of
+	// them.
+	if calls := readFakeCalls(t, fakeDir); len(calls) == 0 {
+		t.Fatal("the fake herdr-soho was never called; the subprocess sweep is vacuous")
+	}
+	callLog, err := os.ReadFile(filepath.Join(fakeDir, "fake-herdr-soho.calls.jsonl"))
+	if err != nil {
+		t.Fatalf("read fake call log: %v", err)
+	}
+	if strings.Contains(string(callLog), sentinelKey) {
+		t.Fatalf("a herdr-soho child environment or stdin carried the key: %.300q", callLog)
 	}
 	// On the wire the key exists only as the Authorization header.
 	for name, s := range map[string]*cliPushServer{"200": srv200, "401": srv401, "500": srv500} {

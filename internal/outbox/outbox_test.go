@@ -701,6 +701,93 @@ func TestOutboxReadOnlyNoFiles(t *testing.T) {
 	}
 }
 
+// dirList returns the entry names of dir as one comma-joined string ("" for
+// an empty dir), so a test can prove no file was created.
+func dirList(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return strings.Join(names, ",")
+}
+
+// TestOutboxReadOnlyNoFilesExistingState: a read-only store over an already
+// existing state dir creates no file at all (not even the lock file), with
+// or without existing jobs/sessions content. A lock-free read is safe
+// because the files are only ever replaced by an atomic rename, so the
+// reader always sees a complete file.
+func TestOutboxReadOnlyNoFilesExistingState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed bool
+	}{
+		{"empty state dir", false},
+		{"existing jobs and sessions", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.seed {
+				s := openStore(t, dir)
+				if err := s.UpdateJobs(func(j *Jobs) error {
+					j.Jobs["J1"] = &Job{ID: "J1", Projeto: testProjeto, Estado: "running"}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed jobs: %v", err)
+				}
+				if err := s.UpdateSessions(func(ss *Sessions) error {
+					ss.Sessions[testProjeto+"\tmain"] = &Session{Projeto: testProjeto, Branch: "main"}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed sessions: %v", err)
+				}
+				// The writable seed left its lock file behind; the starting
+				// point is the data files only.
+				if err := os.Remove(filepath.Join(dir, "lock")); err != nil {
+					t.Fatalf("remove seed lock: %v", err)
+				}
+			}
+			before := dirList(t, dir)
+			s, err := Open(dir, Options{Now: fixedNow, ReadOnly: true})
+			if err != nil {
+				t.Fatalf("Open read-only: %v", err)
+			}
+			jobs, err := s.LoadJobs()
+			if err != nil {
+				t.Fatalf("LoadJobs: %v", err)
+			}
+			sessions, err := s.LoadSessions()
+			if err != nil {
+				t.Fatalf("LoadSessions: %v", err)
+			}
+			if _, _, err := s.Read(0); err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if _, err := s.DeliveredSeq(); err != nil {
+				t.Fatalf("DeliveredSeq: %v", err)
+			}
+			if _, err := s.LastPush(); err != nil {
+				t.Fatalf("LastPush: %v", err)
+			}
+			after := dirList(t, dir)
+			if after != before {
+				t.Fatalf("read-only loads created files: before %q after %q", before, after)
+			}
+			if tc.seed {
+				if jobs.Jobs["J1"] == nil || sessions.Sessions[testProjeto+"\tmain"] == nil {
+					t.Fatalf("seeded content not read back: jobs=%v sessions=%v", jobs.Jobs, sessions.Sessions)
+				}
+			} else if len(jobs.Jobs) != 0 || len(sessions.Sessions) != 0 {
+				t.Fatalf("absent files must read as empty sets: jobs=%v sessions=%v", jobs.Jobs, sessions.Sessions)
+			}
+		})
+	}
+}
+
 // TestOutboxCursor: cursor.json is written atomically, is monotonic, and a
 // missing cursor reads as 0.
 func TestOutboxCursor(t *testing.T) {

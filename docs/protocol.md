@@ -98,12 +98,21 @@ with exit 0, 40, 41 or 42 according to the push outcome; on a non-zero outcome t
 
 `capabilities` is the raw `herdr-soho capabilities --json` line or null. `wake_hook` is `true` when the `herdr-soho` configuration carries a `job_wake_cmd` that starts with `herdr-hermes wake`, `false` when a parseable configuration has a different value or none, and `unknown` when the configuration cannot be read or parsed. `doctor` exits 43 when `herdr-soho` is missing or lacks either capability, else 0.
 
+## Plugin
+
+The optional plugin (`plugin/herdr-plugin.toml`) runs the CLI as one-shot entry points; it keeps no second copy of the outbox or push logic, and the CLI works fully without the plugin. Every `command` in the manifest is an argv array whose first element is `herdr-hermes`.
+
+- `herdr-hermes plugin startup` (the `[[startup]]` hook) runs the `sync` logic for every open tracked job and then the push step. It always exits 0 and never fails the Herdr server: a config, capability or machine-label failure writes one friction line and prints `{"status":"skipped","motivo":…}`; otherwise it prints the sync counts line (a push failure is a normal sync outcome, with its `status` field).
+- `herdr-hermes plugin event` (the `workspace.created` and `workspace.closed` hooks) reads `HERDR_PLUGIN_EVENT` and `HERDR_PLUGIN_EVENT_JSON` from the environment. A `workspace.created` for a workspace labeled `job-<id>` (id matching the contract id rule) tracks the job in the local bookkeeping when it is unknown (empty `projeto`) and then runs the `sync --job <id>` logic; a `workspace.closed` runs a final `sync --job <id>` for a tracked `job-<id>`, so terminal and cleanup events reach the outbox. Other workspace labels and other event names are ignored with nothing written; an unknown or empty `HERDR_PLUGIN_EVENT_JSON` shape writes one friction line. It always exits 0; failures go to friction.
+- `herdr-hermes plugin bridge status` (read-only action, exit 0) prints exactly one JSON line and nothing else: `{"jobs_abertos":N,"pendentes":N,"ultimo_push":…,"key_configured":bool}`, where `ultimo_push` is the `last_push` entry of `cursor.json` or `null`. It is read-only: it works under `HERDR_HERMES_NOWRITE=1` and creates no files.
+- `herdr-hermes plugin bridge sync` (action) prints to stderr what it will do — the number of open tracked jobs and of pending outbox records — then runs the `sync` logic and prints its JSON line; its exit code is the sync exit code (0, 2, 40, 41, 42, 43). It is a writing command and is refused under `HERDR_HERMES_NOWRITE=1` with exit 2.
+
 ## Exit codes
 
 | code | meaning |
 |------|---------|
 | 0 | success (forwarded commands: whatever `herdr-soho` returned) |
-| 2 | bad usage, input limit exceeded, unknown config key, internal job subcommand refused |
+| 2 | bad usage, input limit exceeded, unknown config key, internal job subcommand refused, a writing command under `HERDR_HERMES_NOWRITE=1`, no user config directory (`no_config_dir`), or a `wake` event that could not be made durable |
 | 3 | unknown job id in `herdr-hermes` bookkeeping (`sync --job`) |
 | 4 | `herdr-soho` not found, not runnable, or killed by the forwarding deadline |
 | 40 | no API key configured (push required) |
@@ -115,7 +124,7 @@ Forwarded `job` subcommands return the `herdr-soho` exit code unchanged; codes 4
 
 ## NOWRITE
 
-`HERDR_HERMES_NOWRITE=1` makes the CLI read-only. The read-only commands work normally and write nothing: `outbox`, `doctor`, `auth status`, `config get` and `config list`, `capabilities`, `version`, `help`, and the read-only `job` subcommands (`status`, `wait`, `events`, `collect`, `list`, which also skip bookkeeping). Every writing command (`job start|amend|send|ack|cancel|close`, `wake`, `sync`, `push`, `session`, `decision`, `auth login`, `auth logout`, `config set`) refuses with exit 2 and `{"status":"nowrite","motivo":"HERDR_HERMES_NOWRITE=1"}` before any side effect. Exception: the plugin entrypoints `plugin startup` and `plugin event` exit 0 under NOWRITE and write nothing.
+`HERDR_HERMES_NOWRITE=1` makes the CLI read-only. The read-only commands work normally and write nothing: `outbox`, `doctor`, `auth status`, `config get` and `config list`, `capabilities`, `version`, `help`, `plugin bridge status`, and the read-only `job` subcommands (`status`, `wait`, `events`, `collect`, `list`, which also skip bookkeeping). Every writing command (`job start|amend|send|ack|cancel|close`, `wake`, `sync`, `push`, `session`, `decision`, `auth login`, `auth logout`, `config set`, `plugin bridge sync`) refuses with exit 2 and `{"status":"nowrite","motivo":"HERDR_HERMES_NOWRITE=1"}` before any side effect. Exception: the plugin entrypoints `plugin startup` and `plugin event` exit 0 under NOWRITE, print `{"status":"skipped","motivo":"HERDR_HERMES_NOWRITE=1"}` and write nothing.
 
 ## Key security
 
