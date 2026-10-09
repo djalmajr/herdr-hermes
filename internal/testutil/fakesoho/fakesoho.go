@@ -214,16 +214,21 @@ func Main() {
 		if rule.HoldPipeMs > 0 {
 			spawnPipeHolder(rule.HoldPipeMs)
 		}
+		// The rule's signal behavior is installed before anything is
+		// written, so a cancel that races the first byte already sees
+		// it in place; the plain path's order of effects is unchanged
+		// (nothing ran between the setup and the wait before either).
+		sig := installRuleSignal(rule)
 		if rule.StdoutFirst {
 			// The stdout write goes straight to the pipe (os.File has
 			// no user-space buffering), so the parent sees it before
 			// the delay; then stderr and the exit.
 			_, _ = os.Stdout.Write(stdoutData)
-			sleepOrExit(rule, rule.Delay)
+			waitRuleSignal(rule, rule.Delay, sig)
 			_, _ = os.Stderr.Write(stderrData)
 			os.Exit(rule.Code)
 		}
-		sleepOrExit(rule, rule.Delay)
+		waitRuleSignal(rule, rule.Delay, sig)
 		_, _ = os.Stdout.Write(stdoutData)
 		_, _ = os.Stderr.Write(stderrData)
 		os.Exit(rule.Code)
@@ -301,24 +306,34 @@ func spawnPipeHolder(ms int) {
 	}()
 }
 
-// sleepOrExit sleeps for ms milliseconds; if the rule requests an exit
-// code on a terminal signal (ExitOnTerm non-zero) and the process is
-// interrupted (os.Interrupt, plus SIGTERM where it exists) during the
-// sleep, it exits with that code immediately. With ExitOnTerm zero the
-// behavior is the plain sleep, which on unix ignores SIGTERM for the
-// duration of the sleep: a runner deadline is then decided by its
-// WaitDelay grace period (unix) or its Kill (Windows), not by the
-// signal's default action.
-func sleepOrExit(rule Rule, ms int) {
+// installRuleSignal is the setup step of a rule's wait: with ExitOnTerm
+// zero and a non-zero delay it makes the process ignore SIGTERM, so a
+// runner deadline is decided by its WaitDelay grace period (unix) or its
+// Kill (Windows), not by the signal's default action; with ExitOnTerm
+// non-zero it installs the exit-on-signal handler and returns its
+// channel. It is called before anything is written, so the behavior is
+// in place before the first byte reaches the parent.
+func installRuleSignal(rule Rule) chan os.Signal {
 	if rule.ExitOnTerm == 0 {
-		if ms > 0 {
+		if rule.Delay > 0 {
 			ignoreTermForSleep()
 		}
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-		return
+		return nil
 	}
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, interruptSignals()...)
+	return ch
+}
+
+// waitRuleSignal is the wait step of a rule's wait: it sleeps for ms
+// milliseconds, or (when ExitOnTerm is non-zero and the handler
+// installed by installRuleSignal fires) exits with that code on a
+// terminal signal (os.Interrupt, plus SIGTERM where it exists).
+func waitRuleSignal(rule Rule, ms int, ch chan os.Signal) {
+	if rule.ExitOnTerm == 0 {
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		return
+	}
 	defer signal.Stop(ch)
 	select {
 	case <-ch:

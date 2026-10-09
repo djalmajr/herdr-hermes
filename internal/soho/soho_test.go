@@ -156,43 +156,78 @@ func TestSohoRunChildEnv(t *testing.T) {
 }
 
 // TestSohoRunDeadline: a child that runs longer than the bound and
-// ignores SIGTERM for the duration of its delay (the fake's default for
-// a plain delay, the same way a Windows child ignores a plain signal) is
-// ended by the runner's WaitDelay grace period (a kill on unix) or by
-// the context watcher's kill on Windows; the runner reports ErrDeadline.
-// The bound (2s) outlasts the fake's cold start so the SIGTERM ignore is
-// in place before the bound fires, the same calibration as
-// TestSohoRunDeadlineExitCode.
+// ignores SIGTERM (the fake's default for a plain delay, installed
+// before its first byte is written, so a slow start can never lose the
+// race to the cancel) is ended by the runner's WaitDelay grace period
+// (a kill on unix) or by the context watcher's kill on Windows; the
+// runner reports ErrDeadline. The parent context is cancelled as soon
+// as the fake's ready line reaches the stdout writer, and the elapsed
+// time is measured from that cancel, so the assertion is independent of
+// the fake's start time.
 func TestSohoRunDeadline(t *testing.T) {
 	exe, _ := installFake(t, fakesoho.Rule{
-		Argv:  []string{"job", "wait", "--id", "J1"},
-		Delay: 30000,
-		Code:  0,
+		Argv:        []string{"job", "wait", "--id", "J1"},
+		StdoutFirst: true,
+		Stdout:      "ready\n",
+		Delay:       30000,
+		Code:        0,
 	})
 	r := soho.Runner{Bin: exe, Environ: childEnv}
-	start := time.Now()
-	_, err := r.Run(context.Background(), []string{"job", "wait", "--id", "J1"}, nil, io.Discard, io.Discard, 2*time.Second)
-	elapsed := time.Since(start)
+	ready := make(chan struct{})
+	w := &readyWriter{ready: ready}
+	ctx, cancel := context.WithCancel(context.Background())
+	// The watcher cancels the parent context as soon as the ready line
+	// reaches the writer and hands the cancel time over through a
+	// channel (the race-free handoff for the measurement below); a
+	// fake that never prints fails the test cleanly instead of
+	// hanging.
+	cancelAt := make(chan time.Time, 1)
+	go func() {
+		select {
+		case <-ready:
+		case <-time.After(15 * time.Second):
+			t.Errorf("the fake never printed the ready line within 15s")
+		}
+		cancelAt <- time.Now()
+		cancel()
+	}()
+	_, err := r.Run(ctx, []string{"job", "wait", "--id", "J1"}, nil, w, io.Discard, 60*time.Second)
+	elapsed := time.Since(<-cancelAt)
 	var de *soho.ErrDeadline
 	if !errors.As(err, &de) {
 		t.Fatalf("Run: err = %v, want ErrDeadline", err)
 	}
-	if elapsed < 150*time.Millisecond {
-		t.Errorf("killed after %s, before the bound (2s)", elapsed)
-	}
-	if elapsed >= 8*time.Second {
-		t.Errorf("killed after %s, beyond bound + WaitDelay (7s)", elapsed)
+	if elapsed >= 10*time.Second {
+		t.Errorf("ended %s after the cancel, beyond the WaitDelay grace period (5s) + margin", elapsed)
 	}
 	if runtime.GOOS != "windows" {
-		// On unix the SIGTERM at the bound is ignored by the fake, so
-		// only the 5s WaitDelay can end the run: the elapsed time must
-		// sit close to bound + WaitDelay (~7s), proving the kill came
-		// from the grace period, not from the signal. Windows kills at
-		// the bound, so that assertion is skipped there.
+		// On unix the SIGTERM at the cancel is ignored by the fake
+		// (installed before the ready line was written), so only the
+		// 5s WaitDelay can end the run: the elapsed time must sit
+		// close to the grace period, proving the kill came from the
+		// grace period, not from the signal. Windows kills at the
+		// cancel, so the lower bound is skipped there.
 		if elapsed < 4*time.Second {
-			t.Errorf("killed after %s, before bound + WaitDelay (~7s): the SIGTERM, not the grace period, ended the run", elapsed)
+			t.Errorf("ended %s after the cancel, before the WaitDelay grace period (~5s): the SIGTERM, not the grace period, ended the run", elapsed)
 		}
 	}
+}
+
+// readyWriter closes ready on its first Write; the guarded writer
+// delivers writes in order through one goroutine, so the first Write is
+// the fake's ready line and the close runs at most once. Closing a
+// channel (never sending a value) keeps the handoff to the cancelling
+// goroutine race-free.
+type readyWriter struct {
+	ready  chan struct{}
+	closed atomic.Bool
+}
+
+func (w *readyWriter) Write(p []byte) (int, error) {
+	if w.closed.CompareAndSwap(false, true) {
+		close(w.ready)
+	}
+	return len(p), nil
 }
 
 // holdWriter blocks its first Write until the test closes release, then
