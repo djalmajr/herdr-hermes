@@ -6,13 +6,16 @@
 package fakesoho
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +28,10 @@ const (
 	scriptName = "fake-herdr-soho.json"
 	// logName is the call log installed next to the executable.
 	logName = "fake-herdr-soho.calls.jsonl"
+	// pipeHolderMarker is the argv marker that routes the re-exec'd copy
+	// into the pipe-holder role: it keeps the inherited stdout and
+	// stderr open for the millisecond count in the next argument.
+	pipeHolderMarker = "-fakesoho-pipe-holder"
 )
 
 // Rule is one scripted response. Argv matches the process argv (the
@@ -51,6 +58,13 @@ type Rule struct {
 	// bound that still ends with an ordinary exit code, as a Windows
 	// child does under TerminateProcess. Default behavior is unchanged.
 	ExitOnTerm int `json:"exit_on_term,omitempty"`
+	// HoldPipeMs, when non-zero, starts a copy of the fake before the
+	// rule runs that keeps the inherited stdout and stderr open for that
+	// many milliseconds: the pipes stay open (the pipe has no writer
+	// left only when the holder exits) after the fake itself has
+	// exited, so a runner's copy goroutine stays draining past the
+	// child's own exit.
+	HoldPipeMs int `json:"hold_pipe_ms,omitempty"`
 }
 
 // Call is one logged invocation: the argv, the full stdin and the full
@@ -139,6 +153,16 @@ func ReadCalls(dir string) ([]Call, error) {
 // returns at once. Call it first from the package TestMain; it exits the
 // re-executed process after dispatching the rule.
 func Main() {
+	// Pipe-holder role: a copy of this binary started by a rule's
+	// HoldPipeMs; it keeps the inherited stdout and stderr open for the
+	// millisecond count in argv and exits. Checked first, before the
+	// fake-role detection.
+	if len(os.Args) == 3 && os.Args[1] == pipeHolderMarker {
+		if ms, err := strconv.Atoi(os.Args[2]); err == nil && ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			os.Exit(0)
+		}
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return
@@ -187,6 +211,9 @@ func Main() {
 		}
 		stdoutData := append([]byte(rule.Stdout), rule.StdoutBytes...)
 		stderrData := append([]byte(rule.Stderr), rule.StderrBytes...)
+		if rule.HoldPipeMs > 0 {
+			spawnPipeHolder(rule.HoldPipeMs)
+		}
 		if rule.StdoutFirst {
 			// The stdout write goes straight to the pipe (os.File has
 			// no user-space buffering), so the parent sees it before
@@ -246,13 +273,47 @@ func ReadCallsFromPath(file string) ([]Call, error) {
 	return calls, nil
 }
 
+// spawnPipeHolder starts a copy of this binary that keeps the inherited
+// stdout and stderr open for ms milliseconds, so the pipes stay open
+// after the fake itself exits. Start failures are ignored: the rule
+// still runs, it just does not hold the pipes.
+func spawnPipeHolder(ms int) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	// The holder bounds itself (it sleeps exactly ms and exits); the fake
+	// never blocks on it.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(ms)*time.Millisecond+5*time.Second)
+	cmd := exec.CommandContext(ctx, exe, pipeHolderMarker, strconv.Itoa(ms))
+	cmd.WaitDelay = time.Second
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return
+	}
+	// Reap the holder and release the deadline; the fake's own exit is
+	// not blocked by it.
+	go func() {
+		_ = cmd.Wait()
+		cancel()
+	}()
+}
+
 // sleepOrExit sleeps for ms milliseconds; if the rule requests an exit
 // code on a terminal signal (ExitOnTerm non-zero) and the process is
 // interrupted (os.Interrupt, plus SIGTERM where it exists) during the
 // sleep, it exits with that code immediately. With ExitOnTerm zero the
-// behavior is the plain sleep.
+// behavior is the plain sleep, which on unix ignores SIGTERM for the
+// duration of the sleep: a runner deadline is then decided by its
+// WaitDelay grace period (unix) or its Kill (Windows), not by the
+// signal's default action.
 func sleepOrExit(rule Rule, ms int) {
 	if rule.ExitOnTerm == 0 {
+		if ms > 0 {
+			ignoreTermForSleep()
+		}
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		return
 	}

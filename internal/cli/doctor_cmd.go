@@ -125,7 +125,17 @@ func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string
 	wakeRunner := soho.Runner{Bin: runner.Bin, Environ: filtered, Now: runner.Now}
 	var out bytes.Buffer
 	exit, err := wakeRunner.Run(ctx, []string{"config"}, nil, &out, io.Discard, 120*time.Second)
-	if err != nil || exit != 0 {
+	if err != nil {
+		return "unknown"
+	}
+	// Wait for the delivery to this internal buffer to finish before
+	// reading it; the buffer never stalls, so the delivery completes.
+	select {
+	case <-wakeRunner.DrainDone():
+	case <-time.After(10 * time.Second):
+		return "unknown"
+	}
+	if exit != 0 {
 		return "unknown"
 	}
 	return parseWakeHook(out.String())

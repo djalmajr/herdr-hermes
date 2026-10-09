@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,19 @@ func installFake(t *testing.T, rules ...fakesoho.Rule) (exe, dir string) {
 }
 
 var childEnv = []string{"PATH=/bin", "SOHO_TEST=1"}
+
+// waitDrain waits for r's most recent Run to finish delivering the
+// child's output to the writers it was given before the test reads a
+// buffered writer; the writers used here are plain buffers and never
+// stall, so the delivery always completes.
+func waitDrain(t *testing.T, r soho.Runner) {
+	t.Helper()
+	select {
+	case <-r.DrainDone():
+	case <-time.After(10 * time.Second):
+		t.Fatalf("output delivery did not finish after Run")
+	}
+}
 
 // TestSohoRunExitCodes: the runner returns the child exit code unchanged.
 func TestSohoRunExitCodes(t *testing.T) {
@@ -48,6 +62,7 @@ func TestSohoRunExitCodes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("code %d: Run: %v", code, err)
 		}
+		waitDrain(t, r)
 		if exit != code {
 			t.Errorf("code %d: exit = %d", code, exit)
 		}
@@ -81,6 +96,7 @@ func TestSohoRunStdioPassThrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	waitDrain(t, r)
 	if exit != 5 {
 		t.Errorf("exit = %d, want 5", exit)
 	}
@@ -139,8 +155,14 @@ func TestSohoRunChildEnv(t *testing.T) {
 	}
 }
 
-// TestSohoRunDeadline: a child that runs longer than the bound is killed
-// within bound + WaitDelay and the runner reports ErrDeadline.
+// TestSohoRunDeadline: a child that runs longer than the bound and
+// ignores SIGTERM for the duration of its delay (the fake's default for
+// a plain delay, the same way a Windows child ignores a plain signal) is
+// ended by the runner's WaitDelay grace period (a kill on unix) or by
+// the context watcher's kill on Windows; the runner reports ErrDeadline.
+// The bound (2s) outlasts the fake's cold start so the SIGTERM ignore is
+// in place before the bound fires, the same calibration as
+// TestSohoRunDeadlineExitCode.
 func TestSohoRunDeadline(t *testing.T) {
 	exe, _ := installFake(t, fakesoho.Rule{
 		Argv:  []string{"job", "wait", "--id", "J1"},
@@ -149,17 +171,175 @@ func TestSohoRunDeadline(t *testing.T) {
 	})
 	r := soho.Runner{Bin: exe, Environ: childEnv}
 	start := time.Now()
-	_, err := r.Run(context.Background(), []string{"job", "wait", "--id", "J1"}, nil, io.Discard, io.Discard, 200*time.Millisecond)
+	_, err := r.Run(context.Background(), []string{"job", "wait", "--id", "J1"}, nil, io.Discard, io.Discard, 2*time.Second)
 	elapsed := time.Since(start)
 	var de *soho.ErrDeadline
 	if !errors.As(err, &de) {
 		t.Fatalf("Run: err = %v, want ErrDeadline", err)
 	}
 	if elapsed < 150*time.Millisecond {
-		t.Errorf("killed after %s, before the bound (200ms)", elapsed)
+		t.Errorf("killed after %s, before the bound (2s)", elapsed)
 	}
 	if elapsed >= 8*time.Second {
-		t.Errorf("killed after %s, beyond bound + WaitDelay (5.2s)", elapsed)
+		t.Errorf("killed after %s, beyond bound + WaitDelay (7s)", elapsed)
+	}
+	if runtime.GOOS != "windows" {
+		// On unix the SIGTERM at the bound is ignored by the fake, so
+		// only the 5s WaitDelay can end the run: the elapsed time must
+		// sit close to bound + WaitDelay (~7s), proving the kill came
+		// from the grace period, not from the signal. Windows kills at
+		// the bound, so that assertion is skipped there.
+		if elapsed < 4*time.Second {
+			t.Errorf("killed after %s, before bound + WaitDelay (~7s): the SIGTERM, not the grace period, ended the run", elapsed)
+		}
+	}
+}
+
+// holdWriter blocks its first Write until the test closes release, then
+// records the bytes and closes done; later Writes just record. Blocking
+// on a channel instead of sleeping keeps the stall deterministic: it
+// outlives the 5s WaitDelay without racing any sleep against the
+// timer.
+type holdWriter struct {
+	first   atomic.Bool
+	release chan struct{}
+	done    chan struct{}
+	buf     bytes.Buffer
+}
+
+func newHoldWriter() *holdWriter {
+	return &holdWriter{release: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (w *holdWriter) Write(p []byte) (int, error) {
+	if w.first.Swap(true) {
+		return w.buf.Write(p)
+	}
+	<-w.release
+	n, err := w.buf.Write(p)
+	close(w.done)
+	return n, err
+}
+
+// unblock releases the first Write; waitDone bounds the wait for it to
+// finish into the writer. unblock must be called exactly once (from
+// whichever point the test decides: after Run returned, or from a
+// goroutine on its own schedule).
+func (w *holdWriter) unblock() {
+	close(w.release)
+}
+
+func (w *holdWriter) waitDone(t *testing.T) {
+	t.Helper()
+	select {
+	case <-w.done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the writer did not finish after release")
+	}
+}
+
+// TestSohoRunNonZeroExitStdoutPastBound: the child exits 7 on its own,
+// but its stdout is still being delivered (a stalled consumer blocks
+// the first Write) when the bound expires. The runner must report the
+// child's own exit code (7), not a deadline: the bound firing is not
+// the child's cause of death. The writer is released from a goroutine
+// after the bound has passed but before the 5s grace period expires, so
+// the copy finishes first and the exit-7 path is decided from the
+// child's own ExitError; if a loaded runner lets the grace period win
+// instead, the same (7, nil) must hold from the process state.
+func TestSohoRunNonZeroExitStdoutPastBound(t *testing.T) {
+	exe, _ := installFake(t,
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J7-cal"}, Stdout: "done\n", Code: 7},
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J7"}, Stdout: "done\n", Code: 7, HoldPipeMs: 4000},
+	)
+	r := soho.Runner{Bin: exe, Environ: childEnv}
+	argv := []string{"job", "status", "--id", "J7"}
+	// Calibrate a plain exit (no pipe hold) on this machine so the
+	// bound below sits after the child has already exited on its own.
+	var cal bytes.Buffer
+	calStart := time.Now()
+	code, err := r.Run(context.Background(), []string{"job", "status", "--id", "J7-cal"}, nil, &cal, io.Discard, 30*time.Second)
+	base := time.Since(calStart)
+	waitDrain(t, r)
+	if err != nil || code != 7 || cal.String() != "done\n" {
+		t.Fatalf("calibrate: exit = %d, err = %v, out = %q, want (7, nil, \"done\\n\")", code, err, cal.String())
+	}
+	t.Logf("calibrate elapsed=%s", base)
+	// bound = measured exit + 2s: after the child's own exit and before
+	// the pipe holder gives up (4s), so the bound fires while the
+	// copy is still draining. The release at bound + 1s stays before
+	// the holder exits for any calibration under 1s.
+	bound := base + 2*time.Second
+	w := newHoldWriter()
+	go func() {
+		time.Sleep(bound + time.Second)
+		close(w.release)
+	}()
+	start := time.Now()
+	code, err = r.Run(context.Background(), argv, nil, w, io.Discard, bound)
+	elapsed := time.Since(start)
+	t.Logf("past bound: exit=%d err=%v elapsed=%s bound=%s", code, err, elapsed, bound)
+	if err != nil || code != 7 {
+		t.Fatalf("Run: exit = %d, err = %v, want (7, nil): the child exited 7 on its own", code, err)
+	}
+	if elapsed >= 10*time.Second {
+		t.Fatalf("elapsed = %s, want well under the 10s ceiling", elapsed)
+	}
+	// The release already happened from the goroutine above; wait for
+	// the in-flight write to finish into the writer.
+	w.waitDone(t)
+	if w.buf.String() != "done\n" {
+		t.Errorf("stdout = %q, want \"done\\n\"", w.buf.String())
+	}
+}
+
+// TestSohoRunZeroExitPastWaitDelay: the child exits 0 on its own, but
+// its stdout stays blocked in the runner's stdout writer past the
+// runner's WaitDelay grace period (the fake also holds the pipe open
+// past the grace period, so the copy goroutine is still draining when
+// it fires), and Wait reports the grace period expiring while the bound
+// (60s) is far away. The runner must report the child's exit (0) and
+// emit exactly one friction diagnostic, not a deadline — and must
+// return while the writer is still blocked, because close never waits
+// for the in-flight Write.
+func TestSohoRunZeroExitPastWaitDelay(t *testing.T) {
+	exe, _ := installFake(t, fakesoho.Rule{
+		Argv:       []string{"job", "status", "--id", "J0"},
+		Stdout:     "done\n",
+		Code:       0,
+		HoldPipeMs: 8000,
+	})
+	r := soho.Runner{Bin: exe, Environ: childEnv}
+	var diags []string
+	r.Diag = func(msg string) { diags = append(diags, msg) }
+	argv := []string{"job", "status", "--id", "J0"}
+	w := newHoldWriter()
+	start := time.Now()
+	code, err := r.Run(context.Background(), argv, nil, w, io.Discard, 60*time.Second)
+	elapsed := time.Since(start)
+	t.Logf("past WaitDelay: exit=%d err=%v diags=%d elapsed=%s", code, err, len(diags), elapsed)
+	if err != nil || code != 0 {
+		t.Fatalf("Run: exit = %d, err = %v, want (0, nil): the child exited 0 on its own", code, err)
+	}
+	// Run returned about one grace period after the child's fast exit,
+	// while the writer was still blocked: the deadline is decided by
+	// the grace period, not by the stalled consumer. The pipe holder
+	// (8s) keeps the copy in flight past the 5s grace period, so the
+	// grace period is what fired.
+	if elapsed < 4*time.Second || elapsed >= 15*time.Second {
+		t.Fatalf("elapsed = %s, want >= 4s and < 15s (about the 5s grace period)", elapsed)
+	}
+	if len(diags) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly 1: %v", len(diags), diags)
+	}
+	want := "herdr-soho job status exited 0 but its output did not drain within 5s; output may be truncated"
+	if diags[0] != want {
+		t.Errorf("diagnostic = %q, want %q", diags[0], want)
+	}
+	w.unblock()
+	w.waitDone(t)
+	if w.buf.String() != "done\n" {
+		t.Errorf("stdout = %q, want \"done\\n\"", w.buf.String())
 	}
 }
 

@@ -3,10 +3,12 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -724,14 +726,19 @@ func TestJobForwardBookkeepingStartOmittedStatus(t *testing.T) {
 // TestJobForwardDeadlineTimeout: a child killed at the bound exits 4 and,
 // when the child wrote nothing to stdout, prints exactly one timeout
 // line; when the child already wrote, stdout keeps only the child's
-// bytes (no timeout line) and the stderr diagnostic stays.
+// bytes (no timeout line) and the stderr diagnostic stays. Both rules
+// use ExitOnTerm 1: with a plain delay the fake ignores SIGTERM, so
+// each sub would take bound + the runner's WaitDelay (~5.5s) here;
+// exiting 1 on SIGTERM keeps the test fast and mirrors the Windows
+// failure mode. The WaitDelay grace period itself is locked in the
+// soho package (TestSohoRunDeadline).
 func TestJobForwardDeadlineTimeout(t *testing.T) {
 	oldDefault, oldMargin := jobDefaultBound, jobBoundMargin
 	jobDefaultBound, jobBoundMargin = 500*time.Millisecond, 500*time.Millisecond
 	defer func() { jobDefaultBound, jobBoundMargin = oldDefault, oldMargin }()
 	exe, _ := installFakeSoho(t,
-		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J1"}, Delay: 5000, Code: 0},
-		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J2"}, Stdout: `{"id":"J2"}` + "\n", StdoutFirst: true, Delay: 5000, Code: 0},
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J1"}, Delay: 5000, Code: 0, ExitOnTerm: 1},
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J2"}, Stdout: `{"id":"J2"}` + "\n", StdoutFirst: true, Delay: 5000, Code: 0, ExitOnTerm: 1},
 	)
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
@@ -763,6 +770,120 @@ func TestJobForwardDeadlineTimeout(t *testing.T) {
 	}
 	if stderr == "" {
 		t.Errorf("output deadline: stderr empty, want the diagnostic kept")
+	}
+}
+
+// holdFirstWrite blocks its first Write until the test closes release,
+// then forwards every byte to w and closes done; it simulates a stdout
+// consumer that stalls longer than the runner's WaitDelay grace period.
+type holdFirstWrite struct {
+	first   atomic.Bool
+	release chan struct{}
+	done    chan struct{}
+	w       io.Writer
+}
+
+func (h *holdFirstWrite) Write(p []byte) (int, error) {
+	if h.first.Swap(true) {
+		return h.w.Write(p)
+	}
+	<-h.release
+	n, err := h.w.Write(p)
+	close(h.done)
+	return n, err
+}
+
+// TestJobForwardStartSlowStdoutBookkeeping: a start whose stdout
+// delivery stalls longer than the runner's WaitDelay grace period still
+// exits 0 with exactly the child's stdout bytes; the job is tracked and
+// one dispatch record is appended (the runner captured the start line
+// into its own buffer before the slow consumer), and one friction line
+// and one stderr diagnostic record the truncated output.
+func TestJobForwardStartSlowStdoutBookkeeping(t *testing.T) {
+	exe, _ := installFakeSoho(t, fakesoho.Rule{
+		Argv:       []string{"job", "start", "--id", "J1", "--repo", "org/repo"},
+		Stdout:     `{"id":"J1","status":"running"}` + "\n",
+		Code:       0,
+		HoldPipeMs: 8000,
+	})
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	// The friction line is best effort and does not create the state
+	// dir: pre-create it (mode 0700, as outbox.Open does) so the
+	// diagnostic lands in friction.log the way it would on a machine
+	// with existing state.
+	if err := os.MkdirAll(outbox.StateDir(cfgDir), 0o700); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+	// The stdout writer blocks its first Write until the test releases
+	// it, past the runner's 5s WaitDelay (the fake also holds the pipe
+	// open past the grace period, so the copy is still draining when it
+	// fires): the child's line is still in flight when Run returns, so
+	// bookkeeping can only see it from the runner's own buffer (written
+	// before the stalled consumer).
+	var out, errb bytes.Buffer
+	slowStdout := &holdFirstWrite{release: make(chan struct{}), done: make(chan struct{}), w: &out}
+	env := Env{
+		Stdin:     strings.NewReader("brief"),
+		Stdout:    slowStdout,
+		Stderr:    &errb,
+		Getenv:    getenvFor(false),
+		Environ:   func() []string { return fakeChildEnv },
+		ConfigDir: cfgDir,
+		Now:       func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Sleep:     sleepCtx,
+	}
+	start := time.Now()
+	exit := Run([]string{"job", "start", "--id", "J1", "--repo", "org/repo"}, env)
+	t.Logf("slow stdout start: exit=%d elapsed=%s", exit, time.Since(start))
+	if exit != 0 {
+		t.Fatalf("start: exit = %d, want 0 (stdout %q, stderr %q)", exit, out.String(), errb.String())
+	}
+	// The bookkeeping ran while the consumer was still stalled, so the
+	// record and the job state can only have come from the buffer the
+	// runner wrote first. Release the stalled consumer only now, and
+	// bounded-wait for the in-flight write to finish into out before
+	// reading it.
+	close(slowStdout.release)
+	select {
+	case <-slowStdout.done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the stalled stdout writer did not finish after release")
+	}
+	if out.String() != `{"id":"J1","status":"running"}`+"\n" {
+		t.Fatalf("stdout = %q, want exactly the child's line", out.String())
+	}
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	jobs, err := s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || j.Projeto != "org/repo" || j.Estado != "running" || j.Closed {
+		t.Errorf("job J1 not tracked correctly: %+v", jobs.Jobs)
+	}
+	recs := readOutboxRecords(t, cfgDir)
+	if len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
+	if recs[0].Tipo != outbox.TipoDispatch || recs[0].JobID == nil || *recs[0].JobID != "J1" {
+		t.Errorf("dispatch record = %+v", recs[0])
+	}
+	if string(recs[0].Dados) != `{"id":"J1","status":"running"}` {
+		t.Errorf("dispatch dados = %s", recs[0].Dados)
+	}
+	wantDiag := "herdr-soho job start exited 0 but its output did not drain within 5s; output may be truncated"
+	fb, err := os.ReadFile(filepath.Join(outbox.StateDir(cfgDir), "friction.log"))
+	if err != nil {
+		t.Fatalf("friction.log: %v", err)
+	}
+	if !strings.Contains(string(fb), wantDiag) {
+		t.Errorf("friction.log = %q, want the diagnostic %q", fb, wantDiag)
+	}
+	if !strings.Contains(errb.String(), "herdr-hermes: "+wantDiag) {
+		t.Errorf("stderr = %q, want the diagnostic kept", errb.String())
 	}
 }
 
@@ -802,5 +923,56 @@ func TestJobForwardNowrite(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfgDir, "state")); !os.IsNotExist(err) {
 		t.Errorf("state dir created under NOWRITE")
+	}
+}
+
+// TestJobForwardStalledDeliveryFriction: a child that exits 0 at once
+// while the stdout consumer stalls past the delivery bound still exits 0
+// with its bookkeeping, and the forwarder records one friction line and
+// one stderr diagnostic that the output may be truncated.
+func TestJobForwardStalledDeliveryFriction(t *testing.T) {
+	saved := deliveryWait
+	deliveryWait = 300 * time.Millisecond
+	t.Cleanup(func() { deliveryWait = saved })
+	exe, _ := installFakeSoho(t, fakesoho.Rule{
+		Argv:   []string{"job", "start", "--id", "J1", "--repo", "org/repo"},
+		Stdout: `{"id":"J1","status":"running"}` + "\n",
+	})
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	if err := os.MkdirAll(outbox.StateDir(cfgDir), 0o700); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+	var out, errb bytes.Buffer
+	slowStdout := &holdFirstWrite{release: make(chan struct{}), done: make(chan struct{}), w: &out}
+	env := Env{
+		Stdin:     strings.NewReader("brief"),
+		Stdout:    slowStdout,
+		Stderr:    &errb,
+		Getenv:    getenvFor(false),
+		Environ:   func() []string { return fakeChildEnv },
+		ConfigDir: cfgDir,
+		Now:       func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Sleep:     sleepCtx,
+	}
+	exit := Run([]string{"job", "start", "--id", "J1", "--repo", "org/repo"}, env)
+	close(slowStdout.release)
+	select {
+	case <-slowStdout.done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the stalled stdout writer did not finish after release")
+	}
+	if exit != 0 {
+		t.Fatalf("start: exit = %d, want 0 (stderr %q)", exit, errb.String())
+	}
+	if recs := readOutboxRecords(t, cfgDir); len(recs) != 1 || recs[0].Tipo != outbox.TipoDispatch {
+		t.Fatalf("records = %+v, want one dispatch record", recs)
+	}
+	logData, err := os.ReadFile(filepath.Join(outbox.StateDir(cfgDir), "friction.log"))
+	if err != nil || strings.Count(string(logData), "did not finish delivering") != 1 {
+		t.Fatalf("friction.log = %q (%v), want one delivery line", logData, err)
+	}
+	if strings.Count(errb.String(), "did not finish delivering") != 1 {
+		t.Fatalf("stderr = %q, want one delivery diagnostic", errb.String())
 	}
 }
