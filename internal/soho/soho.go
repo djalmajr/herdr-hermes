@@ -60,9 +60,11 @@ type Runner struct {
 // context deadline of bound plus the WaitDelay grace period. stdin is
 // streamed to the child; the child's stdout and stderr are copied
 // unchanged to the given writers. It returns the child exit code
-// unchanged when the child exits; ErrUnavailable when the executable is
-// missing or not runnable; ErrDeadline when the bound expired and the
-// child was killed without an exit code.
+// unchanged when the child exits on its own before the bound; ErrDeadline
+// when the bound expired and the child was killed — decided from the
+// context, because on Windows the kill surfaces as an ordinary exit code
+// (TerminateProcess); ErrUnavailable when the executable is missing or
+// not runnable.
 func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, bound time.Duration) (int, error) {
 	if bound <= 0 {
 		bound = defaultBound
@@ -92,6 +94,14 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 	err = cmd.Wait()
 	if err == nil {
 		return 0, nil
+	}
+	// The deadline is decided from the context, not from how the child
+	// died: on Windows the deadline kill surfaces as an ordinary exit
+	// code (TerminateProcess, code 1), so an expired bound reports
+	// ErrDeadline whatever Wait returned. A child that exited on its own
+	// before the bound (ctx.Err() == nil) keeps its code unchanged.
+	if ctx.Err() == context.DeadlineExceeded {
+		return -1, &ErrDeadline{Bound: bound}
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {

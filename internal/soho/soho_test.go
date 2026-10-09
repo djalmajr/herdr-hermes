@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,8 +120,22 @@ func TestSohoRunChildEnv(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("calls = %d, want 1", len(calls))
 	}
-	if len(calls[0].Env) != 2 || calls[0].Env[0] != "A=1" || calls[0].Env[1] != "B=two words" {
-		t.Errorf("child env = %v, want [A=1 B=two words]", calls[0].Env)
+	env := calls[0].Env
+	if runtime.GOOS == "windows" {
+		// The Go runtime adds SYSTEMROOT to a child environment on
+		// Windows when it is missing; that is the standard library's
+		// behavior, not a leak, so it is ignored before the exact
+		// comparison (which stays exact on every other OS).
+		var kept []string
+		for _, kv := range env {
+			if !strings.HasPrefix(kv, "SYSTEMROOT=") {
+				kept = append(kept, kv)
+			}
+		}
+		env = kept
+	}
+	if len(env) != 2 || env[0] != "A=1" || env[1] != "B=two words" {
+		t.Errorf("child env = %v, want [A=1 B=two words]", env)
 	}
 }
 
@@ -144,6 +160,33 @@ func TestSohoRunDeadline(t *testing.T) {
 	}
 	if elapsed >= 8*time.Second {
 		t.Errorf("killed after %s, beyond bound + WaitDelay (5.2s)", elapsed)
+	}
+}
+
+// TestSohoRunDeadlineExitCode: a child killed at the bound is reported as
+// ErrDeadline even when the kill ends in an ordinary exit code, exactly
+// the Windows failure mode (TerminateProcess exits with code 1): the
+// deadline is decided from the context, not from how the child died.
+// The late child uses ExitOnTerm 1 so that on unix it exits 1 on
+// SIGTERM, the same way a Windows child exits 1 on TerminateProcess;
+// its bound (2s) is long enough that the fake installs its signal
+// handler before the kill (a cold fake start can take a while). The
+// control child that exits 1 on its own before the bound still returns
+// 1 unchanged.
+func TestSohoRunDeadlineExitCode(t *testing.T) {
+	exe, _ := installFake(t,
+		fakesoho.Rule{Argv: []string{"job", "wait", "--id", "late"}, Delay: 30000, Code: 1, ExitOnTerm: 1},
+		fakesoho.Rule{Argv: []string{"job", "wait", "--id", "early"}, Code: 1},
+	)
+	r := soho.Runner{Bin: exe, Environ: childEnv}
+	_, err := r.Run(context.Background(), []string{"job", "wait", "--id", "late"}, nil, io.Discard, io.Discard, 2*time.Second)
+	var de *soho.ErrDeadline
+	if !errors.As(err, &de) {
+		t.Fatalf("deadline child: err = %v, want ErrDeadline", err)
+	}
+	code, err := r.Run(context.Background(), []string{"job", "wait", "--id", "early"}, nil, io.Discard, io.Discard, 10*time.Second)
+	if err != nil || code != 1 {
+		t.Fatalf("early child: exit = %d, err = %v, want (1, nil)", code, err)
 	}
 }
 

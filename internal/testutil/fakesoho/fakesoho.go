@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -44,6 +45,12 @@ type Rule struct {
 	// then the stderr and the exit; the default is delay, stdout,
 	// stderr, exit.
 	StdoutFirst bool `json:"stdout_first,omitempty"`
+	// ExitOnTerm, when non-zero, makes the fake install a signal
+	// handler (os.Interrupt and SIGTERM where it exists) before its
+	// delay and exit with that code on a signal — a child killed at the
+	// bound that still ends with an ordinary exit code, as a Windows
+	// child does under TerminateProcess. Default behavior is unchanged.
+	ExitOnTerm int `json:"exit_on_term,omitempty"`
 }
 
 // Call is one logged invocation: the argv, the full stdin and the full
@@ -185,15 +192,11 @@ func Main() {
 			// no user-space buffering), so the parent sees it before
 			// the delay; then stderr and the exit.
 			_, _ = os.Stdout.Write(stdoutData)
-			if rule.Delay > 0 {
-				time.Sleep(time.Duration(rule.Delay) * time.Millisecond)
-			}
+			sleepOrExit(rule, rule.Delay)
 			_, _ = os.Stderr.Write(stderrData)
 			os.Exit(rule.Code)
 		}
-		if rule.Delay > 0 {
-			time.Sleep(time.Duration(rule.Delay) * time.Millisecond)
-		}
+		sleepOrExit(rule, rule.Delay)
 		_, _ = os.Stdout.Write(stdoutData)
 		_, _ = os.Stderr.Write(stderrData)
 		os.Exit(rule.Code)
@@ -241,6 +244,26 @@ func ReadCallsFromPath(file string) ([]Call, error) {
 		calls = append(calls, c)
 	}
 	return calls, nil
+}
+
+// sleepOrExit sleeps for ms milliseconds; if the rule requests an exit
+// code on a terminal signal (ExitOnTerm non-zero) and the process is
+// interrupted (os.Interrupt, plus SIGTERM where it exists) during the
+// sleep, it exits with that code immediately. With ExitOnTerm zero the
+// behavior is the plain sleep.
+func sleepOrExit(rule Rule, ms int) {
+	if rule.ExitOnTerm == 0 {
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		return
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, interruptSignals()...)
+	defer signal.Stop(ch)
+	select {
+	case <-ch:
+		os.Exit(rule.ExitOnTerm)
+	case <-time.After(time.Duration(ms) * time.Millisecond):
+	}
 }
 
 func matches(argv []string, rule Rule) bool {

@@ -570,12 +570,13 @@ func TestJobForwardBookkeepingClose(t *testing.T) {
 	}
 }
 
-// TestJobForwardBookkeepingFailure: an unwritable state dir and an empty
+// TestJobForwardBookkeepingFailure: an uncreatable state dir and an empty
 // machine_label leave the forwarded exit code and stdout unchanged; the
 // failure goes to friction, not to the output.
 func TestJobForwardBookkeepingFailure(t *testing.T) {
-	// Unwritable state: the config dir is read-only, so the state dir
-	// cannot be created. The forward still succeeds.
+	// Uncreatable state: a regular file named "state" blocks the state
+	// directory on every OS (a read-only config dir would only work where
+	// directory mode changes are honored). The forward still succeeds.
 	exe, _ := installFakeSoho(t, fakesoho.Rule{
 		Argv:   []string{"job", "start", "--id", "J1", "--repo", "org/repo"},
 		Stdout: `{"id":"J1","status":"running"}` + "\n",
@@ -583,11 +584,9 @@ func TestJobForwardBookkeepingFailure(t *testing.T) {
 	})
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
-	roDir := cfgDir
-	if err := os.Chmod(roDir, 0o555); err != nil {
-		t.Fatalf("chmod config dir: %v", err)
+	if err := os.WriteFile(filepath.Join(cfgDir, "state"), []byte("blocker"), 0o600); err != nil {
+		t.Fatalf("write state blocker file: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(roDir, 0o755) })
 	stdout, _, exit := runHermes(t, cfgDir, false, "brief", "job", "start", "--id", "J1", "--repo", "org/repo")
 	if exit != 0 {
 		t.Fatalf("start with unwritable state: exit = %d, stdout %q", exit, stdout)
@@ -595,8 +594,8 @@ func TestJobForwardBookkeepingFailure(t *testing.T) {
 	if stdout != `{"id":"J1","status":"running"}`+"\n" {
 		t.Errorf("stdout = %q, want the forwarded line unchanged", stdout)
 	}
-	if _, err := os.Stat(filepath.Join(cfgDir, "state")); !os.IsNotExist(err) {
-		t.Errorf("state dir exists despite the read-only config dir")
+	if st, err := os.Stat(filepath.Join(cfgDir, "state")); err != nil || !st.Mode().IsRegular() {
+		t.Fatalf("state = %v, %v; want the plain blocker file untouched", st, err)
 	}
 	// Empty machine_label: friction instead of the record, the forward is
 	// unchanged.
