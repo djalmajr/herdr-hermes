@@ -114,7 +114,43 @@ func Install(t testing.TB, dir string, rules ...Rule) (exePath string) {
 	if err := os.WriteFile(filepath.Join(dir, scriptName), b, 0o600); err != nil {
 		t.Fatalf("fakesoho: write script: %v", err)
 	}
+	if hold := maxHoldPipeMs(rules); hold > 0 {
+		// A pipe holder runs a copy of the installed executable for up to
+		// hold ms after the fake exits, and Windows refuses to delete a
+		// running executable. Registered after the caller's TempDir, this
+		// cleanup runs first and retries the removal until the holder has
+		// exited, so the TempDir cleanup finds nothing left to fail on.
+		t.Cleanup(func() { removeAllWithin(t, dir, time.Duration(hold)*time.Millisecond+10*time.Second) })
+	}
 	return exePath
+}
+
+// maxHoldPipeMs returns the longest HoldPipeMs among the rules.
+func maxHoldPipeMs(rules []Rule) int {
+	hold := 0
+	for _, r := range rules {
+		if r.HoldPipeMs > hold {
+			hold = r.HoldPipeMs
+		}
+	}
+	return hold
+}
+
+// removeAllWithin removes dir, retrying while a file in it is still in use,
+// for at most d.
+func removeAllWithin(t testing.TB, dir string, d time.Duration) {
+	deadline := time.Now().Add(d)
+	for {
+		err := os.RemoveAll(dir)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("fakesoho: remove %s: %v", dir, err)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // ScriptPath returns the script file installed by Install in dir.
