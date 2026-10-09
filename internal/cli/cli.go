@@ -36,6 +36,11 @@ var commands = []command{
 	// slice 2: job, sync, doctor
 	{"outbox", false, true, cmdOutbox},
 	// slice 3: wake, session, decision, push, auth
+	{"wake", true, true, cmdWake},
+	{"session", true, true, cmdSession},
+	{"decision", true, true, cmdDecision},
+	{"push", true, true, cmdPush},
+	{"auth", false, true, cmdAuth},
 	{"config", false, true, cmdConfig},
 	{"capabilities", false, false, cmdCapabilities},
 	{"version", false, false, cmdVersion},
