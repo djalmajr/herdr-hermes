@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -821,12 +822,13 @@ func TestJobForwardStartSlowStdoutBookkeeping(t *testing.T) {
 	// fires): the child's line is still in flight when Run returns, so
 	// bookkeeping can only see it from the runner's own buffer (written
 	// before the stalled consumer).
-	var out, errb bytes.Buffer
+	var out bytes.Buffer
+	errb := newLineBuffer()
 	slowStdout := &holdFirstWrite{release: make(chan struct{}), done: make(chan struct{}), w: &out}
 	env := Env{
 		Stdin:     strings.NewReader("brief"),
 		Stdout:    slowStdout,
-		Stderr:    &errb,
+		Stderr:    errb,
 		Getenv:    getenvFor(false),
 		Environ:   func() []string { return fakeChildEnv },
 		ConfigDir: cfgDir,
@@ -882,7 +884,7 @@ func TestJobForwardStartSlowStdoutBookkeeping(t *testing.T) {
 	if !strings.Contains(string(fb), wantDiag) {
 		t.Errorf("friction.log = %q, want the diagnostic %q", fb, wantDiag)
 	}
-	if !strings.Contains(errb.String(), "herdr-hermes: "+wantDiag) {
+	if !errb.waitFor("herdr-hermes: "+wantDiag, 5*time.Second) {
 		t.Errorf("stderr = %q, want the diagnostic kept", errb.String())
 	}
 }
@@ -943,12 +945,13 @@ func TestJobForwardStalledDeliveryFriction(t *testing.T) {
 	if err := os.MkdirAll(outbox.StateDir(cfgDir), 0o700); err != nil {
 		t.Fatalf("mkdir state: %v", err)
 	}
-	var out, errb bytes.Buffer
+	var out bytes.Buffer
+	errb := newLineBuffer()
 	slowStdout := &holdFirstWrite{release: make(chan struct{}), done: make(chan struct{}), w: &out}
 	env := Env{
 		Stdin:     strings.NewReader("brief"),
 		Stdout:    slowStdout,
-		Stderr:    &errb,
+		Stderr:    errb,
 		Getenv:    getenvFor(false),
 		Environ:   func() []string { return fakeChildEnv },
 		ConfigDir: cfgDir,
@@ -972,7 +975,169 @@ func TestJobForwardStalledDeliveryFriction(t *testing.T) {
 	if err != nil || strings.Count(string(logData), "did not finish delivering") != 1 {
 		t.Fatalf("friction.log = %q (%v), want one delivery line", logData, err)
 	}
-	if strings.Count(errb.String(), "did not finish delivering") != 1 {
+	if !errb.waitFor("did not finish delivering", 5*time.Second) || strings.Count(errb.String(), "did not finish delivering") != 1 {
 		t.Fatalf("stderr = %q, want one delivery diagnostic", errb.String())
+	}
+}
+
+// stallWriter blocks every Write until release is closed, standing for a
+// consumer that stopped reading (a shared stdout and stderr pipe, for
+// instance).
+type stallWriter struct {
+	release chan struct{}
+	mu      sync.Mutex
+	buf     bytes.Buffer
+}
+
+func (s *stallWriter) Write(p []byte) (int, error) {
+	<-s.release
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+// lineBuffer is a race-free writer whose content a test can wait on: the
+// forwarder writes its own diagnostics without blocking once the consumer
+// may be stalled, so they can land after Run returned.
+type lineBuffer struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	notify chan struct{}
+}
+
+func newLineBuffer() *lineBuffer { return &lineBuffer{notify: make(chan struct{})} }
+
+func (b *lineBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n, err := b.buf.Write(p)
+	close(b.notify)
+	b.notify = make(chan struct{})
+	return n, err
+}
+
+func (b *lineBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitFor reports whether the buffer contains sub within d.
+func (b *lineBuffer) waitFor(sub string, d time.Duration) bool {
+	deadline := time.After(d)
+	for {
+		b.mu.Lock()
+		ok := strings.Contains(b.buf.String(), sub)
+		ch := b.notify
+		b.mu.Unlock()
+		if ok {
+			return true
+		}
+		select {
+		case <-ch:
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+// TestJobForwardStalledSharedStreamReturns: when stdout and stderr are
+// one stalled consumer, the forwarder still returns the child's exit
+// once the delivery bound trips; its own diagnostic never blocks it.
+func TestJobForwardStalledSharedStreamReturns(t *testing.T) {
+	saved := deliveryWait
+	deliveryWait = 300 * time.Millisecond
+	t.Cleanup(func() { deliveryWait = saved })
+	exe, _ := installFakeSoho(t, fakesoho.Rule{
+		Argv:   []string{"job", "status", "--id", "J1"},
+		Stdout: `{"id":"J1","estado":"running"}` + "\n",
+	})
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	if err := os.MkdirAll(outbox.StateDir(cfgDir), 0o700); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+	stall := &stallWriter{release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-stall.release:
+		default:
+			close(stall.release)
+		}
+	})
+	env := Env{
+		Stdin:     strings.NewReader(""),
+		Stdout:    stall,
+		Stderr:    stall,
+		Getenv:    getenvFor(false),
+		Environ:   func() []string { return fakeChildEnv },
+		ConfigDir: cfgDir,
+		Now:       func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Sleep:     sleepCtx,
+	}
+	done := make(chan int, 1)
+	go func() { done <- Run([]string{"job", "status", "--id", "J1"}, env) }()
+	select {
+	case exit := <-done:
+		if exit != 0 {
+			t.Fatalf("status: exit = %d, want 0", exit)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("job status still blocked on the stalled stream 10s after a 300ms delivery bound")
+	}
+	logData, err := os.ReadFile(filepath.Join(outbox.StateDir(cfgDir), "friction.log"))
+	if err != nil || strings.Count(string(logData), "did not finish delivering") != 1 {
+		t.Fatalf("friction.log = %q (%v), want one delivery line", logData, err)
+	}
+}
+
+// TestJobForwardNowriteGraceSkipsDeliveryWait: under NOWRITE a read-only
+// forward whose grace period fired on a zero exit returns right after the
+// runner, without waiting out the delivery bound, and writes no friction.
+func TestJobForwardNowriteGraceSkipsDeliveryWait(t *testing.T) {
+	saved := deliveryWait
+	deliveryWait = 3 * time.Second
+	t.Cleanup(func() { deliveryWait = saved })
+	exe, _ := installFakeSoho(t, fakesoho.Rule{
+		Argv:       []string{"job", "status", "--id", "J1"},
+		Stdout:     `{"id":"J1","estado":"running"}` + "\n",
+		HoldPipeMs: 8000,
+	})
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	slowStdout := &holdFirstWrite{release: make(chan struct{}), done: make(chan struct{}), w: io.Discard}
+	errb := newLineBuffer()
+	env := Env{
+		Stdin:     strings.NewReader(""),
+		Stdout:    slowStdout,
+		Stderr:    errb,
+		Getenv:    getenvFor(true),
+		Environ:   func() []string { return fakeChildEnv },
+		ConfigDir: cfgDir,
+		Now:       func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Sleep:     sleepCtx,
+	}
+	start := time.Now()
+	exit := Run([]string{"job", "status", "--id", "J1"}, env)
+	elapsed := time.Since(start)
+	close(slowStdout.release)
+	select {
+	case <-slowStdout.done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the stalled stdout writer did not finish after release")
+	}
+	if exit != 0 {
+		t.Fatalf("status: exit = %d, want 0 (stderr %q)", exit, errb.String())
+	}
+	// The grace period (5s) ends the runner; waiting out the 3s delivery
+	// bound on top of it would take about 8s.
+	if elapsed >= 7*time.Second {
+		t.Fatalf("returned after %s, want right after the 5s grace period (no %s delivery wait)", elapsed, deliveryWait)
+	}
+	if !errb.waitFor("did not drain within", 5*time.Second) {
+		t.Fatalf("stderr = %q, want the grace-period diagnostic", errb.String())
+	}
+	if _, err := os.Stat(filepath.Join(outbox.StateDir(cfgDir), "friction.log")); !os.IsNotExist(err) {
+		t.Fatalf("friction.log under NOWRITE: stat err = %v, want not exist", err)
 	}
 }

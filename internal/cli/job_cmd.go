@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/djalmajr/herdr-hermes/internal/config"
@@ -151,43 +152,49 @@ func cmdJob(args []string, env Env) int {
 		return 2
 	}
 	runner := soho.Runner{Bin: cfg.HerdrSohoBin, Environ: childEnviron(env)}
-	// A successful exit whose output did not drain within the grace
-	// period leaves one friction line plus the stderr diagnostic;
-	// under NOWRITE neither is written. The flag also records whether
-	// the grace period fired on a zero exit: the only case where the
-	// stdout consumer may still be stalled, so the delivery wait below
-	// is skipped (waiting would sit behind the stalled consumer).
-	var diagFired bool
-	if !nowrite {
-		stateDir := outbox.StateDir(env.ConfigDir)
-		runner.Diag = func(msg string) {
-			diagFired = true
-			outbox.Friction(stateDir, "job", msg)
-			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: %s\n", msg)
+	// stalled records that the consumer of the child's output may still
+	// be stalled: the grace period fired on a zero exit, or the bounded
+	// delivery wait below tripped. From then on the forwarder's own lines
+	// are written without blocking the command, because a stalled stdout
+	// and stderr (often one pipe) must not hold it past its bounds; such a
+	// line may be lost if the consumer never resumes, and the friction
+	// line keeps the diagnostic.
+	var stalled atomic.Bool
+	emit := func(w io.Writer, line string) {
+		if stalled.Load() {
+			go func() { _, _ = io.WriteString(w, line) }()
+			return
 		}
+		_, _ = io.WriteString(w, line)
 	}
+	// diagnose records a possibly truncated output: one friction line
+	// (not under NOWRITE) and one stderr line.
+	diagnose := func(msg string) {
+		stalled.Store(true)
+		if !nowrite {
+			outbox.Friction(outbox.StateDir(env.ConfigDir), "job", msg)
+		}
+		emit(env.Stderr, "herdr-hermes: "+msg+"\n")
+	}
+	// A successful exit whose output did not drain within the grace
+	// period is diagnosed, under NOWRITE too, so the delivery wait below
+	// is skipped in that case (it would sit behind the stalled consumer).
+	runner.Diag = diagnose
 	// awaitDelivery waits for the runner's delivery of the child's
 	// output to the env's writers to finish, so the bytes on env.Stdout
 	// are complete before the command returns. The delivery to the
 	// capture buffer needs no wait (it is written on the copy path);
-	// this only orders the consumer delivery. It is skipped when the
-	// diagnostic fired: the consumer may be stalled and only finishes
-	// when it resumes. When the bounded wait trips, the consumer is
-	// still stalled: one friction line and one stderr line record it.
+	// this only orders the consumer delivery. It is skipped once the
+	// consumer may be stalled; when the bounded wait trips, the output
+	// is diagnosed and the command returns anyway.
 	awaitDelivery := func() {
-		if diagFired {
+		if stalled.Load() {
 			return
 		}
 		select {
 		case <-runner.DrainDone():
 		case <-time.After(deliveryWait):
-			// The consumer is still stalled: the command returns
-			// anyway, and the output may be truncated.
-			msg := fmt.Sprintf("herdr-soho job %s output did not finish delivering within %s; output may be truncated", sub, deliveryWait)
-			if !nowrite {
-				outbox.Friction(outbox.StateDir(env.ConfigDir), "job", msg)
-			}
-			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: %s\n", msg)
+			diagnose(fmt.Sprintf("herdr-soho job %s output did not finish delivering within %s; output may be truncated", sub, deliveryWait))
 		}
 	}
 	var stdoutBuf bytes.Buffer
@@ -220,14 +227,16 @@ func cmdJob(args []string, env Env) int {
 			// delivery first so the forwarder's own lines do not
 			// interleave with the child's bytes on the env's writers.
 			awaitDelivery()
-			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: herdr-soho job %s killed after %s\n", sub, de.Bound)
+			emit(env.Stderr, fmt.Sprintf("herdr-hermes: herdr-soho job %s killed after %s\n", sub, de.Bound))
 			if stdoutBuf.Len() == 0 {
-				_, _ = fmt.Fprintf(env.Stdout, `{"status":"timeout","motivo":"herdr-soho job %s did not finish within %s"}`+"\n", sub, de.Bound)
+				emit(env.Stdout, fmt.Sprintf(`{"status":"timeout","motivo":"herdr-soho job %s did not finish within %s"}`+"\n", sub, de.Bound))
 			}
 			return jobapi.ExitUnavailable
 		}
 		awaitDelivery()
-		fail(env, 2, "herdr-soho job "+sub+": "+rerr.Error())
+		motivo := "herdr-soho job " + sub + ": " + rerr.Error()
+		emit(env.Stderr, "herdr-hermes: "+motivo+"\n")
+		emit(env.Stdout, mustJSON(errorLine{Status: itoa(2), Motivo: motivo})+"\n")
 		return 2
 	}
 	// Bookkeeping after a successful forward; it never changes the exit
