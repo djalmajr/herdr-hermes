@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -228,6 +229,50 @@ func (s *Store) repairTornTail() error {
 	return s.syncFile(f)
 }
 
+// normalizeJobEventData keeps a job_event dados a valid single-line JSON
+// value: surrounding whitespace never reaches the file, a single-line
+// event keeps its exact bytes (spacing and field order included), and a
+// multi-line (pretty-printed) event is compacted into one line.
+func normalizeJobEventData(dados []byte) ([]byte, error) {
+	d := bytes.TrimSpace(dados)
+	if bytes.ContainsAny(d, "\n\r") {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, d); err != nil {
+			return nil, fmt.Errorf("outbox: job_event record has invalid dados: %w", err)
+		}
+		return buf.Bytes(), nil
+	}
+	if !json.Valid(d) {
+		return nil, errors.New("outbox: job_event record has invalid or empty dados")
+	}
+	return d, nil
+}
+
+// jobEventLine marshals one job_event record, embedding the normalized
+// dados bytes verbatim: json.Marshal of the whole record would compact
+// them. The caller normalizes the dados with normalizeJobEventData first,
+// so the line stays one line per record.
+func jobEventLine(r Record) ([]byte, error) {
+	head, err := json.Marshal(struct {
+		Schema         int     `json:"schema"`
+		Seq            int64   `json:"seq"`
+		TS             string  `json:"ts"`
+		Tipo           string  `json:"tipo"`
+		Maquina        string  `json:"maquina"`
+		Projeto        string  `json:"projeto"`
+		JobID          *string `json:"job_id"`
+		IdempotencyKey string  `json:"idempotency_key"`
+	}{r.Schema, r.Seq, r.TS, r.Tipo, r.Maquina, r.Projeto, r.JobID, r.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(head)+len(r.Dados)+16)
+	out = append(out, head[:len(head)-1]...)
+	out = append(out, `,"dados":`...)
+	out = append(out, r.Dados...)
+	return append(out, '}'), nil
+}
+
 // appendLocked appends one record under the caller-held lock: it assigns
 // seq (last seq in the file + 1), ts, the schema and, for non-job_event
 // records, the idempotency key <maquina>:<seq>; then it writes one line and
@@ -252,7 +297,16 @@ func (s *Store) appendLocked(r Record) (Record, error) {
 	if r.Tipo != TipoJobEvent && r.IdempotencyKey == "" {
 		r.IdempotencyKey = r.Maquina + ":" + strconv.FormatInt(r.Seq, 10)
 	}
-	line, err := json.Marshal(&r)
+	if r.Tipo == TipoJobEvent {
+		// The record line must stay one line: normalize the dados before
+		// writing so the returned record equals what was written.
+		d, err := normalizeJobEventData(r.Dados)
+		if err != nil {
+			return r, err
+		}
+		r.Dados = d
+	}
+	line, err := marshalRecord(r)
 	if err != nil {
 		return r, err
 	}
@@ -267,6 +321,16 @@ func (s *Store) appendLocked(r Record) (Record, error) {
 	return r, s.syncFile(f)
 }
 
+// marshalRecord marshals one record into its outbox line. Job events keep
+// the original event bytes in dados verbatim; every other record type is
+// marshaled with the standard encoder.
+func marshalRecord(r Record) ([]byte, error) {
+	if r.Tipo == TipoJobEvent {
+		return jobEventLine(r)
+	}
+	return json.Marshal(&r)
+}
+
 // Append appends one record and returns it with seq, ts, schema and (for
 // non-job_event records) the idempotency key assigned. Job events go through
 // AppendJobEvent, which assigns the <job_id>:<seq> key and dedupes.
@@ -279,33 +343,124 @@ func (s *Store) Append(r Record) (Record, error) {
 	return s.appendLocked(r)
 }
 
-// findRecordByKeyLocked scans outbox.jsonl for a record with the given
-// idempotency key; it returns nil when there is none.
-func (s *Store) findRecordByKeyLocked(key string) (*Record, error) {
+// jobEventsLocked scans outbox.jsonl once and returns the existing record
+// for key (nil when none) and the set of the job's stored event seqs
+// (the key parts of its job_event records), from which the caller derives
+// the contiguous stored prefix with contiguousPrefix. The caller holds
+// the lock.
+func (s *Store) jobEventsLocked(jobID, key string) (*Record, map[int64]bool, error) {
 	data, err := s.readOutbox()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	prefix := jobID + ":"
+	var existing *Record
+	present := map[int64]bool{}
 	for _, line := range completeLines(data) {
 		var r Record
 		if err := json.Unmarshal(line, &r); err != nil {
 			continue
 		}
-		if r.IdempotencyKey == key {
-			return &r, nil
+		if r.Tipo != TipoJobEvent || r.JobID == nil || *r.JobID != jobID {
+			continue
+		}
+		if strings.HasPrefix(r.IdempotencyKey, prefix) {
+			if n, perr := strconv.ParseInt(strings.TrimPrefix(r.IdempotencyKey, prefix), 10, 64); perr == nil && n > 0 {
+				present[n] = true
+			}
+		}
+		if r.IdempotencyKey == key && existing == nil {
+			c := r
+			existing = &c
 		}
 	}
-	return nil, nil
+	return existing, present, nil
+}
+
+// contiguousPrefix returns the contiguous stored prefix: the largest N
+// such that the keys <job_id>:1 .. <job_id>:N are all present (0 when
+// event 1 is absent).
+func contiguousPrefix(present map[int64]bool) int64 {
+	var n int64
+	for present[n+1] {
+		n++
+	}
+	return n
+}
+
+// maxStoredSeq returns the highest seq in the stored set (0 when the set
+// is empty).
+func maxStoredSeq(present map[int64]bool) int64 {
+	var n int64
+	for k := range present {
+		if k > n {
+			n = k
+		}
+	}
+	return n
+}
+
+// JobEventCursor reports the stored progress of the job's job events
+// without writing anything: prefix is the contiguous stored prefix (the
+// largest N such that the keys <job_id>:1 .. <job_id>:N are all present in
+// the outbox, 0 when event 1 is absent) and maxStored is the highest
+// stored event seq (0 when the job has no job_event records). It reuses
+// the jobEventsLocked scan; a read-only store reads without the lock,
+// like LoadJobs.
+func (s *Store) JobEventCursor(jobID string) (prefix, maxStored int64, err error) {
+	if !s.readOnly {
+		l, err := s.lock()
+		if err != nil {
+			return 0, 0, err
+		}
+		defer l.unlock()
+	}
+	_, present, err := s.jobEventsLocked(jobID, "")
+	if err != nil {
+		return 0, 0, err
+	}
+	return contiguousPrefix(present), maxStoredSeq(present), nil
+}
+
+// syncCursorLocked tracks the job in jobs.json when unknown, sets its
+// last_event_seq to the contiguous stored prefix, and writes jobs.json
+// when the value or the job entry changed. The caller holds the lock.
+func (s *Store) syncCursorLocked(jobs *Jobs, jobID, projeto string, prefix int64) error {
+	changed := false
+	j := jobs.Jobs[jobID]
+	if j == nil {
+		ts := s.now().Format(TSLayout)
+		j = &Job{ID: jobID, Projeto: projeto, CreatedAt: ts, UpdatedAt: ts}
+		jobs.Jobs[jobID] = j
+		changed = true
+	}
+	if j.LastEventSeq != prefix {
+		j.LastEventSeq = prefix
+		j.UpdatedAt = s.now().Format(TSLayout)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return s.writeJobsLocked(jobs)
 }
 
 // AppendJobEvent appends one job event. The idempotency key is
-// <job_id>:<event seq> and dados carries the original event bytes unchanged.
-// It is a no-op (appended=false) when jobs.json already records
-// last_event_seq >= event seq for the job, or when a record with the key
-// already exists in the outbox (the window between the append and the
-// jobs.json update, where a crash must not duplicate). The job is tracked in
-// jobs.json when unknown. An event without a positive integer seq is an
-// error.
+// <job_id>:<event seq> and dados carries the original event bytes (a
+// single-line event byte-for-byte, a multi-line one compacted into one
+// line, so the outbox stays one line per record). The key is the durable dedupe: when a record with the key
+// exists it is returned with appended=false, whatever jobs.json says, and
+// when no record exists the event is appended whatever last_event_seq
+// says, so a stale or too-high cursor never makes a missing record count
+// as a duplicate. The job's last_event_seq is the contiguous stored
+// prefix (the largest N such that the keys <job_id>:1 .. <job_id>:N are
+// all present in the outbox, 0 when event 1 is absent), recomputed under
+// the lock from one outbox scan on every call (both the append path and
+// the existing-record path) and written to jobs.json when the value or
+// the job entry changes; recomputing may lower a stale value, which heals
+// the bookkeeping of a crash between the append and the jobs.json write.
+// The job is tracked in jobs.json when unknown. An event without a
+// positive integer seq is an error.
 func (s *Store) AppendJobEvent(maquina, projeto, jobID string, event json.RawMessage) (rec Record, appended bool, err error) {
 	var probe struct {
 		Seq int64 `json:"seq"`
@@ -328,37 +483,14 @@ func (s *Store) AppendJobEvent(maquina, projeto, jobID string, event json.RawMes
 	if err != nil {
 		return rec, false, err
 	}
-	if j, ok := jobs.Jobs[jobID]; ok && j.LastEventSeq >= probe.Seq {
-		// Already durable from a previous append; return the existing record
-		// when it is present.
-		existing, ferr := s.findRecordByKeyLocked(key)
-		if ferr != nil {
-			return rec, false, ferr
-		}
-		if existing != nil {
-			return *existing, false, nil
-		}
-		return rec, false, nil
-	}
-	existing, ferr := s.findRecordByKeyLocked(key)
-	if ferr != nil {
-		return rec, false, ferr
+	existing, present, err := s.jobEventsLocked(jobID, key)
+	if err != nil {
+		return rec, false, err
 	}
 	if existing != nil {
-		// A crash left the outbox record without the jobs.json update: heal
-		// the cursor so later retries take the cheap path.
-		j := jobs.Jobs[jobID]
-		if j == nil {
-			ts := s.now().Format(TSLayout)
-			j = &Job{ID: jobID, Projeto: projeto, CreatedAt: ts, UpdatedAt: ts}
-			jobs.Jobs[jobID] = j
-		}
-		j.LastEventSeq = probe.Seq
-		j.UpdatedAt = s.now().Format(TSLayout)
-		if err := s.writeJobsLocked(jobs); err != nil {
-			return *existing, false, err
-		}
-		return *existing, false, nil
+		// A record with the key already exists; a crash may have left it
+		// without the jobs.json update, so recompute and write the cursor.
+		return *existing, false, s.syncCursorLocked(jobs, jobID, projeto, contiguousPrefix(present))
 	}
 	id := jobID
 	rec = Record{
@@ -373,15 +505,11 @@ func (s *Store) AppendJobEvent(maquina, projeto, jobID string, event json.RawMes
 	if err != nil {
 		return rec, false, err
 	}
-	j, ok := jobs.Jobs[jobID]
-	if !ok {
-		ts := s.now().Format(TSLayout)
-		j = &Job{ID: jobID, Projeto: projeto, CreatedAt: ts, UpdatedAt: ts}
-		jobs.Jobs[jobID] = j
-	}
-	j.LastEventSeq = probe.Seq
-	j.UpdatedAt = s.now().Format(TSLayout)
-	return rec, true, s.writeJobsLocked(jobs)
+	// The new record joins the stored set; the contiguous prefix derived
+	// from the same scan catches both the event right after the prefix
+	// and the one that fills a gap below an already stored higher seq.
+	present[probe.Seq] = true
+	return rec, true, s.syncCursorLocked(jobs, jobID, projeto, contiguousPrefix(present))
 }
 
 // Read returns the raw lines with seq > since, in file order, ignoring a
@@ -542,8 +670,11 @@ func (s *Store) SetDeliveredSeq(n int64) error {
 
 // Job is one tracked job in jobs.json.
 type Job struct {
-	ID           string `json:"id"`
-	Projeto      string `json:"projeto"`
+	ID      string `json:"id"`
+	Projeto string `json:"projeto"`
+	// LastEventSeq is the contiguous stored prefix: the largest N such
+	// that the keys <id>:1 .. <id>:N are all in the outbox (0 when event
+	// 1 is absent), so sync refetches any gap.
 	LastEventSeq int64  `json:"last_event_seq"`
 	Estado       string `json:"estado"`
 	CreatedAt    string `json:"created_at"`
@@ -696,6 +827,38 @@ func (s *Store) UpdateSessions(mutate func(*Sessions) error) error {
 		return err
 	}
 	return s.writeSessionsLocked(ss)
+}
+
+// UpdateSessionsAndAppend makes the session change and the record append
+// one atomic step under one lock: it loads the sessions, calls build (which
+// mutates the in-memory sessions and returns the record to append), appends
+// the record, and only after the append is durable writes sessions.json.
+// When build or the append fails, sessions.json on disk is untouched. When
+// the sessions write fails after a durable append, the appended record and
+// the error are returned: a retry appends one more record with the same
+// fields, which the receiver deduplicates by content.
+func (s *Store) UpdateSessionsAndAppend(build func(*Sessions) (Record, error)) (Record, error) {
+	l, err := s.lock()
+	if err != nil {
+		return Record{}, err
+	}
+	defer l.unlock()
+	ss, err := s.loadSessionsLocked()
+	if err != nil {
+		return Record{}, err
+	}
+	rec, err := build(ss)
+	if err != nil {
+		return rec, err
+	}
+	rec, err = s.appendLocked(rec)
+	if err != nil {
+		return rec, err
+	}
+	if err := s.writeSessionsLocked(ss); err != nil {
+		return rec, err
+	}
+	return rec, nil
 }
 
 // atomicWriteSync is the sync step of WriteFileAtomic; tests replace it to

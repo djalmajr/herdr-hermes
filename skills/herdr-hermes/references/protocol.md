@@ -16,6 +16,8 @@ One JSON line per record, schema 1:
 - `idempotency_key` is `<job_id>:<event seq>` for `job_event` (the same key the job contract uses) and `<maquina>:<outbox seq>` for every other record.
 - `dados` carries the original job event for `job_event`, or the command payload otherwise.
 
+Job events are deduplicated by their idempotency key, and `last_event_seq` is the highest event seq up to which every event of the job is stored, so `sync` refetches any gap.
+
 ## Pull channel
 
 `herdr-hermes outbox [--since <seq>] [--wait <ms>]` prints the records with `seq > since` as JSON lines and always ends with the trailer `{"outbox":"fim","ultimo_seq":N,"entregue_seq":M}`. It is read-only, needs no key and no network, and works under `HERDR_HERMES_NOWRITE=1`.

@@ -105,13 +105,13 @@ func cmdSession(args []string, env Env) int {
 		fail(env, 2, "session "+sub+": "+err.Error())
 		return 2
 	}
-	key, err := sessionTarget(store, sub, flags)
-	if err != nil {
-		fail(env, 2, "session "+sub+": "+err.Error())
-		return 2
-	}
+	// The session change and the record append are one atomic step under
+	// one lock, with the append first: when the append fails the open
+	// session is still there, so a retry writes the end record with the
+	// branch, card and job.
 	var dados sessionDados
-	err = store.UpdateSessions(func(ss *outbox.Sessions) error {
+	rec, err := store.UpdateSessionsAndAppend(func(ss *outbox.Sessions) (outbox.Record, error) {
+		key := sessionTarget(ss, sub, flags)
 		e := ss.Sessions[key]
 		now := env.Now().Format(outbox.TSLayout)
 		if e == nil {
@@ -147,18 +147,13 @@ func cmdSession(args []string, env Env) int {
 			// Open sessions only: closing the session removes the entry.
 			delete(ss.Sessions, key)
 		}
-		return nil
-	})
-	if err != nil {
-		fail(env, 2, "session "+sub+": "+err.Error())
-		return 2
-	}
-	rec, err := store.Append(outbox.Record{
-		Tipo:    outbox.TipoSession,
-		Maquina: cfg.MachineLabel,
-		Projeto: flags.projeto,
-		JobID:   jobIDPtr(dados.Job),
-		Dados:   mustMarshal(dados),
+		return outbox.Record{
+			Tipo:    outbox.TipoSession,
+			Maquina: cfg.MachineLabel,
+			Projeto: flags.projeto,
+			JobID:   jobIDPtr(dados.Job),
+			Dados:   mustMarshal(dados),
+		}, nil
 	})
 	if err != nil {
 		fail(env, 2, "session "+sub+": "+err.Error())
@@ -168,21 +163,19 @@ func cmdSession(args []string, env Env) int {
 	return 0
 }
 
-// sessionTarget resolves the sessions.json key: <projeto>@<branch or job or
-// "">. start and update with --branch use the branch; start with --job (no
-// --branch) uses the job; otherwise it is the most recently updated open
-// session of that projeto (ties: the lexicographically smallest key), and
-// when none exists the key with the empty part.
-func sessionTarget(store *outbox.Store, sub string, flags sessionFlags) (string, error) {
+// sessionTarget resolves the sessions.json key from the already loaded
+// sessions: <projeto>@<branch or job or "">. start and update with --branch
+// use the branch; start with --job (no --branch) uses the job; otherwise
+// it is the most recently updated open session of that projeto (ties: the
+// lexicographically smallest key), and when none exists the key with the
+// empty part. It runs inside the UpdateSessionsAndAppend lock, so it takes
+// the loaded sessions instead of the store (no second lock).
+func sessionTarget(ss *outbox.Sessions, sub string, flags sessionFlags) string {
 	if flags.branch != "" {
-		return flags.projeto + "@" + flags.branch, nil
+		return flags.projeto + "@" + flags.branch
 	}
 	if sub == "start" && flags.job != "" {
-		return flags.projeto + "@" + flags.job, nil
-	}
-	ss, err := store.LoadSessions()
-	if err != nil {
-		return "", err
+		return flags.projeto + "@" + flags.job
 	}
 	prefix := flags.projeto + "@"
 	var best *outbox.Session
@@ -197,9 +190,9 @@ func sessionTarget(store *outbox.Store, sub string, flags sessionFlags) (string,
 		}
 	}
 	if best == nil {
-		return prefix, nil
+		return prefix
 	}
-	return bestKey, nil
+	return bestKey
 }
 
 // parseSessionFlags parses the --flag value pairs of a session subcommand.

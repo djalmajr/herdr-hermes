@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -161,7 +162,10 @@ func helperArgs() (dir string, n int, startFile string, ok bool) {
 
 // TestOutboxSeqConsecutiveProcesses: two OS processes that are both blocked
 // inside the lock region at the same time append through the lock file and
-// the seqs come out consecutive with no gap or duplicate.
+// the seqs come out consecutive with no gap or duplicate. The children run
+// under a context deadline (60 s) with a WaitDelay (5 s), and a cleanup
+// cancels the context and reaps every started child, so a failing or hung
+// test kills and reaps all children.
 func TestOutboxSeqConsecutiveProcesses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("re-executes the test binary")
@@ -169,18 +173,29 @@ func TestOutboxSeqConsecutiveProcesses(t *testing.T) {
 	dir := t.TempDir()
 	const perProcess = 25
 	startFile := filepath.Join(dir, "start")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var started []*exec.Cmd
+	t.Cleanup(func() {
+		cancel()
+		for _, c := range started {
+			_ = c.Wait()
+		}
+	})
 	cmds := make([]*exec.Cmd, 2)
 	outBufs := make([]*bytes.Buffer, 2)
 	for p := 0; p < 2; p++ {
 		outBufs[p] = &bytes.Buffer{}
-		cmds[p] = exec.Command(os.Args[0],
+		cmds[p] = exec.CommandContext(ctx, os.Args[0],
 			"-test.run=TestOutboxHelperProcess",
 			"--", dir, strconv.Itoa(perProcess), startFile)
 		cmds[p].Stdout = outBufs[p]
 		cmds[p].Stderr = outBufs[p]
+		cmds[p].WaitDelay = 5 * time.Second
 		if err := cmds[p].Start(); err != nil {
 			t.Fatalf("start process %d: %v", p, err)
 		}
+		started = append(started, cmds[p])
 	}
 	// Both children write a ready marker before they start polling the
 	// start file; wait until both are inside the block so the append
@@ -940,5 +955,86 @@ func TestOutboxWriteFileAtomic(t *testing.T) {
 		if e.Name() != "target.json" {
 			t.Errorf("leftover file %q", e.Name())
 		}
+	}
+}
+
+// TestOutboxUpdateSessionsAndAppend: the session change and the record
+// append are one atomic step under one lock. An append failure leaves
+// sessions.json unchanged, a build error appends nothing, the success path
+// appends exactly one record and writes the session change, and the method
+// returns (no deadlock) on every path.
+func TestOutboxUpdateSessionsAndAppend(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 0444 does not prevent writes on Windows")
+	}
+	dir := t.TempDir()
+	s := openStore(t, dir)
+	if _, err := s.Append(Record{Tipo: TipoDispatch, Maquina: testMaquina, Projeto: testProjeto, Dados: json.RawMessage(`{"seed":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateSessions(func(ss *Sessions) error {
+		ss.Sessions[testProjeto+"@b1"] = &Session{Projeto: testProjeto, Branch: "b1", StartedAt: "2026-01-02T03:04:05-03:00", UpdatedAt: "2026-01-02T03:04:05-03:00"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(s.sessionsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An append failure (a read-only outbox) leaves sessions.json
+	// unchanged and appends nothing.
+	if err := os.Chmod(s.outboxPath(), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateSessionsAndAppend(func(ss *Sessions) (Record, error) {
+		delete(ss.Sessions, testProjeto+"@b1")
+		return Record{Tipo: TipoSession, Maquina: testMaquina, Projeto: testProjeto, Dados: json.RawMessage(`{"acao":"end"}`)}, nil
+	}); err == nil {
+		t.Fatal("UpdateSessionsAndAppend succeeded with a read-only outbox")
+	}
+	if err := os.Chmod(s.outboxPath(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := os.ReadFile(s.sessionsPath()); err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("sessions.json changed on a failed append: %v\nbefore %s\nafter %s", err, before, after)
+	}
+	if lines, _, err := s.Read(0); err != nil || len(lines) != 1 {
+		t.Fatalf("a failed append left %d records, want only the seed", len(lines))
+	}
+	// A build error appends nothing and leaves sessions.json unchanged.
+	if _, err := s.UpdateSessionsAndAppend(func(ss *Sessions) (Record, error) {
+		return Record{}, errors.New("build failed")
+	}); err == nil {
+		t.Fatal("UpdateSessionsAndAppend succeeded with a failing build")
+	}
+	if after, err := os.ReadFile(s.sessionsPath()); err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("sessions.json changed on a build error: %v", err)
+	}
+	if lines, _, err := s.Read(0); err != nil || len(lines) != 1 {
+		t.Fatalf("a build error left %d records, want only the seed", len(lines))
+	}
+	// The success path appends exactly one record and writes the session
+	// change.
+	rec, err := s.UpdateSessionsAndAppend(func(ss *Sessions) (Record, error) {
+		delete(ss.Sessions, testProjeto+"@b1")
+		return Record{Tipo: TipoSession, Maquina: testMaquina, Projeto: testProjeto, Dados: json.RawMessage(`{"acao":"end"}`)}, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateSessionsAndAppend: %v", err)
+	}
+	if rec.Seq != 2 || rec.Tipo != TipoSession {
+		t.Fatalf("record = %+v, want the appended session record", rec)
+	}
+	lines, last, err := s.Read(0)
+	if err != nil || len(lines) != 2 || last != 2 {
+		t.Fatalf("Read = %d lines, last %d, err %v; want the seed plus one record", len(lines), last, err)
+	}
+	ss, err := s.LoadSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ss.Sessions) != 0 {
+		t.Fatalf("sessions.json = %+v, want the session change written", ss)
 	}
 }

@@ -92,11 +92,25 @@ func runSync(ctx context.Context, env Env, jobID string, pushOnly bool) (syncRes
 	jobCount := 0
 	for _, id := range ids {
 		j := jobs.Jobs[id]
-		if j.Closed || isSyncTerminal(j.Estado) {
+		// The --since value is always the recomputed contiguous stored
+		// prefix, never the recorded cursor: a legacy or stale cursor
+		// above the stored records would make the sync skip the gap.
+		prefix, maxStored, cerr := store.JobEventCursor(id)
+		if cerr != nil {
+			outbox.Friction(outbox.StateDir(env.ConfigDir), "sync", "job "+id+": "+cerr.Error())
+			continue
+		}
+		// Gap evidence: a stored record above a hole, or a recorded
+		// cursor above what is stored. A closed or terminal job is
+		// skipped only when it has no gap; with gap evidence it is
+		// synced like an open job (and keeps Closed as it is), so the
+		// missing records below the gap are never lost.
+		gap := maxStored > prefix || j.LastEventSeq > prefix
+		if (j.Closed || isSyncTerminal(j.Estado)) && !gap {
 			continue
 		}
 		jobCount++
-		res, err := runner.Events(ctx, id, j.LastEventSeq)
+		res, err := runner.Events(ctx, id, prefix)
 		if err != nil {
 			outbox.Friction(outbox.StateDir(env.ConfigDir), "sync", "job "+id+": "+err.Error())
 			continue

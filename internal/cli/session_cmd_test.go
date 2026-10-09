@@ -3,6 +3,8 @@ package cli
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -226,6 +228,58 @@ func TestSession(t *testing.T) {
 	dirEmpty := t.TempDir()
 	if _, _, exit := runCLIStdin(t, dirEmpty, "", nil, "session", "start", "--projeto", "org/repo"); exit != 2 {
 		t.Errorf("session with empty machine_label: exit %d, want 2", exit)
+	}
+}
+
+// TestSessionEndAppendFailureKeepsFields: when the outbox is not writable,
+// session end fails before it removes the open session, so a retry after
+// restoring the mode writes the end record with branch, card and job and
+// closes the session.
+func TestSessionEndAppendFailureKeepsFields(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 0444 does not prevent writes on Windows")
+	}
+	dir := t.TempDir()
+	setConfig(t, dir, map[string]string{"machine_label": "m1"})
+	stdout, stderr, exit := runCLIStdin(t, dir, "", nil, "session", "start", "--projeto", "org/repo", "--branch", "b1", "--card", "c1", "--job", "job-1")
+	if exit != 0 {
+		t.Fatalf("session start exit = %d, stderr %q", exit, stderr)
+	}
+	outboxPath := filepath.Join(dir, "state", "outbox.jsonl")
+	if err := os.Chmod(outboxPath, 0o444); err != nil {
+		t.Fatalf("chmod 0444: %v", err)
+	}
+	defer os.Chmod(outboxPath, 0o600)
+	stdout, stderr, exit = runCLIStdin(t, dir, "", nil, "session", "end", "--projeto", "org/repo", "--estado", "done")
+	if exit != 2 {
+		t.Fatalf("session end with a read-only outbox: exit = %d, want 2 (stdout %q stderr %q)", exit, stdout, stderr)
+	}
+	ss := sessionsFile(t, dir)
+	e := ss.Sessions["org/repo@b1"]
+	if e == nil || e.Branch != "b1" || e.Card != "c1" || e.Job != "job-1" {
+		t.Fatalf("sessions.json after the failed end = %+v, want the open session kept (branch b1, card c1, job job-1)", ss)
+	}
+	// Restore the mode: the retry appends the end record and closes the
+	// session.
+	if err := os.Chmod(outboxPath, 0o600); err != nil {
+		t.Fatalf("chmod 0600: %v", err)
+	}
+	stdout, stderr, exit = runCLIStdin(t, dir, "", nil, "session", "end", "--projeto", "org/repo", "--estado", "done")
+	if exit != 0 {
+		t.Fatalf("session end retry exit = %d, stderr %q", exit, stderr)
+	}
+	rec := sessionRecord(t, dir, 2)
+	var dados map[string]any
+	if err := json.Unmarshal(rec.Dados, &dados); err != nil {
+		t.Fatal(err)
+	}
+	assertDados(t, dados, map[string]any{"acao": "end", "projeto": "org/repo", "branch": "b1", "card": "c1", "job": "job-1", "estado": "done"})
+	if rec.JobID == nil || *rec.JobID != "job-1" {
+		t.Fatalf("end record job_id = %v, want job-1", rec.JobID)
+	}
+	ss = sessionsFile(t, dir)
+	if len(ss.Sessions) != 0 {
+		t.Fatalf("sessions.json after the retry = %+v, want the session closed", ss)
 	}
 }
 

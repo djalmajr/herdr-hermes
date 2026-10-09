@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/djalmajr/herdr-hermes/internal/jobapi"
 	"github.com/djalmajr/herdr-hermes/internal/outbox"
 	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
 )
@@ -52,6 +55,54 @@ func eventLine(seq int, tipo, estado string) string {
 
 func trailer(ultimo int, estado string) string {
 	return `{"eventos":"fim","ultimo_seq":` + intTo(ultimo) + `,"estado":"` + estado + `"}`
+}
+
+// runHermesVars is runHermes with the CLI-visible environment variables
+// (the wake hook's HERDR_SOHO_JOB_* variables) set.
+func runHermesVars(t *testing.T, cfgDir string, vars map[string]string, stdin string, args ...string) (string, string, int) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	env := Env{
+		Stdin:     strings.NewReader(stdin),
+		Stdout:    &out,
+		Stderr:    &errb,
+		Getenv:    func(k string) string { return vars[k] },
+		Environ:   func() []string { return fakeChildEnv },
+		ConfigDir: cfgDir,
+		Now:       func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Sleep:     sleepCtx,
+	}
+	exit := Run(args, env)
+	return out.String(), errb.String(), exit
+}
+
+// eventsSinceArgs returns the --since argument of every logged
+// `job events` call.
+func eventsSinceArgs(t *testing.T, fakeDir string) []string {
+	t.Helper()
+	calls, err := fakesoho.ReadCalls(fakeDir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadCalls: %v", err)
+	}
+	var out []string
+	for _, c := range calls {
+		if len(c.Argv) >= 2 && c.Argv[0] == "job" && c.Argv[1] == "events" {
+			out = append(out, c.Argv[len(c.Argv)-1])
+		}
+	}
+	return out
+}
+
+// eventsUpTo is the newline-separated event lines 1..n (tipo accepted).
+func eventsUpTo(n int) string {
+	var b strings.Builder
+	for i := 1; i <= n; i++ {
+		if i > 1 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(eventLine(i, "accepted", ""))
+	}
+	return b.String()
 }
 
 // TestSyncAppendsNewEvents: new events are appended in order from
@@ -116,15 +167,26 @@ func TestSyncTrailerTerminalSkipped(t *testing.T) {
 	)
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
+	// Events 1 and 2 are already durable, so the seeded cursor 2 is the
+	// contiguous stored prefix.
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		if _, appended, err := s.AppendJobEvent("machine-a", "org/repo", "J1", json.RawMessage(eventLine(i, "accepted", ""))); err != nil || !appended {
+			t.Fatalf("event %d: appended=%v err=%v, want true,nil", i, appended, err)
+		}
+	}
 	seedJob(t, cfgDir, "J1", "org/repo", 2, "running")
 	stdout, _, exit := runHermes(t, cfgDir, false, "", "sync", "--job", "J1")
 	if exit != 0 {
 		t.Fatalf("sync --job: exit = %d, stdout %q", exit, stdout)
 	}
-	if stdout != `{"jobs":1,"novos":1,"enviados":0,"pendentes":1}`+"\n" {
+	if stdout != `{"jobs":1,"novos":1,"enviados":0,"pendentes":3}`+"\n" {
 		t.Fatalf("stdout = %q", stdout)
 	}
-	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{ReadOnly: true})
+	s, err = outbox.Open(outbox.StateDir(cfgDir), outbox.Options{ReadOnly: true})
 	if err != nil {
 		t.Fatalf("open state: %v", err)
 	}
@@ -140,7 +202,7 @@ func TestSyncTrailerTerminalSkipped(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("second sync: exit = %d, stdout %q", exit, stdout)
 	}
-	if stdout != `{"jobs":0,"novos":0,"enviados":0,"pendentes":1}`+"\n" {
+	if stdout != `{"jobs":0,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
 		t.Fatalf("second sync stdout = %q", stdout)
 	}
 	calls, err := fakesoho.ReadCalls(fakeDir)
@@ -193,6 +255,166 @@ func TestSyncRetryConverges(t *testing.T) {
 		if r.Tipo != outbox.TipoJobEvent {
 			t.Errorf("record = %+v", r)
 		}
+	}
+}
+
+// TestSyncRecoversGapAfterWake: the wake hook stored event 3 before sync
+// stored 1 and 2; the cursor is the contiguous stored prefix (0), so the
+// sync refetches from 0 and appends the gap in upstream event order after
+// the wake record, with exactly one record per key and the original event
+// bytes in dados; a second sync appends nothing.
+func TestSyncRecoversGapAfterWake(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		eventsRule("J1", 0,
+			eventLine(1, "accepted", "")+"\n"+eventLine(2, "preparing", "")+"\n"+eventLine(3, "question", ""),
+			trailer(3, "running"), 0),
+		eventsRule("J1", 3, "", trailer(3, "running"), 0),
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	seedJob(t, cfgDir, "J1", "org/repo", 0, "accepted")
+	// The wake hook stores event 3 directly; the cursor stays 0 because
+	// events 1 and 2 were never stored.
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	wakeEv := json.RawMessage(eventLine(3, "question", ""))
+	if _, appended, err := s.AppendJobEvent("machine-a", "org/repo", "J1", wakeEv); err != nil || !appended {
+		t.Fatalf("wake event 3: appended=%v err=%v, want true,nil", appended, err)
+	}
+	jobs, err := s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || j.LastEventSeq != 0 {
+		t.Fatalf("after the wake: job J1 = %+v, want last_event_seq 0 (events 1 and 2 absent)", j)
+	}
+	stdout, _, exit := runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":2,"enviados":0,"pendentes":3}`+"\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	calls, err := fakesoho.ReadCalls(fakeDir)
+	if err != nil {
+		t.Fatalf("ReadCalls: %v", err)
+	}
+	var sinceArgs []string
+	for _, c := range calls {
+		if len(c.Argv) >= 2 && c.Argv[0] == "job" && c.Argv[1] == "events" {
+			sinceArgs = append(sinceArgs, c.Argv[len(c.Argv)-1])
+		}
+	}
+	if len(sinceArgs) != 1 || sinceArgs[0] != "0" {
+		t.Fatalf("events --since args = %v, want [0] (the contiguous stored prefix)", sinceArgs)
+	}
+	recs := readOutboxRecords(t, cfgDir)
+	if len(recs) != 3 {
+		t.Fatalf("records = %d, want 3 (one per key)", len(recs))
+	}
+	// Outbox order: the wake record 3 first, then the gap in upstream
+	// event order 1, 2; each record keeps the original event bytes.
+	wantKeys := []string{"J1:3", "J1:1", "J1:2"}
+	wantDados := []string{eventLine(3, "question", ""), eventLine(1, "accepted", ""), eventLine(2, "preparing", "")}
+	for i, r := range recs {
+		if r.IdempotencyKey != wantKeys[i] {
+			t.Fatalf("record %d key = %q, want %q (order 3, 1, 2)", i+1, r.IdempotencyKey, wantKeys[i])
+		}
+		if r.Seq != int64(i+1) {
+			t.Fatalf("record %d outbox seq = %d, want %d", i+1, r.Seq, i+1)
+		}
+		if !bytes.Equal(r.Dados, []byte(wantDados[i])) {
+			t.Fatalf("record %d dados = %s, want the original bytes %s", i+1, r.Dados, wantDados[i])
+		}
+	}
+	jobs, err = s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || j.LastEventSeq != 3 || j.Estado != "running" {
+		t.Fatalf("job J1 = %+v, want last_event_seq 3, estado running", j)
+	}
+	// The second sync asks --since 3 and appends nothing.
+	stdout, _, exit = runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("second sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
+		t.Fatalf("second sync stdout = %q", stdout)
+	}
+	if recs := readOutboxRecords(t, cfgDir); len(recs) != 3 {
+		t.Fatalf("records after the second sync = %d, want 3 (nothing appended)", len(recs))
+	}
+}
+
+// TestSyncRetryAfterAppendCrash: a crash between the outbox append and the
+// jobs.json write leaves records without bookkeeping; the sync refetches
+// from the contiguous stored prefix, appends nothing that is already
+// durable, and converges with the healed cursor and no duplicate records.
+func TestSyncRetryAfterAppendCrash(t *testing.T) {
+	exe, _ := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		eventsRule("J1", 2, eventLine(3, "question", ""), trailer(3, "running"), 0),
+		eventsRule("J1", 3, "", trailer(3, "running"), 0),
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	seedJob(t, cfgDir, "J1", "org/repo", 0, "running")
+	// A previous sync appended events 1 and 2 and crashed before the
+	// jobs.json write: store the records, then rewrite jobs.json back to 0.
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		if _, appended, err := s.AppendJobEvent("machine-a", "org/repo", "J1", json.RawMessage(eventLine(i, "accepted", ""))); err != nil || !appended {
+			t.Fatalf("event %d: appended=%v err=%v, want true,nil", i, appended, err)
+		}
+	}
+	jobsData := `{"jobs":{"J1":{"id":"J1","projeto":"org/repo","last_event_seq":0,"estado":"running"}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(outbox.StateDir(cfgDir), "jobs.json"), []byte(jobsData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, exit := runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":1,"enviados":0,"pendentes":3}`+"\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	recs := readOutboxRecords(t, cfgDir)
+	if len(recs) != 3 {
+		t.Fatalf("records = %d, want 3 (no duplicates)", len(recs))
+	}
+	counts := map[string]int{}
+	for _, r := range recs {
+		counts[r.IdempotencyKey]++
+	}
+	for _, k := range []string{"J1:1", "J1:2", "J1:3"} {
+		if counts[k] != 1 {
+			t.Fatalf("key %s stored %d times, want exactly 1", k, counts[k])
+		}
+	}
+	jobs, err := s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || j.LastEventSeq != 3 || j.Estado != "running" {
+		t.Fatalf("job J1 = %+v, want last_event_seq 3 (healed), estado running", j)
+	}
+	// The second sync converges: nothing new is appended.
+	stdout, _, exit = runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("second sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
+		t.Fatalf("second sync stdout = %q", stdout)
+	}
+	if recs := readOutboxRecords(t, cfgDir); len(recs) != 3 {
+		t.Fatalf("records after the second sync = %d, want 3 (no duplicates)", len(recs))
 	}
 }
 
@@ -485,6 +707,331 @@ func TestSyncClosedJobSkipped(t *testing.T) {
 		if len(c.Argv) >= 2 && c.Argv[0] == "job" && c.Argv[1] == "events" {
 			t.Errorf("events called for a closed job: %v", c.Argv)
 		}
+	}
+}
+
+// TestSyncLegacyHighCursorRefetches: a jobs.json written by a previous
+// release holds a high-water last_event_seq while the outbox lacks the
+// lower events; the sync asks the contiguous stored prefix (0), stores the
+// missing events with their original bytes and converges on the cursor.
+func TestSyncLegacyHighCursorRefetches(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		eventsRule("J1", 0,
+			eventLine(1, "accepted", "")+"\n"+eventLine(2, "preparing", "")+"\n"+eventLine(3, "question", ""),
+			trailer(3, "running"), 0),
+		eventsRule("J1", 3, "", trailer(3, "running"), 0),
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	// A previous release recorded the high-water cursor 3 while the
+	// outbox holds none of the events.
+	seedJob(t, cfgDir, "J1", "org/repo", 3, "running")
+	stdout, _, exit := runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":3,"enviados":0,"pendentes":3}`+"\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	sinceArgs := eventsSinceArgs(t, fakeDir)
+	if len(sinceArgs) != 1 || sinceArgs[0] != "0" {
+		t.Fatalf("events --since args = %v, want [0] (the contiguous stored prefix, not the legacy cursor 3)", sinceArgs)
+	}
+	recs := readOutboxRecords(t, cfgDir)
+	if len(recs) != 3 {
+		t.Fatalf("records = %d, want 3", len(recs))
+	}
+	wantDados := []string{eventLine(1, "accepted", ""), eventLine(2, "preparing", ""), eventLine(3, "question", "")}
+	for i, r := range recs {
+		if r.IdempotencyKey != "J1:"+intTo(i+1) {
+			t.Fatalf("record %d key = %q, want J1:%d", i+1, r.IdempotencyKey, i+1)
+		}
+		if r.Seq != int64(i+1) {
+			t.Fatalf("record %d outbox seq = %d, want %d", i+1, r.Seq, i+1)
+		}
+		if !bytes.Equal(r.Dados, []byte(wantDados[i])) {
+			t.Fatalf("record %d dados = %s, want the original bytes %s", i+1, r.Dados, wantDados[i])
+		}
+	}
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	jobs, err := s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || j.LastEventSeq != 3 || j.Estado != "running" {
+		t.Errorf("job J1 = %+v, want last_event_seq 3, estado running", j)
+	}
+}
+
+// TestSyncSparseTerminalWakeThenSync: the wake hook stored only the
+// terminal event 9 (prefix 0) of a job whose estado is already terminal;
+// the sync still fetches from the contiguous stored prefix, stores 1..8 in
+// upstream order after the wake record and converges the cursor; a second
+// sync skips the job because the gap is closed.
+func TestSyncSparseTerminalWakeThenSync(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		eventsRule("J1", 0, eventsUpTo(9), trailer(9, "done"), 0),
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	// The job is tracked and already terminal in jobs.json (an earlier
+	// sync applied the terminal estado), while its events were never
+	// stored.
+	seedJob(t, cfgDir, "J1", "org/repo", 0, "done")
+	wakeStdin := eventLine(9, "terminal", "")
+	stdout, stderr, exit := runHermesVars(t, cfgDir, map[string]string{
+		jobapi.EnvJobID:             "J1",
+		jobapi.EnvJobSeq:            "9",
+		jobapi.EnvJobEvent:          wakeStdin,
+		jobapi.EnvJobIdempotencyKey: "J1:9",
+	}, wakeStdin, "wake")
+	if exit != 0 {
+		t.Fatalf("wake: exit = %d, stdout %q stderr %q", exit, stdout, stderr)
+	}
+	if stdout != `{"seq":1,"duplicado":false,"enviados":0,"pendentes":1}`+"\n" {
+		t.Fatalf("wake stdout = %q", stdout)
+	}
+	stdout, _, exit = runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":8,"enviados":0,"pendentes":9}`+"\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	sinceArgs := eventsSinceArgs(t, fakeDir)
+	if len(sinceArgs) != 1 || sinceArgs[0] != "0" {
+		t.Fatalf("events --since args = %v, want [0] (the contiguous stored prefix)", sinceArgs)
+	}
+	recs := readOutboxRecords(t, cfgDir)
+	if len(recs) != 9 {
+		t.Fatalf("records = %d, want 9 (one per key 1..9)", len(recs))
+	}
+	// The wake record 9 first, then the gap in upstream event order 1..8.
+	wantKeys := []string{"J1:9"}
+	wantDados := []string{wakeStdin}
+	for i := 1; i <= 8; i++ {
+		wantKeys = append(wantKeys, "J1:"+intTo(i))
+		wantDados = append(wantDados, eventLine(i, "accepted", ""))
+	}
+	for i, r := range recs {
+		if r.IdempotencyKey != wantKeys[i] {
+			t.Fatalf("record %d key = %q, want %q (9 stored first, then 1..8)", i+1, r.IdempotencyKey, wantKeys[i])
+		}
+		if r.Seq != int64(i+1) {
+			t.Fatalf("record %d outbox seq = %d, want %d", i+1, r.Seq, i+1)
+		}
+		if !bytes.Equal(r.Dados, []byte(wantDados[i])) {
+			t.Fatalf("record %d dados = %s, want the original bytes %s", i+1, r.Dados, wantDados[i])
+		}
+	}
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	jobs, err := s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || j.LastEventSeq != 9 || j.Estado != "done" {
+		t.Fatalf("job J1 = %+v, want last_event_seq 9, estado done", j)
+	}
+	// The gap is closed and the job is terminal: the second sync skips
+	// it, with no job events call for it.
+	stdout, _, exit = runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("second sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":0,"novos":0,"enviados":0,"pendentes":9}`+"\n" {
+		t.Fatalf("second sync stdout = %q", stdout)
+	}
+	if n := len(eventsSinceArgs(t, fakeDir)); n != 1 {
+		t.Errorf("events calls = %d, want 1 (the second sync skipped the gapless terminal job)", n)
+	}
+}
+
+// TestSyncClosedJobWithGapStillSynced: a closed job with a stored event
+// above the contiguous stored prefix is still synced for the gap: the sync
+// stores the missing events and the job stays closed.
+func TestSyncClosedJobWithGapStillSynced(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		fakesoho.Rule{Argv: []string{"job", "close", "--id", "J1"}, Stdout: `{"status":"closed"}` + "\n", Code: 0},
+		eventsRule("J1", 0, eventsUpTo(9), trailer(9, "done"), 0),
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	seedJob(t, cfgDir, "J1", "org/repo", 0, "running")
+	wakeStdin := eventLine(9, "terminal", "")
+	stdout, stderr, exit := runHermesVars(t, cfgDir, map[string]string{
+		jobapi.EnvJobID:             "J1",
+		jobapi.EnvJobSeq:            "9",
+		jobapi.EnvJobEvent:          wakeStdin,
+		jobapi.EnvJobIdempotencyKey: "J1:9",
+	}, wakeStdin, "wake")
+	if exit != 0 {
+		t.Fatalf("wake: exit = %d, stdout %q stderr %q", exit, stdout, stderr)
+	}
+	stdout, _, exit = runHermes(t, cfgDir, false, "", "job", "close", "--id", "J1")
+	if exit != 0 {
+		t.Fatalf("job close: exit = %d, stdout %q", exit, stdout)
+	}
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	jobs, err := s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || !j.Closed {
+		t.Fatalf("job J1 after close = %+v, want Closed true", j)
+	}
+	stdout, _, exit = runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":8,"enviados":0,"pendentes":9}`+"\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	sinceArgs := eventsSinceArgs(t, fakeDir)
+	if len(sinceArgs) != 1 || sinceArgs[0] != "0" {
+		t.Fatalf("events --since args = %v, want [0] (the contiguous stored prefix)", sinceArgs)
+	}
+	recs := readOutboxRecords(t, cfgDir)
+	if len(recs) != 9 {
+		t.Fatalf("records = %d, want 9 (one per key 1..9)", len(recs))
+	}
+	wantKeys := []string{"J1:9"}
+	wantDados := []string{wakeStdin}
+	for i := 1; i <= 8; i++ {
+		wantKeys = append(wantKeys, "J1:"+intTo(i))
+		wantDados = append(wantDados, eventLine(i, "accepted", ""))
+	}
+	for i, r := range recs {
+		if r.IdempotencyKey != wantKeys[i] {
+			t.Fatalf("record %d key = %q, want %q (9 stored first, then 1..8)", i+1, r.IdempotencyKey, wantKeys[i])
+		}
+		if !bytes.Equal(r.Dados, []byte(wantDados[i])) {
+			t.Fatalf("record %d dados = %s, want the original bytes %s", i+1, r.Dados, wantDados[i])
+		}
+	}
+	jobs, err = s.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || !j.Closed || j.LastEventSeq != 9 || j.Estado != "done" {
+		t.Fatalf("job J1 = %+v, want still closed, last_event_seq 9, estado done", j)
+	}
+}
+
+// TestSyncTerminalLegacyCursorStillSynced: a terminal job whose recorded
+// cursor (5) sits above the contiguous stored prefix (only event 5 is
+// stored) is synced from the prefix and stores the missing events 1..4.
+func TestSyncTerminalLegacyCursorStillSynced(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		eventsRule("J1", 0,
+			eventLine(1, "accepted", "")+"\n"+eventLine(2, "preparing", "")+"\n"+eventLine(3, "question", "")+"\n"+eventLine(4, "push", ""),
+			trailer(5, "done"), 0),
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	// Only event 5 is stored (as a crash or a previous release left it),
+	// and jobs.json records the high-water cursor 5 with the terminal
+	// estado.
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	if _, appended, err := s.AppendJobEvent("machine-a", "org/repo", "J1", json.RawMessage(eventLine(5, "terminal", ""))); err != nil || !appended {
+		t.Fatalf("event 5: appended=%v err=%v, want true,nil", appended, err)
+	}
+	err = s.UpdateJobs(func(js *outbox.Jobs) error {
+		js.Jobs["J1"].LastEventSeq = 5
+		js.Jobs["J1"].Estado = "done"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+	stdout, _, exit := runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":1,"novos":4,"enviados":0,"pendentes":5}`+"\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	sinceArgs := eventsSinceArgs(t, fakeDir)
+	if len(sinceArgs) != 1 || sinceArgs[0] != "0" {
+		t.Fatalf("events --since args = %v, want [0] (the contiguous stored prefix, not the recorded cursor 5)", sinceArgs)
+	}
+	recs := readOutboxRecords(t, cfgDir)
+	if len(recs) != 5 {
+		t.Fatalf("records = %d, want 5 (one per key 1..5)", len(recs))
+	}
+	wantKeys := []string{"J1:5", "J1:1", "J1:2", "J1:3", "J1:4"}
+	wantDados := []string{
+		eventLine(5, "terminal", ""), eventLine(1, "accepted", ""),
+		eventLine(2, "preparing", ""), eventLine(3, "question", ""), eventLine(4, "push", ""),
+	}
+	for i, r := range recs {
+		if r.IdempotencyKey != wantKeys[i] {
+			t.Fatalf("record %d key = %q, want %q (5 stored first, then 1..4)", i+1, r.IdempotencyKey, wantKeys[i])
+		}
+		if !bytes.Equal(r.Dados, []byte(wantDados[i])) {
+			t.Fatalf("record %d dados = %s, want the original bytes %s", i+1, r.Dados, wantDados[i])
+		}
+	}
+	sro, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	jobs, err := sro.LoadJobs()
+	if err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	if j := jobs.Jobs["J1"]; j == nil || j.LastEventSeq != 5 || j.Estado != "done" {
+		t.Fatalf("job J1 = %+v, want last_event_seq 5, estado done", j)
+	}
+}
+
+// TestSyncTerminalNoGapSkipped (control): a terminal job whose stored
+// events cover its recorded cursor (no gap) is still skipped: no job
+// events call for it.
+func TestSyncTerminalNoGapSkipped(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t, capsRule(capsJSON, 0))
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{})
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, appended, err := s.AppendJobEvent("machine-a", "org/repo", "J1", json.RawMessage(eventLine(i, "accepted", ""))); err != nil || !appended {
+			t.Fatalf("event %d: appended=%v err=%v, want true,nil", i, appended, err)
+		}
+	}
+	err = s.UpdateJobs(func(js *outbox.Jobs) error {
+		js.Jobs["J1"].Estado = "done"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed estado: %v", err)
+	}
+	stdout, _, exit := runHermes(t, cfgDir, false, "", "sync")
+	if exit != 0 {
+		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
+	}
+	if stdout != `{"jobs":0,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	if n := len(eventsSinceArgs(t, fakeDir)); n != 0 {
+		t.Fatalf("events calls = %d, want 0 (no gap: the terminal job is skipped)", n)
 	}
 }
 

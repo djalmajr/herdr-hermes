@@ -167,8 +167,8 @@ func TestWake(t *testing.T) {
 	if err := json.Unmarshal(data, &jobs); err != nil {
 		t.Fatal(err)
 	}
-	if j, ok := jobs.Jobs["job-9"]; !ok || j.LastEventSeq != 3 || j.Projeto != "" {
-		t.Fatalf("jobs.json job-9 = %+v, want tracked with empty projeto", j)
+	if j, ok := jobs.Jobs["job-9"]; !ok || j.LastEventSeq != 0 || j.Projeto != "" {
+		t.Fatalf("jobs.json job-9 = %+v, want tracked with empty projeto and last_event_seq 0 (event 1 absent)", j)
 	}
 	if j, ok := jobs.Jobs["job-1"]; !ok || j.LastEventSeq != 1 {
 		t.Fatalf("jobs.json job-1 = %+v, want last_event_seq 1", j)
@@ -245,6 +245,46 @@ func TestWake(t *testing.T) {
 	stdout, stderr, exit = runCLIStdin(t, dirEmpty, wakeEvent(1), map[string]string{jobapi.EnvJobID: "job-1"}, "wake")
 	if exit != 2 || !strings.Contains(stderr, "machine_label is empty") {
 		t.Errorf("wake with empty machine_label: exit %d stderr %q", exit, stderr)
+	}
+}
+
+// TestWakeEventTrailingNewline: an event on stdin that ends with a newline
+// (as the wake hook normally delivers it) stores one single-line record,
+// and the pull channel prints that record plus the trailer.
+func TestWakeEventTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	setConfig(t, dir, map[string]string{"machine_label": "m1"})
+	vars := map[string]string{
+		jobapi.EnvJobID:             "job-5",
+		jobapi.EnvJobSeq:            "1",
+		jobapi.EnvJobEvent:          wakeEvent(1),
+		jobapi.EnvJobIdempotencyKey: "job-5:1",
+	}
+	stdout, stderr, exit := runCLIStdin(t, dir, wakeEvent(1)+"\n", vars, "wake")
+	if exit != 0 {
+		t.Fatalf("wake exit = %d, stderr %q", exit, stderr)
+	}
+	if !strings.Contains(stdout, `"duplicado":false`) {
+		t.Fatalf("wake stdout = %q, want the event appended", stdout)
+	}
+	lines := outboxLines(t, dir)
+	if len(lines) != 1 {
+		t.Fatalf("outbox has %d lines, want exactly 1: %q", len(lines), lines)
+	}
+	var rec outbox.Record
+	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+		t.Fatalf("the record line does not parse: %v", err)
+	}
+	if rec.Tipo != "job_event" || rec.IdempotencyKey != "job-5:1" || *rec.JobID != "job-5" {
+		t.Fatalf("record = %+v, want a job_event with key job-5:1", rec)
+	}
+	// The pull channel prints the record plus the trailer.
+	stdout, stderr, exit = runCLIStdin(t, dir, "", map[string]string{}, "outbox")
+	if exit != 0 {
+		t.Fatalf("outbox exit = %d, stderr %q", exit, stderr)
+	}
+	if stdout != lines[0]+"\n"+`{"outbox":"fim","ultimo_seq":1,"entregue_seq":0}`+"\n" {
+		t.Fatalf("outbox stdout = %q, want the record line plus the trailer", stdout)
 	}
 }
 
