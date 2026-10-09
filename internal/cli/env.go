@@ -15,9 +15,13 @@ type Env struct {
 	Stdin          io.Reader
 	Stdout, Stderr io.Writer
 	Getenv         func(string) string
-	ConfigDir      string
-	Now            func() time.Time
-	Sleep          func(context.Context, time.Duration) error
+	// Environ returns the exact environment of the herdr-hermes process;
+	// forwarded subprocesses get this environment and nothing else. The
+	// API key is never in it because it is never put there.
+	Environ   func() []string
+	ConfigDir string
+	Now       func() time.Time
+	Sleep     func(context.Context, time.Duration) error
 }
 
 // EnvFromOS builds the production Env. When the user config directory
@@ -26,12 +30,13 @@ type Env struct {
 // state to a shared temp dir.
 func EnvFromOS() Env {
 	env := Env{
-		Stdin:  os.Stdin,
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
-		Getenv: os.Getenv,
-		Now:    time.Now,
-		Sleep:  sleepCtx,
+		Stdin:   os.Stdin,
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
+		Getenv:  os.Getenv,
+		Environ: os.Environ,
+		Now:     time.Now,
+		Sleep:   sleepCtx,
 	}
 	if cfg, err := os.UserConfigDir(); err == nil && cfg != "" {
 		env.ConfigDir = filepath.Join(cfg, "herdr-hermes")

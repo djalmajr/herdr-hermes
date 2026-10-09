@@ -1,0 +1,266 @@
+// Package fakesoho provides a re-executed Go test binary as a deterministic
+// fake of the herdr-soho executable. It is configured without any
+// environment variable: Install copies the test binary next to a JSON
+// script, and the fake finds the script next to os.Executable(). Call
+// Install from a test and Main first from the package TestMain.
+package fakesoho
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+const (
+	// exeBase is the executable base name the fake is installed as.
+	exeBase = "herdr-soho"
+	// scriptName is the script file installed next to the executable.
+	scriptName = "fake-herdr-soho.json"
+	// logName is the call log installed next to the executable.
+	logName = "fake-herdr-soho.calls.jsonl"
+)
+
+// Rule is one scripted response. Argv matches the process argv (the
+// arguments after the executable), exactly or as a prefix; Call, when
+// non-zero, matches only the rule's Nth call with that same argv.
+type Rule struct {
+	Argv        []string `json:"argv"`
+	ArgvPrefix  bool     `json:"argv_prefix,omitempty"`
+	AnyArgs     bool     `json:"any_args,omitempty"`
+	Call        int      `json:"call,omitempty"`
+	Stdout      string   `json:"stdout,omitempty"`
+	StdoutBytes []byte   `json:"stdout_bytes,omitempty"`
+	Stderr      string   `json:"stderr,omitempty"`
+	StderrBytes []byte   `json:"stderr_bytes,omitempty"`
+	Code        int      `json:"code,omitempty"`
+	Delay       int      `json:"delay_ms,omitempty"`
+	// StdoutFirst writes the stdout first, then applies the delay,
+	// then the stderr and the exit; the default is delay, stdout,
+	// stderr, exit.
+	StdoutFirst bool `json:"stdout_first,omitempty"`
+}
+
+// Call is one logged invocation: the argv, the full stdin and the full
+// environment as it was seen by the child process.
+type Call struct {
+	Argv  []string `json:"argv"`
+	Stdin string   `json:"stdin,omitempty"`
+	Env   []string `json:"env,omitempty"`
+}
+
+type script struct {
+	Log   string `json:"log"`
+	Rules []Rule `json:"rules"`
+}
+
+// Install copies the test binary as <dir>/herdr-soho (herdr-soho.exe on
+// Windows) and writes the rule script to <dir>/fake-herdr-soho.json. It
+// returns the absolute executable path; tests point the herdr_soho_bin
+// config key at it.
+func Install(t testing.TB, dir string, rules ...Rule) (exePath string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("fakesoho: mkdir %s: %v", dir, err)
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("fakesoho: executable: %v", err)
+	}
+	data, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("fakesoho: read test binary: %v", err)
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	exePath = filepath.Join(dir, exeBase+ext)
+	// A copy, not a link: os.Executable must resolve to the fake on every
+	// platform (on Linux a link would resolve back to the test binary).
+	if err := os.WriteFile(exePath, data, 0o755); err != nil {
+		t.Fatalf("fakesoho: write %s: %v", exePath, err)
+	}
+	b, err := json.Marshal(script{Log: filepath.Join(dir, logName), Rules: rules})
+	if err != nil {
+		t.Fatalf("fakesoho: marshal script: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, scriptName), b, 0o600); err != nil {
+		t.Fatalf("fakesoho: write script: %v", err)
+	}
+	return exePath
+}
+
+// ScriptPath returns the script file installed by Install in dir.
+func ScriptPath(dir string) string {
+	return filepath.Join(dir, scriptName)
+}
+
+// LogPath returns the call log file installed by Install in dir.
+func LogPath(dir string) string {
+	return filepath.Join(dir, logName)
+}
+
+// ReadCalls decodes the ordered JSONL call log installed in dir. A missing
+// log file means no call happened.
+func ReadCalls(dir string) ([]Call, error) {
+	b, err := os.ReadFile(LogPath(dir))
+	if err != nil {
+		return nil, err
+	}
+	var calls []Call
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if line == "" {
+			continue
+		}
+		var c Call
+		if err := json.Unmarshal([]byte(line), &c); err != nil {
+			return nil, err
+		}
+		calls = append(calls, c)
+	}
+	return calls, nil
+}
+
+// Main assumes the fake herdr-soho role when the process executable base
+// name is herdr-soho and the script is installed next to it; otherwise it
+// returns at once. Call it first from the package TestMain; it exits the
+// re-executed process after dispatching the rule.
+func Main() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	if filepath.Base(exe) != exeBase && filepath.Base(exe) != exeBase+ext {
+		return
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(exe), scriptName))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fakesoho: %v\n", err)
+		os.Exit(126)
+	}
+	var cfg script
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "fakesoho: %v\n", err)
+		os.Exit(126)
+	}
+	// Always drain stdin: the parent waits for the copy to finish, and the
+	// bridge caps or passes through a finite reader.
+	stdin, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fakesoho: read stdin: %v\n", err)
+		os.Exit(126)
+	}
+	argv := os.Args[1:]
+	call := Call{Argv: argv, Stdin: string(stdin), Env: os.Environ()}
+	if err := logCall(cfg.Log, call); err != nil {
+		fmt.Fprintf(os.Stderr, "fakesoho: %v\n", err)
+		os.Exit(126)
+	}
+	callNumber := 0
+	if calls, readErr := ReadCallsFromPath(cfg.Log); readErr == nil {
+		for _, c := range calls {
+			if same(argv, c.Argv) {
+				callNumber++
+			}
+		}
+	}
+	for _, rule := range cfg.Rules {
+		if !matches(argv, rule) || (rule.Call != 0 && rule.Call != callNumber) {
+			continue
+		}
+		stdoutData := append([]byte(rule.Stdout), rule.StdoutBytes...)
+		stderrData := append([]byte(rule.Stderr), rule.StderrBytes...)
+		if rule.StdoutFirst {
+			// The stdout write goes straight to the pipe (os.File has
+			// no user-space buffering), so the parent sees it before
+			// the delay; then stderr and the exit.
+			_, _ = os.Stdout.Write(stdoutData)
+			if rule.Delay > 0 {
+				time.Sleep(time.Duration(rule.Delay) * time.Millisecond)
+			}
+			_, _ = os.Stderr.Write(stderrData)
+			os.Exit(rule.Code)
+		}
+		if rule.Delay > 0 {
+			time.Sleep(time.Duration(rule.Delay) * time.Millisecond)
+		}
+		_, _ = os.Stdout.Write(stdoutData)
+		_, _ = os.Stderr.Write(stderrData)
+		os.Exit(rule.Code)
+	}
+	fmt.Fprintf(os.Stderr, "fakesoho: no rule for %v\n", argv)
+	os.Exit(127)
+}
+
+// logCall appends one call line under a short-lived exclusive lock, so
+// concurrent fake invocations never interleave half lines.
+func logCall(logPath string, call Call) error {
+	unlock, err := lock(logPath + ".lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	line, err := json.Marshal(call)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(line, '\n'))
+	return err
+}
+
+// ReadCallsFromPath decodes the ordered JSONL call log at file.
+func ReadCallsFromPath(file string) ([]Call, error) {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	var calls []Call
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if line == "" {
+			continue
+		}
+		var c Call
+		if err := json.Unmarshal([]byte(line), &c); err != nil {
+			return nil, err
+		}
+		calls = append(calls, c)
+	}
+	return calls, nil
+}
+
+func matches(argv []string, rule Rule) bool {
+	if rule.AnyArgs {
+		return true
+	}
+	if rule.ArgvPrefix {
+		return len(argv) >= len(rule.Argv) && same(argv[:len(rule.Argv)], rule.Argv)
+	}
+	return same(argv, rule.Argv)
+}
+
+func same(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

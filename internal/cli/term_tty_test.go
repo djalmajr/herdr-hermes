@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+func init() {
+	testMainHook = func() {
+		if mode := os.Getenv("HERDR_HERMES_PTY_MODE"); mode != "" {
+			os.Exit(ptyHelper(mode))
+		}
+	}
+}
+
 // These tests run the real production code on a real terminal. The pty is
 // allocated by the system "script" command (which this environment allows
 // to create ptys even when ad-hoc binaries cannot), so the re-exec'd test
@@ -79,13 +87,6 @@ func ptyHelper(mode string) int {
 
 	line("unknown-mode=%v", mode)
 	return 2
-}
-
-func TestMain(m *testing.M) {
-	if mode := os.Getenv("HERDR_HERMES_PTY_MODE"); mode != "" {
-		os.Exit(ptyHelper(mode))
-	}
-	os.Exit(m.Run())
 }
 
 // runUnderScript re-executes the test binary under the system `script` so

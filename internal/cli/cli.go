@@ -34,6 +34,10 @@ type command struct {
 // blocks so parallel slices merge cleanly.
 var commands = []command{
 	// slice 2: job, sync, doctor
+	{"job", false, true, cmdJob},
+	{"sync", true, true, cmdSync},
+	{"doctor", false, true, cmdDoctor},
+	// slice 1: outbox, config, capabilities, version, help
 	{"outbox", false, true, cmdOutbox},
 	// slice 3: wake, session, decision, push, auth
 	{"wake", true, true, cmdWake},
