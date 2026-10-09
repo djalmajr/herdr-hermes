@@ -100,7 +100,10 @@ func cmdWake(args []string, env Env) int {
 	if appended {
 		seq = rec.Seq
 	}
-	// The record is durable: exit 0 whatever the push result.
+	// The record is durable: exit 0 whatever the push result. Project and
+	// deliver the pending notifications (bounded, before the push); the
+	// output line and exit code are unchanged.
+	runNotify(context.Background(), env, cfg, notifyHookBound)
 	ctx, cancel := context.WithTimeout(context.Background(), wakePushTimeout(cfg))
 	defer cancel()
 	o := pushPending(ctx, env, cfg, store, false)

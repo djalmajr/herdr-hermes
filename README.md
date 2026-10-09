@@ -26,6 +26,7 @@ The binary must be on your `PATH`; the optional plugin also needs it on the Herd
 3. Point the node at the dispatcher (HTTPS): `herdr-hermes config set dispatcher_url <https-url>`. Until this is set, push is disabled and the dispatcher can still pull the outbox.
 4. Register the wake hook in the `herdr-soho` machine configuration: `job_wake_cmd=herdr-hermes wake`, so every job event that wakes the dispatcher is recorded in the outbox as it happens.
 5. Verify with `herdr-hermes doctor`, which reports the `herdr-soho` capabilities, the configuration state, the wake hook and the outbox counts in one JSON line.
+6. Optionally, register the notification recipients so this machine's native events reach them: `herdr-hermes notify register owner --projeto <org>/<repo> --to <ref>`, `herdr-hermes notify register orchestrator --job <id> --to <ref>`, `herdr-hermes notify register coordinator --to <ref>` `herdr-hermes notify register watch --pane <ws:pane>` and `herdr-hermes notify register workspace --workspace <ws>`, where `<ref>` is a `herdr-soho send` reference or a local agent name. Until the first `notify register`, no notification file is written.
 
 ## Commands
 
@@ -38,6 +39,7 @@ Every command prints exactly one JSON line on stdout (diagnostics go to stderr);
 - `outbox [--since <seq>] [--wait <ms>]` — print outbox records with `seq > since` as JSON lines, then the trailer (the dispatcher pull channel; read-only).
 - `session start|update|end` — manage open session records for a project.
 - `decision --projeto <org/repo> --escopo global|projeto --motivo <text> [--job <id>] [<resumo>|-]` — record a decision taken outside a job.
+- `notify <sub>` — native notifications for this machine: `register` and `unregister` the recipients (project `owner`, job `orchestrator`, machine `coordinator`) and sources (watched `pane`, watched `workspace`), `list` and `status` (read-only), `deliver` the pending notifications, `ingest agent-status` or `ingest workspace` a Herdr event, `raise` a `stuck` or `cross_project` escalation explicitly, `ack` a delivered notification, and `retry` once an uncertain or exhausted delivery.
 - `auth login|status|logout` — manage the per-user dispatcher API key.
 - `config get|set|list` — manage the machine configuration (`machine_label`, `dispatcher_url`, `herdr_soho_bin`, `push_timeout_s`).
 - `doctor` — check the bridge prerequisites and print one status line.
@@ -52,7 +54,7 @@ The node records everything in a durable local outbox (`outbox.jsonl`, one JSON 
 
 ## Optional plugin
 
-[`plugin/herdr-plugin.toml`](plugin/herdr-plugin.toml) is an optional Herdr plugin: a startup hook that syncs the open tracked jobs and pushes pending records, event hooks that keep `job-<id>` workspaces tracked and synced (including a final sync on close), and two read-only workspace actions — `status` (tracked jobs, pending records, last push result, key configured) and `sync`. The hooks are one-shot, always exit 0 and write only to the `herdr-hermes` state directory; install it with `herdr plugin link <path-to-this-repo>/plugin` (or `herdr plugin install djalmajr/herdr-hermes` once the repository is published). The CLI works fully without the plugin.
+[`plugin/herdr-plugin.toml`](plugin/herdr-plugin.toml) is an optional Herdr plugin: a startup hook that syncs the open tracked jobs and pushes pending records, event hooks that keep `job-<id>` workspaces tracked and synced (including a final sync on close) and that feed the Herdr agent status changes of watched panes into the notifications, and two read-only workspace actions — `status` (tracked jobs, pending records, last push result, key configured) and `sync`. The hooks are one-shot, always exit 0 and write only to the `herdr-hermes` state directory; install it with `herdr plugin link <path-to-this-repo>/plugin` (or `herdr plugin install djalmajr/herdr-hermes` once the repository is published). The CLI works fully without the plugin.
 
 ## Optional skill
 
