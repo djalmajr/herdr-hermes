@@ -1,0 +1,47 @@
+# herdr-hermes optional plugin — a startup sync, job-workspace event hooks and two read-only bridge actions.
+# Manifest contract: https://herdr.dev/docs/plugins/
+# Every command runs the `herdr-hermes` binary (the Go CLI), which must be
+# on the Herdr server's PATH. The startup hook runs a sync for the open
+# tracked jobs and pushes the pending outbox records; the workspace.created
+# and workspace.closed event hooks track `job-<id>` workspaces and run a
+# sync for that job (on close, a final sync so the terminal and cleanup
+# events reach the outbox). The hooks are one-shot and exit quickly; they
+# never fail the Herdr server (always exit 0, failures to friction) and
+# write only to the herdr-hermes state directory. The read-only actions
+# (status, sync) call `herdr-hermes plugin bridge <subcommand>` and keep no
+# second copy of the outbox or push logic — the CLI works fully without the
+# plugin.
+id = "djalmajr.herdr-hermes"
+name = "herdr-hermes"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Two-way bridge between a remote job dispatcher and this machine: it tracks dispatched jobs, records their events plus session status and decisions in a durable local outbox that the dispatcher can pull, and pushes the pending records to the configured dispatcher URL. The startup hook syncs the open tracked jobs and pushes pending records; the workspace event hooks keep `job-<id>` workspaces tracked and synced, including a final sync when the workspace closes. The read-only actions show the bridge status (tracked jobs, pending records, last push result, key configured) and run a sync; they run the herdr-hermes binary, which must be on the Herdr server's PATH."
+platforms = ["linux", "macos", "windows"]
+
+[[startup]]
+id = "sync"
+command = ["herdr-hermes", "plugin", "startup"]
+
+[[events]]
+id = "workspace-created"
+on = "workspace.created"
+command = ["herdr-hermes", "plugin", "event"]
+
+[[events]]
+id = "workspace-closed"
+on = "workspace.closed"
+command = ["herdr-hermes", "plugin", "event"]
+
+[[actions]]
+id = "status"
+title = "Bridge: status"
+description = "Read-only: shows a short bridge status in a popup — the tracked jobs, the pending outbox records, the last push result and whether the API key is configured."
+contexts = ["workspace"]
+command = ["herdr-hermes", "plugin", "bridge", "status"]
+
+[[actions]]
+id = "sync"
+title = "Bridge: sync"
+description = "Shows what a sync will do, then runs it: pulls new job events for the open tracked jobs into the outbox and pushes the pending records to the dispatcher."
+contexts = ["workspace"]
+command = ["herdr-hermes", "plugin", "bridge", "sync"]

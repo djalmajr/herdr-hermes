@@ -1,0 +1,79 @@
+name: Go checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Go (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: auto
+      GOMAXPROCS: 2
+      CGO_ENABLED: 1
+      CHECK_REPO: ${{ github.repository }}
+      CHECK_SHA: ${{ github.sha }}
+    steps:
+      - name: Check out the exact commit
+        shell: pwsh
+        run: |
+          git init .
+          if ($LASTEXITCODE -ne 0) { throw "git init failed" }
+          git config core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw "git config core.autocrlf failed" }
+          git remote add origin "https://github.com/${env:CHECK_REPO}.git"
+          if ($LASTEXITCODE -ne 0) { throw "git remote add failed" }
+          git fetch --depth 1 origin "${env:CHECK_SHA}"
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+          git checkout --detach "${env:CHECK_SHA}"
+          if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
+      - name: Resolve the native Go toolchain
+        shell: pwsh
+        run: |
+          if (Get-Command go -ErrorAction SilentlyContinue) { return }
+          $arch = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
+          $toolcache = $env:RUNNER_TOOL_CACHE
+          if (-not $toolcache) { $toolcache = $env:AGENT_TOOLSDIRECTORY }
+          if (-not $toolcache) { throw "Go is not on PATH and the runner toolcache is unset" }
+          $exe = if ($IsWindows) { 'go.exe' } else { 'go' }
+          $bin = Get-ChildItem (Join-Path $toolcache 'go') -Directory |
+            Where-Object { $_.Name -match '^1\.25\.\d+$' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Join-Path $_.FullName "$arch/bin" } |
+            Where-Object { Test-Path (Join-Path $_ $exe) } |
+            Select-Object -First 1
+          if (-not $bin) { throw "Go is not on PATH and a native Go 1.25 toolcache entry was not found" }
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+      - name: Formatting and vet
+        shell: pwsh
+        run: |
+          $files = @(git ls-files '*.go')
+          if ($LASTEXITCODE -ne 0) { throw "git ls-files failed" }
+          $formatting = @(gofmt -l $files)
+          if ($LASTEXITCODE -ne 0 -or $formatting.Count -ne 0) { throw "gofmt failed: $formatting" }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
+      - name: Native tests
+        shell: pwsh
+        run: |
+          go test -timeout=30m ./...
+          if ($LASTEXITCODE -ne 0) { throw "go test failed" }
+      - name: Race detector
+        shell: pwsh
+        run: |
+          go test -race -timeout=30m ./...
+          if ($LASTEXITCODE -ne 0) { throw "go test -race failed" }
