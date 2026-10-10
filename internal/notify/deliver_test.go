@@ -223,6 +223,139 @@ func TestDeliverNotLocked(t *testing.T) {
 	}
 }
 
+// TestLeaseForRun: the run lease is the time until the context deadline
+// (store clock) plus the crash margin with a deadline, LeaseDuration
+// without one or with one that already passed.
+func TestLeaseForRun(t *testing.T) {
+	now := newLedgerTestClock().Now()
+	if got := leaseForRun(context.Background(), now); got != LeaseDuration {
+		t.Fatalf("lease = %v, want %v (no deadline)", got, LeaseDuration)
+	}
+	budget := 10 * time.Minute
+	ctx, cancel := context.WithDeadline(context.Background(), now.Add(budget))
+	defer cancel()
+	if got := leaseForRun(ctx, now); got != budget+LeaseDuration {
+		t.Fatalf("lease = %v, want %v (the budget plus the crash margin)", got, budget+LeaseDuration)
+	}
+	past, cancel := context.WithDeadline(context.Background(), now.Add(-time.Minute))
+	defer cancel()
+	if got := leaseForRun(past, now); got != LeaseDuration {
+		t.Fatalf("lease = %v, want %v (an already-passed deadline)", got, LeaseDuration)
+	}
+}
+
+// TestDeliverLeaseCoversRunBudget: a Deliver whose context deadline is
+// 10 minutes away claims with a lease that covers the run's remaining
+// budget plus the crash margin: while its sender is blocked, advancing
+// the store clock by LeaseDuration + 1s does not make the delivery
+// claimable by another ClaimDue, and after the blocked send returns
+// accepted the first completion is recorded (accepted on attempt 1).
+func TestDeliverLeaseCoversRunBudget(t *testing.T) {
+	s, clk := deliverSetup(t, 1)
+	budget := 10 * time.Minute
+	// the deadline is always in the real future (the store clock is an
+	// injected fixture that may sit behind or ahead of the wall clock),
+	// so the run's context is live for the whole test.
+	base := time.Now()
+	if clk.Now().After(base) {
+		base = clk.Now()
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), base.Add(budget))
+	defer cancel()
+	releaseCh := make(chan struct{})
+	entered := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	t.Cleanup(release)
+	f := &recordingSender{
+		block:   releaseCh,
+		entered: entered,
+		result:  SendResult{Outcome: OutcomeAccepted, Status: "sent", Exit: 0},
+	}
+	res := make(chan struct {
+		summary DeliverSummary
+		err     error
+	}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		summary, err := Deliver(ctx, s, f, fakeRender, DeliverOptions{})
+		res <- struct {
+			summary DeliverSummary
+			err     error
+		}{summary, err}
+	}()
+	// the cleanup runs also on assertion failure: release the sender and
+	// wait for the run to finish before the store's temp dir is removed.
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+		}
+	})
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sender was not entered within 10s")
+	}
+	// the lease covers the run's budget: LeaseUntil is at least now +
+	// the budget + the crash margin.
+	led, err := s.LoadLedger()
+	if err != nil {
+		t.Fatalf("LoadLedger: %v", err)
+	}
+	d := led.Notifications[0].Deliveries[0]
+	if d.State != StateInFlight {
+		t.Fatalf("delivery state = %s, want in_flight", d.State)
+	}
+	leaseUntil, err := time.Parse(TSLayout, d.LeaseUntil)
+	if err != nil {
+		t.Fatalf("LeaseUntil %q: %v", d.LeaseUntil, err)
+	}
+	want := clk.Now().Add(budget).Add(LeaseDuration)
+	if leaseUntil.Before(want) {
+		t.Fatalf("LeaseUntil = %s, want at least %s (the run's budget plus the crash margin)", d.LeaseUntil, want.Format(TSLayout))
+	}
+	// while the send is blocked, advancing the store clock by
+	// LeaseDuration + 1s does not make the delivery claimable.
+	clk.Add(LeaseDuration + time.Second)
+	claims, err := Open(s.ob, clk.Now).ClaimDue(0)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	if len(claims) != 0 {
+		t.Fatalf("claims = %+v, want 0 (a live claim must not become due while its run can still send it)", claims)
+	}
+	// after the blocked send returns accepted, the first completion is
+	// recorded: accepted on attempt 1.
+	release()
+	var r struct {
+		summary DeliverSummary
+		err     error
+	}
+	select {
+	case r = <-res:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Deliver did not return within 10s of the send finishing")
+	}
+	if r.err != nil {
+		t.Fatalf("Deliver: %v", r.err)
+	}
+	wantSummary := DeliverSummary{Claimed: 1, Accepted: 1}
+	if r.summary != wantSummary {
+		t.Fatalf("summary = %+v, want %+v", r.summary, wantSummary)
+	}
+	led, err = s.LoadLedger()
+	if err != nil {
+		t.Fatalf("LoadLedger: %v", err)
+	}
+	d = led.Notifications[0].Deliveries[0]
+	if d.State != StateAccepted || d.Attempts != 1 || d.AcceptStatus != "sent" {
+		t.Fatalf("delivery = %+v, want accepted on attempt 1 (the first completion is recorded)", d)
+	}
+}
+
 // TestDeliverCtxDone: a context already done before the sends start is
 // not sent: the claim is released unsent, without consuming the attempt,
 // and stays due at once (Deferred), so a backlog larger than one bounded

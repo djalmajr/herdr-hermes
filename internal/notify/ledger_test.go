@@ -318,6 +318,153 @@ func TestLedgerEnableNoBackfill(t *testing.T) {
 	}
 }
 
+// TestLedgerMissingLedgerNoBackfill: a registry that exists without a
+// ledger (the crash state: the registry was written and the ledger
+// never was, or the file was deleted) must never backfill the stored
+// records: the first mutating operation initializes the cursor at the
+// last outbox seq. ProjectOutbox on that state writes the initialized
+// ledger and creates 0, and a later appended event is projected. A
+// ledger file that exists but cannot be parsed stays an error, never a
+// silent reset.
+func TestLedgerMissingLedgerNoBackfill(t *testing.T) {
+	ob := openOutbox(t, t.TempDir())
+	clk := newLedgerTestClock()
+	s := Open(ob, clk.Now)
+	// the records first: they must not be backfilled later.
+	appendJobEvent(t, ob, "job-1", 1, "blocked")
+	appendJobEvent(t, ob, "job-1", 2, "failure")
+	enableNotify(t, s)
+	// the crash state: the registry exists, the ledger was not written.
+	if err := os.Remove(filepath.Join(s.Dir(), "ledger.json")); err != nil {
+		t.Fatalf("remove ledger: %v", err)
+	}
+	sum, err := s.ProjectOutbox(fakeProjectJobEvent)
+	if err != nil {
+		t.Fatalf("ProjectOutbox: %v", err)
+	}
+	if sum.Created != 0 || sum.Duplicates != 0 || sum.Malformed != 0 || sum.ProjectedSeq != 2 {
+		t.Fatalf("summary = %+v, want 0 created and ProjectedSeq 2 (no backfill)", sum)
+	}
+	led, err := s.LoadLedger()
+	if err != nil {
+		t.Fatalf("LoadLedger: %v", err)
+	}
+	if led.ProjectedSeq != 2 || len(led.Notifications) != 0 {
+		t.Fatalf("ledger = seq %d with %d notifications, want the initialized cursor 2 and none", led.ProjectedSeq, len(led.Notifications))
+	}
+	// a later appended event is projected.
+	appendJobEvent(t, ob, "job-1", 3, "blocked")
+	clk.Add(time.Minute)
+	sum, err = s.ProjectOutbox(fakeProjectJobEvent)
+	if err != nil {
+		t.Fatalf("ProjectOutbox: %v", err)
+	}
+	if sum.Created != 1 || sum.ProjectedSeq != 3 {
+		t.Fatalf("summary = %+v, want Created 1, ProjectedSeq 3", sum)
+	}
+	// a ledger file that exists but cannot be parsed stays an error.
+	if err := os.WriteFile(filepath.Join(s.Dir(), "ledger.json"), []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("write corrupt ledger: %v", err)
+	}
+	if _, err := s.ProjectOutbox(fakeProjectJobEvent); err == nil {
+		t.Fatal("ProjectOutbox on a corrupt ledger: want an error, got nil")
+	}
+}
+
+// TestLedgerClaimDueLease: ClaimDueLease claims with the given lease (a
+// live run passes its remaining budget plus the crash margin), ClaimDue
+// keeps the default lease (LeaseDuration) and a non-positive lease falls
+// back to it; the long-lease delivery stays unclaimable past the default
+// expiry and becomes due again only when its own lease expires.
+func TestLedgerClaimDueLease(t *testing.T) {
+	ob := openOutbox(t, t.TempDir())
+	clk := newLedgerTestClock()
+	s := Open(ob, clk.Now)
+	enableNotify(t, s)
+	appendJobEvent(t, ob, "job-1", 1, "blocked")
+	appendJobEvent(t, ob, "job-1", 2, "failure")
+	appendJobEvent(t, ob, "job-1", 3, "question")
+	if _, err := s.ProjectOutbox(fakeProjectJobEvent); err != nil {
+		t.Fatalf("ProjectOutbox: %v", err)
+	}
+	// claim the three deliveries (ledger order): one with a long lease,
+	// one with the default lease, one with a non-positive lease.
+	long := 2 * time.Minute
+	c1, err := s.ClaimDueLease(1, long)
+	if err != nil || len(c1) != 1 || c1[0].Attempt != 1 {
+		t.Fatalf("ClaimDueLease = %+v, %v; want one claim with Attempt 1", c1, err)
+	}
+	c2, err := s.ClaimDue(1)
+	if err != nil || len(c2) != 1 || c2[0].Attempt != 1 {
+		t.Fatalf("ClaimDue = %+v, %v; want one claim with Attempt 1", c2, err)
+	}
+	c3, err := s.ClaimDueLease(1, 0)
+	if err != nil || len(c3) != 1 || c3[0].Attempt != 1 {
+		t.Fatalf("ClaimDueLease(0) = %+v, %v; want one claim with Attempt 1", c3, err)
+	}
+	led, err := s.LoadLedger()
+	if err != nil {
+		t.Fatalf("LoadLedger: %v", err)
+	}
+	leaseUntil := func(id string) time.Time {
+		t.Helper()
+		for i := range led.Notifications {
+			if led.Notifications[i].ID != id {
+				continue
+			}
+			d := led.Notifications[i].Deliveries[0]
+			ts, err := time.Parse(TSLayout, d.LeaseUntil)
+			if err != nil {
+				t.Fatalf("LeaseUntil %q: %v", d.LeaseUntil, err)
+			}
+			return ts
+		}
+		t.Fatalf("notification %s not in the ledger", id)
+		return time.Time{}
+	}
+	if got, want := leaseUntil(c1[0].NotificationID), clk.Now().Add(long); !got.Equal(want) {
+		t.Fatalf("long-lease LeaseUntil = %s, want %s (the given lease)", got.Format(TSLayout), want.Format(TSLayout))
+	}
+	for _, c := range []Claim{c2[0], c3[0]} {
+		if got, want := leaseUntil(c.NotificationID), clk.Now().Add(LeaseDuration); !got.Equal(want) {
+			t.Fatalf("default-lease LeaseUntil = %s, want %s (LeaseDuration)", got.Format(TSLayout), want.Format(TSLayout))
+		}
+	}
+	// past the default lease: the two default-lease deliveries are due
+	// again, the long-lease one stays held.
+	clk.Add(LeaseDuration + time.Second)
+	cs, err := s.ClaimDue(0)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	if len(cs) != 2 {
+		t.Fatalf("claims = %+v, want the two default-lease deliveries only", cs)
+	}
+	byID := map[string]Claim{}
+	for _, c := range cs {
+		byID[c.NotificationID] = c
+	}
+	if c, ok := byID[c1[0].NotificationID]; ok {
+		t.Fatalf("the long-lease delivery was claimed before its lease expires: %+v", c)
+	}
+	for _, id := range []string{c2[0].NotificationID, c3[0].NotificationID} {
+		if c, ok := byID[id]; !ok || c.Attempt != 2 {
+			t.Fatalf("default-lease delivery %s not re-claimed at Attempt 2: %+v", id, cs)
+		}
+	}
+	// past the long lease too: only that delivery is due again; the two
+	// re-claimed ones carry a fresh default lease that expires exactly
+	// at this clock value, and the expiry check is strict (lease < now).
+	clk.Add(long - LeaseDuration)
+	cs, err = s.ClaimDue(0)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	if len(cs) != 1 || cs[0].NotificationID != c1[0].NotificationID || cs[0].Attempt != 2 {
+		t.Fatalf("claims = %+v, want only the long-lease delivery at Attempt 2", cs)
+	}
+}
+
 // TestLedgerProjectReplayNoDuplicates: projecting the same records
 // several times never creates a duplicate notification or a second
 // delivery for one (source, recipient).

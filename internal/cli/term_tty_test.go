@@ -152,16 +152,17 @@ func runPtyChild(t *testing.T, mode, dir, readyLine, feed string) ptyRunResult {
 	slave.Close()
 
 	var (
-		mu      sync.Mutex
-		stdoutB strings.Builder
-		stderrB []byte
-		masterB []byte
-		readers sync.WaitGroup
+		mu          sync.Mutex
+		stdoutB     strings.Builder
+		stderrB     []byte
+		masterB     []byte
+		pipeReaders sync.WaitGroup
 	)
+	masterEOF := make(chan struct{})
 	ready := make(chan struct{}, 1)
-	readers.Add(3)
+	pipeReaders.Add(2)
 	go func() {
-		defer readers.Done()
+		defer pipeReaders.Done()
 		fed := false
 		sc := bufio.NewScanner(stdoutPipe)
 		for sc.Scan() {
@@ -177,14 +178,14 @@ func runPtyChild(t *testing.T, mode, dir, readyLine, feed string) ptyRunResult {
 		}
 	}()
 	go func() {
-		defer readers.Done()
+		defer pipeReaders.Done()
 		b, _ := io.ReadAll(stderrPipe)
 		mu.Lock()
 		stderrB = b
 		mu.Unlock()
 	}()
 	go func() {
-		defer readers.Done()
+		defer close(masterEOF)
 		b, _ := io.ReadAll(master)
 		mu.Lock()
 		masterB = b
@@ -200,9 +201,16 @@ func runPtyChild(t *testing.T, mode, dir, readyLine, feed string) ptyRunResult {
 			t.Fatalf("timed out waiting for the pty child's ready line: %v", ctx.Err())
 		}
 	}
+	// The stdout and stderr readers must reach EOF before Wait is called:
+	// Wait closes those pipes, and Go documents it as incorrect to call it
+	// before all reads from them have completed, so the tail of the child's
+	// output can be lost. A hanging child is killed by the 20 s context
+	// deadline, which closes its ends and lets the readers finish, so this
+	// wait cannot outlive the deadline.
+	pipeReaders.Wait()
 	waitErr := cmd.Wait()
 	master.Close()
-	readers.Wait()
+	<-masterEOF
 	mu.Lock()
 	defer mu.Unlock()
 	return ptyRunResult{

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // RenderFunc renders the message of one delivery.
@@ -25,8 +26,11 @@ type DeliverSummary struct{ Claimed, Accepted, Uncertain, Rejected, Retrying, Ex
 const defaultConcurrency = 4
 
 // Deliver claims the due deliveries and sends them with at most
-// Concurrency goroutines. Each send sits between two locked steps (the
-// claim and its Complete), so the store is never locked while a sender
+// Concurrency goroutines. The claim lease covers the run's remaining
+// context budget plus the crash margin (LeaseDuration when the context
+// has no deadline), so a live claim never becomes due while the run can
+// still send it. Each send sits between two locked steps (the claim and
+// its Complete), so the store is never locked while a sender
 // runs. When the context is already done before a send starts, the
 // sender is not called and the attempt is completed as a transient
 // "deadline". It returns the first Complete error, after all sends have
@@ -42,7 +46,7 @@ func Deliver(ctx context.Context, s *Store, sender Sender, render RenderFunc, op
 	if concurrency <= 0 {
 		concurrency = defaultConcurrency
 	}
-	claims, err := s.ClaimDue(opts.Limit)
+	claims, err := s.ClaimDueLease(opts.Limit, leaseForRun(ctx, s.now()))
 	if err != nil {
 		return DeliverSummary{}, err
 	}
@@ -101,6 +105,23 @@ func Deliver(ctx context.Context, s *Store, sender Sender, render RenderFunc, op
 	}
 	wg.Wait()
 	return summary, firstErr
+}
+
+// leaseForRun derives the claim lease of one Deliver run from its
+// context: when the context has a deadline, the lease covers the time
+// until the deadline (measured from the store clock) plus the crash
+// margin (LeaseDuration), so a live claim never becomes due while the
+// run can still send it; without a deadline — or with one that already
+// passed — the lease is LeaseDuration.
+func leaseForRun(ctx context.Context, now time.Time) time.Duration {
+	if d, ok := ctx.Deadline(); ok {
+		rem := d.Sub(now)
+		if rem < 0 {
+			rem = 0
+		}
+		return rem + LeaseDuration
+	}
+	return LeaseDuration
 }
 
 // sendOne sends one claim and reports its result: when the context is

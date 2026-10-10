@@ -315,7 +315,9 @@ func readRegistry(t *testing.T, dir string) notify.Registry {
 
 // TestNotifyList covers the read-only list line, the disabled state on a
 // fresh dir (nothing created) and the counts after registrations and a
-// projected event.
+// projected event, with the wake's delivery run through the fake
+// herdr-soho (a question event has no escalation, so exactly two sends:
+// the owner and the orchestrator).
 func TestNotifyList(t *testing.T) {
 	clk := newTestClock()
 	// Fresh dir: disabled, nothing created (not even the state dir).
@@ -331,8 +333,12 @@ func TestNotifyList(t *testing.T) {
 		t.Fatal("list created the state dir")
 	}
 
-	// After registrations.
-	setConfig(t, dir, map[string]string{"machine_label": "m1"})
+	// After registrations: the herdr-soho bin points at the fake, so the
+	// wake's sends never resolve a real binary from the test PATH, and
+	// the job is seeded with its project before the wake.
+	exe, fakeDir := installFakeSoho(t, capsRule(capsJSON, 0), sendRule(0, 0))
+	setSohoConfig(t, dir, exe, "machine-a")
+	seedJob(t, dir, notifyTestJob, notifyTestRepo, 0, "accepted")
 	mustRunNotify(t, dir, clk, "notify", "register", "owner", "--projeto", notifyTestRepo, "--to", notifyTestOwner)
 	mustRunNotify(t, dir, clk, "notify", "register", "orchestrator", "--job", notifyTestJob, "--to", notifyTestOrch)
 	mustRunNotify(t, dir, clk, "notify", "register", "coordinator", "--to", notifyTestCoord)
@@ -364,6 +370,23 @@ func TestNotifyList(t *testing.T) {
 	stdout, _, exit = runNotifyFlow(t, dir, clk, vars, wakeEvent(1), "wake")
 	if exit != 0 {
 		t.Fatalf("wake exit = %d, stdout %q", exit, stdout)
+	}
+	// The wake delivered through the fake: exactly two sends, to the
+	// owner and the orchestrator (a question event has no escalation,
+	// so the coordinator is not a recipient).
+	sends := flowSendCalls(t, fakeDir)
+	if len(sends) != 2 {
+		t.Fatalf("wake made %d sends, want 2 (owner + orchestrator): %v", len(sends), sends)
+	}
+	refs := map[string]bool{}
+	for _, s := range sends {
+		if len(s) < 2 {
+			t.Fatalf("send argv = %v", s)
+		}
+		refs[s[1]] = true
+	}
+	if len(refs) != 2 || !refs[notifyTestOwner] || !refs[notifyTestOrch] {
+		t.Fatalf("send refs = %v, want the owner and the orchestrator", refs)
 	}
 	stdout, _, exit = runNotifyFlow(t, dir, clk, map[string]string{}, "", "notify", "list")
 	if exit != 0 {

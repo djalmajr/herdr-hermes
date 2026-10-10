@@ -230,6 +230,33 @@ func (s *Store) loadLedgerLocked() (*Ledger, error) {
 // read-only: it takes no lock and creates nothing.
 func (s *Store) LoadLedger() (*Ledger, error) { return s.loadLedgerLocked() }
 
+// loadLedgerMutatingLocked loads the ledger for one mutating operation,
+// under the outbox lock. A missing ledger file (the registry exists but
+// the ledger was never written, or was deleted) is initialized at the
+// current last outbox seq and reported as initialized, so the records
+// stored before it are never backfilled; the operation writes the ledger
+// back when it persists. A ledger file that exists but cannot be parsed
+// stays an error, never a silent reset.
+func (s *Store) loadLedgerMutatingLocked() (*Ledger, bool, error) {
+	_, statErr := os.Stat(s.ledgerPath())
+	led, err := s.loadLedgerLocked()
+	if err != nil {
+		return nil, false, err
+	}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return nil, false, statErr
+	}
+	if statErr == nil {
+		return led, false, nil
+	}
+	_, last, err := s.ob.Read(0)
+	if err != nil {
+		return nil, false, err
+	}
+	led.ProjectedSeq = last
+	return led, true, nil
+}
+
 func (s *Store) writeRegistryLocked(reg *Registry) error {
 	if reg.Schema == 0 {
 		reg.Schema = LedgerSchema
@@ -291,10 +318,12 @@ func copyNotification(n *Notification) Notification {
 
 // UpdateRegistry mutates the registry under the outbox lock and writes it
 // atomically. When the registry did not exist it is created, and when the
-// ledger does not exist yet it is created too, with ProjectedSeq at the
-// last complete outbox seq: old records are not backfilled, the cursor
-// only moves forward from here. A later update never resets an existing
-// ledger. Validation is the caller's job.
+// ledger does not exist yet it is created first — with ProjectedSeq at the
+// last complete outbox seq — and only then the registry: there is no
+// window in which notifications are enabled without a cursor, and old
+// records are not backfilled (the cursor only moves forward from here).
+// A later update never resets an existing ledger. Validation is the
+// caller's job.
 func (s *Store) UpdateRegistry(mutate func(*Registry) error) error {
 	return s.ob.WithLock(func() error {
 		if err := s.ensureDir(); err != nil {
@@ -307,9 +336,8 @@ func (s *Store) UpdateRegistry(mutate func(*Registry) error) error {
 		if err := mutate(&reg); err != nil {
 			return err
 		}
-		if err := s.writeRegistryLocked(&reg); err != nil {
-			return err
-		}
+		// The missing ledger is created before the registry enables
+		// notifications: no window with notifications on and no cursor.
 		if _, err := os.ReadFile(s.ledgerPath()); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return err
@@ -320,9 +348,11 @@ func (s *Store) UpdateRegistry(mutate func(*Registry) error) error {
 			}
 			led := emptyLedger()
 			led.ProjectedSeq = last
-			return s.writeLedgerLocked(led)
+			if err := s.writeLedgerLocked(led); err != nil {
+				return err
+			}
 		}
-		return nil
+		return s.writeRegistryLocked(&reg)
 	})
 }
 
@@ -330,7 +360,10 @@ func (s *Store) UpdateRegistry(mutate func(*Registry) error) error {
 // projection cursor into notifications, under the outbox lock. Records
 // whose tipo is not job_event or that carry no job id are skipped; a
 // project error counts Malformed and does not stop the run; a
-// notification id already in the ledger counts Duplicates. The cursor
+// notification id already in the ledger counts Duplicates. A missing
+// ledger (the registry exists, the ledger was never written or was
+// deleted) is initialized at the current last outbox seq and written,
+// so the stored records are never backfilled. The cursor
 // advances to the last complete outbox seq of the lines read, the ledger
 // is written once and only when something changed, and before the write
 // the final notifications persisted before the retention window are
@@ -342,7 +375,7 @@ func (s *Store) ProjectOutbox(project ProjectFunc) (ProjectSummary, error) {
 	}
 	var sum ProjectSummary
 	err := s.ob.WithLock(func() error {
-		led, err := s.loadLedgerLocked()
+		led, initialized, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -393,7 +426,7 @@ func (s *Store) ProjectOutbox(project ProjectFunc) (ProjectSummary, error) {
 			changed = true
 		}
 		sum.ProjectedSeq = led.ProjectedSeq
-		if changed {
+		if changed || initialized {
 			pruneLedger(led, now)
 			if err := s.writeLedgerLocked(led); err != nil {
 				return err
@@ -471,7 +504,7 @@ func (s *Store) IngestAgentStatus(ev AgentStatusEvent, project StatusFunc) (Inge
 			sum = IngestSummary{Ignored: true}
 			return nil
 		}
-		led, err := s.loadLedgerLocked()
+		led, _, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -531,7 +564,7 @@ func (s *Store) Raise(in RaiseInput, project RaiseFunc) (*Notification, bool, er
 	var n *Notification
 	var created bool
 	err := s.ob.WithLock(func() error {
-		led, err := s.loadLedgerLocked()
+		led, _, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -589,7 +622,7 @@ func (s *Store) IngestWorkspace(ev WorkspaceEvent, labelJob, labelProjeto string
 		if err != nil {
 			return err
 		}
-		led, err := s.loadLedgerLocked()
+		led, _, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -693,13 +726,26 @@ type Claim struct {
 	prevFirst, prevLast string
 }
 
-// ClaimDue claims the due deliveries, in ledger order: pending ones whose
-// NextAttemptAt has come (empty means due now) and in-flight ones whose
-// lease has expired (the earlier run died). Every claim is marked
-// in-flight with a fresh lease, Attempts is incremented, the attempt
+// ClaimDue claims the due deliveries with the default lease
+// (LeaseDuration): the same behavior as ClaimDueLease with the default
+// lease. A disabled store claims nothing.
+func (s *Store) ClaimDue(limit int) ([]Claim, error) {
+	return s.ClaimDueLease(limit, LeaseDuration)
+}
+
+// ClaimDueLease claims the due deliveries, in ledger order: pending ones
+// whose NextAttemptAt has come (empty means due now) and in-flight ones
+// whose lease has expired (the earlier run died). Every claim is marked
+// in-flight with a fresh lease of the given duration — a live delivery
+// run passes its remaining run budget plus the crash margin, so a live
+// claim never becomes due while its run can still send it; a lease of
+// 0 or less uses LeaseDuration. Attempts is incremented, the attempt
 // timestamps are set, and the ledger is written once. limit <= 0 means
 // defaultClaimLimit. A disabled store claims nothing.
-func (s *Store) ClaimDue(limit int) ([]Claim, error) {
+func (s *Store) ClaimDueLease(limit int, lease time.Duration) ([]Claim, error) {
+	if lease <= 0 {
+		lease = LeaseDuration
+	}
 	if limit <= 0 {
 		limit = defaultClaimLimit
 	}
@@ -708,13 +754,13 @@ func (s *Store) ClaimDue(limit int) ([]Claim, error) {
 	}
 	var claims []Claim
 	err := s.ob.WithLock(func() error {
-		led, err := s.loadLedgerLocked()
+		led, initialized, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
 		now := s.now()
 		nowTS := now.Format(TSLayout)
-		leaseTS := now.Add(LeaseDuration).Format(TSLayout)
+		leaseTS := now.Add(lease).Format(TSLayout)
 		claims = []Claim{}
 	outer:
 		for i := range led.Notifications {
@@ -747,7 +793,7 @@ func (s *Store) ClaimDue(limit int) ([]Claim, error) {
 				}
 			}
 		}
-		if len(claims) > 0 {
+		if len(claims) > 0 || initialized {
 			if err := s.writeLedgerLocked(led); err != nil {
 				return err
 			}
@@ -799,7 +845,7 @@ func (s *Store) Complete(c Claim, r SendResult) error {
 		return nil
 	}
 	return s.ob.WithLock(func() error {
-		led, err := s.loadLedgerLocked()
+		led, _, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -827,7 +873,7 @@ func (s *Store) Release(c Claim) error {
 		return nil
 	}
 	return s.ob.WithLock(func() error {
-		led, err := s.loadLedgerLocked()
+		led, _, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -892,7 +938,7 @@ func (s *Store) Ack(id, role string) (bool, error) {
 	}
 	var found bool
 	err := s.ob.WithLock(func() error {
-		led, err := s.loadLedgerLocked()
+		led, initialized, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -915,7 +961,7 @@ func (s *Store) Ack(id, role string) (bool, error) {
 				changed = true
 			}
 		}
-		if changed {
+		if changed || initialized {
 			return s.writeLedgerLocked(led)
 		}
 		return nil
@@ -939,7 +985,7 @@ func (s *Store) Retry(id, role string) (bool, error) {
 	}
 	var found bool
 	err := s.ob.WithLock(func() error {
-		led, err := s.loadLedgerLocked()
+		led, initialized, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -957,7 +1003,7 @@ func (s *Store) Retry(id, role string) (bool, error) {
 			d.NextAttemptAt = s.now().Format(TSLayout)
 			d.LeaseUntil = ""
 		}
-		if found {
+		if found || initialized {
 			return s.writeLedgerLocked(led)
 		}
 		return nil
