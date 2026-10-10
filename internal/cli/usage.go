@@ -28,12 +28,39 @@ commands:
   version                           print the version
   help                              print this usage
   plugin startup|event|bridge       Herdr plugin entry points
+  notify register owner --projeto <org/repo> --to <ref> | orchestrator --job <id>
+                        --to <ref> | coordinator --to <ref> | watch --pane <ws:pane>
+                        [--job <id>] [--projeto <org/repo>] | workspace
+                        --workspace <ws> [--job <id>] [--projeto <org/repo>]
+                                    register notification recipients and sources
+  notify unregister owner --projeto <org/repo> | orchestrator --job <id> |
+                        coordinator | watch --pane <ws:pane> | workspace --workspace <ws>
+                                    unregister notification recipients and sources
+  notify list                   show the registrations and the notification,
+                                    delivery and pending counts (read-only)
+  notify status [--id <nid>]    show the last 50 notifications, or exactly one by
+                                    id (read-only)
+  notify deliver [--timeout <ms>]
+                                project new job events and deliver the due
+                                    notifications
+  notify ingest agent-status|workspace
+                                ingest a Herdr agent status or workspace event from stdin
+                                    (64 KiB cap)
+  notify raise --class cross_project|stuck [--projeto <org/repo>] [--job <id>]
+                                [--id <raise-id>]
+                                    raise an explicit cross-project or stuck
+                                    notification
+  notify ack <nid> --role owner|orchestrator|coordinator
+                                    acknowledge a delivered notification
+  notify retry <nid> --role owner|orchestrator|coordinator
+                                    re-queue once an uncertain or exhausted delivery
 
 exit codes:
   0   success (forwarded commands: whatever herdr-soho returned)
   2   bad usage, input limit exceeded, unknown config key, internal job
       subcommand refused
-  3   unknown job id in herdr-hermes bookkeeping (sync --job)
+  3   unknown job id in herdr-hermes bookkeeping (sync --job) and unknown
+      notification id (notify status --id, notify ack, notify retry)
   4   herdr-soho not found or not runnable
   40  no API key configured (push required)
   41  API key rejected by the dispatcher (401/403)

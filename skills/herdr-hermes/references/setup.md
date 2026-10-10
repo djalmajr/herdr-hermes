@@ -44,6 +44,20 @@ job_wake_cmd=herdr-hermes wake
 
 With this set, every job event that wakes the dispatcher is also recorded in the outbox as soon as it happens.
 
+## Register notification recipients (optional)
+
+Native notifications reach only explicitly registered recipients; until the first `notify register`, no notification file is written. Register the project owner, the job orchestrator, the machine coordinator and the Herdr panes to watch:
+
+```text
+herdr-hermes notify register owner --projeto <org>/<repo> --to <ref>
+herdr-hermes notify register orchestrator --job <id> --to <ref>
+herdr-hermes notify register coordinator --to <ref>
+herdr-hermes notify register watch --pane <ws:pane> --job <id>
+herdr-hermes notify register workspace --workspace <ws> --job <id>
+```
+
+`<ref>` is a `herdr-soho send` reference `<machine>/<ws>:<pane>` or a local agent name; it is validated, never guessed. `notify list` and `notify status` are read-only; `notify deliver`, `notify ingest agent-status|workspace`, `notify raise`, `notify ack` and `notify retry` write the ledger and are refused under `HERDR_HERMES_NOWRITE=1` with exit 2.
+
 ## Verify
 
 ```text

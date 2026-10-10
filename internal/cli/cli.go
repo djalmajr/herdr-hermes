@@ -50,6 +50,8 @@ var commands = []command{
 	{"version", false, false, cmdVersion},
 	{"help", false, false, cmdHelp},
 	{"plugin", false, true, cmdPlugin},
+	// slice 5: notify
+	{"notify", false, true, cmdNotify},
 }
 
 // Run executes args[0] as a command and returns its exit code. An unknown

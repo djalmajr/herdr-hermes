@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/djalmajr/herdr-hermes/internal/config"
 	"github.com/djalmajr/herdr-hermes/internal/jobapi"
@@ -144,6 +145,12 @@ func runSync(ctx context.Context, env Env, jobID string, pushOnly bool) (syncRes
 				outbox.Friction(outbox.StateDir(env.ConfigDir), "sync", "job "+id+": "+err.Error())
 			}
 		}
+	}
+	// Project and deliver the pending notifications after the per-job
+	// event loop and before the push (skipped with --push-only); the
+	// output line and exit code are unchanged.
+	if !pushOnly {
+		runNotify(ctx, env, cfg, 30*time.Second)
 	}
 	res := pushPending(ctx, env, cfg, store, true)
 	status := ""

@@ -116,6 +116,7 @@ func TestManifest(t *testing.T) {
 		"startup sync":             false,
 		"events workspace-created": false,
 		"events workspace-closed":  false,
+		"events agent-status":      false,
 		"actions status":           false,
 		"actions sync":             false,
 	}
