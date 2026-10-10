@@ -38,7 +38,7 @@ var ErrUnsafeState = errors.New("registry: unsafe state file")
 // columns, the text columns are what the API returns.
 const schemaDDL = `
 CREATE TABLE nodes(maquina TEXT PRIMARY KEY, ultimo_contato TEXT, ultimo_contato_unix INTEGER, ultimo_poll TEXT, poll_status TEXT, herdr_version TEXT, soho_version TEXT, runners TEXT, manutencao INTEGER NOT NULL DEFAULT 0, manutencao_motivo TEXT);
-CREATE TABLE jobs(maquina TEXT NOT NULL, chave TEXT NOT NULL, origem TEXT NOT NULL, job_id TEXT, workspace TEXT, workspace_id TEXT, agente TEXT, agente_fonte TEXT, trabalho TEXT, ref TEXT, card TEXT, projeto TEXT, branch TEXT, pr TEXT, fase TEXT, herdr_status TEXT, terminal INTEGER NOT NULL DEFAULT 0, saida INTEGER, esperando_humano INTEGER NOT NULL DEFAULT 0, espera_motivo TEXT, ultimo_seq INTEGER NOT NULL DEFAULT 0, ultima_atividade TEXT, ultima_atividade_unix INTEGER, obsoleto INTEGER NOT NULL DEFAULT 0, fonte_push INTEGER NOT NULL DEFAULT 0, fonte_poll INTEGER NOT NULL DEFAULT 0, visto_poll TEXT, sessao_ts_unix INTEGER, encerrado INTEGER NOT NULL DEFAULT 0, encerrado_unix INTEGER, PRIMARY KEY(maquina, chave));
+CREATE TABLE jobs(maquina TEXT NOT NULL, chave TEXT NOT NULL, origem TEXT NOT NULL, job_id TEXT, workspace TEXT, workspace_id TEXT, agente TEXT, agente_fonte TEXT, trabalho TEXT, ref TEXT, card TEXT, projeto TEXT, branch TEXT, pr TEXT, fase TEXT, herdr_status TEXT, terminal INTEGER NOT NULL DEFAULT 0, saida INTEGER, esperando_humano INTEGER NOT NULL DEFAULT 0, espera_motivo TEXT, ultimo_seq INTEGER NOT NULL DEFAULT 0, ultima_atividade TEXT, ultima_atividade_unix INTEGER, obsoleto INTEGER NOT NULL DEFAULT 0, fonte_push INTEGER NOT NULL DEFAULT 0, fonte_poll INTEGER NOT NULL DEFAULT 0, visto_poll TEXT, sessao_ts_unix INTEGER, sessao_seq INTEGER, encerrado INTEGER NOT NULL DEFAULT 0, encerrado_unix INTEGER, PRIMARY KEY(maquina, chave));
 CREATE TABLE events(maquina TEXT NOT NULL, chave TEXT NOT NULL, seq INTEGER NOT NULL, ts TEXT NOT NULL, tipo TEXT NOT NULL, resumo TEXT NOT NULL, refs TEXT, PRIMARY KEY(maquina, chave, seq));
 CREATE TABLE waits(maquina TEXT NOT NULL, pane TEXT NOT NULL, workspace_id TEXT, agente TEXT, desde TEXT NOT NULL, desde_unix INTEGER NOT NULL, PRIMARY KEY(maquina, pane));
 CREATE TABLE claims(id TEXT PRIMARY KEY, agente TEXT NOT NULL, maquina TEXT, card TEXT, projeto TEXT, branch TEXT, pr TEXT, workspace TEXT, ref TEXT, criado TEXT NOT NULL, criado_unix INTEGER NOT NULL, expira TEXT NOT NULL, expira_unix INTEGER NOT NULL);
@@ -304,19 +304,74 @@ func unsafeStateCheck(path string) error {
 				return fmt.Errorf("%w: %s has group or other mode bits (%o)", ErrUnsafeState, st.path, perm)
 			}
 		}
-		dir := filepath.Dir(path)
-		if dir != "" {
-			dst, err := os.Lstat(dir)
-			if err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					return nil // MkdirAll creates it at 0700
-				}
-				return err
-			}
-			if perm := dst.Mode().Perm() & 0o022; perm != 0 {
-				return fmt.Errorf("%w: %s allows group or other writes (%o)", ErrUnsafeState, dir, perm)
+		for _, st := range existing {
+			if !ownedBySelfOrRoot(st.fi) {
+				return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeState, st.path)
 			}
 		}
+		if err := checkAncestors(filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkAncestors walks every existing directory from the root down to
+// dir, so nobody but the current user (or root) can swap an entry on the
+// way to the database. A directory another user owns, or one writable by
+// group or other, is refused; the one exception is a sticky shared
+// directory such as /tmp, where only an entry's owner may replace it: the
+// entry below it must then be a real directory owned by the current user
+// or root, never a symlink. A missing part of the path ends the walk:
+// Open creates it at 0700.
+func checkAncestors(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	vol := filepath.VolumeName(abs)
+	cur := vol + string(filepath.Separator)
+	for _, part := range strings.Split(strings.TrimPrefix(abs[len(vol):], string(filepath.Separator)), string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		parent, err := os.Stat(cur)
+		if err != nil {
+			return err
+		}
+		if !ownedBySelfOrRoot(parent) {
+			return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeState, cur)
+		}
+		next := filepath.Join(cur, part)
+		entry, err := os.Lstat(next)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if parent.Mode().Perm()&0o022 != 0 {
+			if parent.Mode()&os.ModeSticky == 0 {
+				return fmt.Errorf("%w: %s allows group or other writes", ErrUnsafeState, cur)
+			}
+			if entry.Mode()&os.ModeSymlink != 0 || !ownedBySelfOrRoot(entry) {
+				return fmt.Errorf("%w: %s in a shared directory is not a directory of the current user", ErrUnsafeState, next)
+			}
+		}
+		cur = next
+	}
+	final, err := os.Stat(cur)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !ownedBySelfOrRoot(final) {
+		return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeState, cur)
+	}
+	if final.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%w: %s allows group or other writes", ErrUnsafeState, cur)
 	}
 	return nil
 }

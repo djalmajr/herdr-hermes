@@ -48,6 +48,11 @@ const (
 	MaxClaims   = 1000
 	MaxPolicies = 1000
 	MaxFolders  = 1000
+
+	// MaxInventoryBytes bounds a full inventory answer: with every table
+	// at its cap and every kept value at its length bound and fully
+	// escaped, the JSON stays under it. The jobs client reads up to it.
+	MaxInventoryBytes = 256 << 20
 )
 
 // Job origins.

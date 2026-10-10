@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/djalmajr/herdr-hermes/internal/registry"
 )
 
 // runCLIVars is runCLI with an explicit environment map (for the NOWRITE
@@ -290,8 +292,16 @@ func TestJobsErrors(t *testing.T) {
 		}
 		requireCapture(t, ch)
 	})
-	t.Run("body over the 64 MiB cap maps to 4 malformed", func(t *testing.T) {
-		big := strings.Repeat("a", (64<<20)+1)
+	// The cap is lowered to 1 MiB here so the boundary stays cheap; its
+	// real value is pinned below to the registry's inventory bound.
+	lowerCap := func(t *testing.T) {
+		old := jobsRespCap
+		jobsRespCap = 1 << 20
+		t.Cleanup(func() { jobsRespCap = old })
+	}
+	t.Run("body over the cap maps to 4 malformed", func(t *testing.T) {
+		lowerCap(t)
+		big := strings.Repeat("a", (1<<20)+1)
 		srv, ch, _ := captureServer(t, http.StatusOK, []byte(`{"pad":"`+big+`"}`), false)
 		dir := t.TempDir()
 		stdout, _, exit := runCLI(t, dir, false, "jobs", "--server", srv.URL)
@@ -303,17 +313,22 @@ func TestJobsErrors(t *testing.T) {
 		}
 		requireCapture(t, ch)
 	})
-	// Boundary: a full response just under the 64 MiB cap is accepted and
-	// printed; the old 16 MiB cap refused it.
-	t.Run("body just under the 64 MiB cap passes", func(t *testing.T) {
-		big := strings.Repeat("a", 64<<20-10) // with the JSON padding, 64 MiB - 4 bytes
+	// Boundary: a full response of exactly the cap is accepted and printed.
+	t.Run("body of exactly the cap passes", func(t *testing.T) {
+		lowerCap(t)
+		big := strings.Repeat("a", 1<<20-10) // with the JSON padding, exactly 1 MiB
 		srv, ch, _ := captureServer(t, http.StatusOK, []byte(`{"pad":"`+big+`"}`), false)
 		dir := t.TempDir()
 		stdout, _, exit := runCLI(t, dir, false, "jobs", "--server", srv.URL)
 		if exit != 0 {
-			t.Fatalf("jobs under-cap body exit = %d, want 0 (stdout %q)", exit, stdout)
+			t.Fatalf("jobs at-cap body exit = %d, want 0 (stdout %q)", exit, stdout)
 		}
 		requireCapture(t, ch)
+	})
+	t.Run("cap is the registry inventory bound", func(t *testing.T) {
+		if jobsRespCap != registry.MaxInventoryBytes {
+			t.Fatalf("jobsRespCap = %d, want registry.MaxInventoryBytes (%d)", jobsRespCap, registry.MaxInventoryBytes)
+		}
 	})
 	t.Run("transport error maps to 4 unreachable", func(t *testing.T) {
 		dir := t.TempDir()
@@ -334,9 +349,9 @@ func TestJobsErrors(t *testing.T) {
 // query, body and headers — and the 200 path (compact single line, exit
 // 0). No request ever carries an Authorization header.
 //
-// Mutation captured: dropping the 64 MiB body cap (or keeping the old
-// 16 MiB one) makes the just-under-cap body exit 4 instead of 0, and
-// raising it makes the over-cap body exit 0 instead of 4.
+// Mutation captured: an off-by-one or a dropped body cap makes the at-cap
+// body exit 4 or the over-cap body exit 0, and a cap other than the
+// registry's inventory bound fails its pin.
 func TestJobsRequests(t *testing.T) {
 	ok := []byte(`{"status":"ok"}`)
 	t.Run("inventory", func(t *testing.T) {

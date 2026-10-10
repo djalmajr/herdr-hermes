@@ -12,14 +12,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/djalmajr/herdr-hermes/internal/registry"
 )
 
 const (
 	jobsDefaultServer = "http://127.0.0.1:7429"
 	jobsUsageText     = "usage: jobs [check|release|policy|folder|node] …"
-	jobsRespCap       = 64 << 20
 	jobsTimeout       = 30 * time.Second
 )
+
+// jobsRespCap is the most the jobs client reads from the registry: the
+// bound of a full inventory. A variable so a test can lower it.
+var jobsRespCap = registry.MaxInventoryBytes
 
 // jobsForm is the parsed form of a jobs invocation: the subcommand, the
 // verb for policy/folder/node and the space-form flags.
@@ -453,14 +458,16 @@ func cmdJobs(args []string, env Env) int {
 		return 4
 	}
 	defer resp.Body.Close()
-	raw, over, err := readCappedOver(resp.Body, jobsRespCap)
+	// Read as the body arrives: a small answer never costs the whole cap.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(jobsRespCap)+1))
+	over := len(raw) > jobsRespCap
 	if err != nil {
 		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs: %v\n", err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry unreachable"}))
 		return 4
 	}
 	if over {
-		_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs: response body exceeds 64 MiB")
+		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs: response body exceeds %d bytes\n", jobsRespCap)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry answered malformed"}))
 		return 4
 	}

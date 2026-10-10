@@ -274,6 +274,53 @@ func TestOpenUnsafeState(t *testing.T) {
 			t.Fatalf("Open in a 0775 dir = %v, want ErrUnsafeState", err)
 		}
 	})
+	t.Run("shared non-sticky ancestor", func(t *testing.T) {
+		shared := filepath.Join(t.TempDir(), "shared")
+		state := filepath.Join(shared, "state")
+		if err := os.MkdirAll(state, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Chmod(shared, 0o777); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := Open(filepath.Join(state, "registry.db"), Options{Now: fixedClock()}); !errors.Is(err, ErrUnsafeState) {
+			t.Fatalf("Open under a 0777 non-sticky ancestor = %v, want ErrUnsafeState", err)
+		}
+	})
+	t.Run("symlink in a sticky shared dir", func(t *testing.T) {
+		shared := filepath.Join(t.TempDir(), "shared")
+		real := filepath.Join(t.TempDir(), "real")
+		if err := os.Mkdir(shared, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Mkdir(real, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Symlink(real, filepath.Join(shared, "state")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if err := os.Chmod(shared, 0o777|os.ModeSticky); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := Open(filepath.Join(shared, "state", "registry.db"), Options{Now: fixedClock()}); !errors.Is(err, ErrUnsafeState) {
+			t.Fatalf("Open through a symlink in a sticky shared dir = %v, want ErrUnsafeState", err)
+		}
+	})
+	t.Run("own dir in a sticky shared dir", func(t *testing.T) {
+		shared := filepath.Join(t.TempDir(), "shared")
+		state := filepath.Join(shared, "state")
+		if err := os.MkdirAll(state, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Chmod(shared, 0o777|os.ModeSticky); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		s, err := Open(filepath.Join(state, "registry.db"), Options{Now: fixedClock()})
+		if err != nil {
+			t.Fatalf("Open in an own dir under a sticky shared dir: %v", err)
+		}
+		s.Close()
+	})
 	t.Run("happy reopen", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "registry.db")

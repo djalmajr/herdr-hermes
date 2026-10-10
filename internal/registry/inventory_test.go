@@ -3,6 +3,7 @@ package registry
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -370,4 +371,77 @@ func TestTwoNodeInventory(t *testing.T) {
 	if jobConflict == nil {
 		t.Errorf("conflicts = %+v, want the node-b card job conflict", res2.Conflitos)
 	}
+}
+
+// TestInventoryWorstCaseBound: one row of each pushed or operator table,
+// with every kept value at its length bound and made of characters JSON
+// escapes to six bytes, serialized and multiplied by its table cap, stays
+// under MaxInventoryBytes, the most the jobs client reads. Poll rows come
+// from the operator's own Herdr and are not part of the bound.
+func TestInventoryWorstCaseBound(t *testing.T) {
+	s := openStore(t)
+	refs := map[string]any{}
+	for _, k := range EventRefsKeys {
+		refs[k] = strings.Repeat("<", MaxRefValueBytes)
+	}
+	for i := int64(1); i <= int64(DefaultEventsPerJob)+1; i++ {
+		tipo := "n" + strings.Repeat("x", 63) // the longest type an event may carry
+		if i == int64(DefaultEventsPerJob)+1 {
+			tipo = jobapi.TypeQuestion
+		}
+		b, _ := json.Marshal(map[string]any{
+			"seq": i, "ts": "2026-10-10T11:30:00.123456789-03:00", "tipo": tipo,
+			"resumo": strings.Repeat("\x01", MaxResumo+1), "refs": refs,
+		})
+		mustIngest(t, s, recordBase(func(r *outbox.Record) {
+			r.Seq = i
+			r.IdempotencyKey = fmt.Sprintf("job-1:%d", i)
+			r.Dados = b
+		}))
+	}
+	esc := strings.Repeat("\x01", 280)
+	if err := s.SetPolicy(PolicyInput{Escopo: EscopoProjeto, Valor: strings.Repeat("a", 100) + "/" + strings.Repeat("b", 100), Hold: true, Prioridade: ptr(-1000), Motivo: esc}); err != nil {
+		t.Fatalf("SetPolicy: %v", err)
+	}
+	if err := s.SetFolder(FolderInput{Maquina: "node-a", Caminho: strings.Repeat("\x01", 1024), TamanhoBytes: ptr(int64(1) << 62), Pedido: "2026-10-10T11:30:00.123456789-03:00", Job: strings.Repeat("j", 64)}); err != nil {
+		t.Fatalf("SetFolder: %v", err)
+	}
+	runners := make([]string, 32)
+	for i := range runners {
+		runners[i] = fmt.Sprintf("%02d", i) + strings.Repeat("r", 30)
+	}
+	on := true
+	if err := s.SetNode(NodeUpdate{Maquina: "node-a", Manutencao: &on, ManutencaoMotivo: ptr(strings.Repeat("~", 280)), SohoVersion: ptr(strings.Repeat("~", 120)), Runners: runners}); err != nil {
+		t.Fatalf("SetNode: %v", err)
+	}
+	if _, err := s.Check(CheckRequest{Agente: strings.Repeat("a", 64), Maquina: "node-b", Card: "A" + strings.Repeat("b", 15) + "-123456789", Projeto: strings.Repeat("c", 100) + "/" + strings.Repeat("d", 100), Branch: strings.Repeat("e", 200), PR: "123456789", Workspace: "w" + strings.Repeat("x", 63)}); err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	inv, err := s.Inventory(Filter{})
+	if err != nil {
+		t.Fatalf("Inventory: %v", err)
+	}
+	if len(inv.Jobs) != 1 || len(inv.Esperas) != 1 || len(inv.Politicas) != 1 || len(inv.Pastas) != 1 || len(inv.Claims) != 1 || len(inv.Nodes) == 0 {
+		t.Fatalf("inventory rows = %d jobs, %d esperas, %d politicas, %d pastas, %d claims, %d nodes; want one of each", len(inv.Jobs), len(inv.Esperas), len(inv.Politicas), len(inv.Pastas), len(inv.Claims), len(inv.Nodes))
+	}
+	if n := len(inv.Jobs[0].Eventos); n != DefaultEventsPerJob {
+		t.Fatalf("events kept = %d, want %d", n, DefaultEventsPerJob)
+	}
+	size := func(v any) int {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return len(b) + 1
+	}
+	total := 1024 +
+		MaxJobs*(size(inv.Jobs[0])+size(inv.Esperas[0])) +
+		MaxPolicies*size(inv.Politicas[0]) +
+		MaxFolders*size(inv.Pastas[0]) +
+		MaxClaims*size(inv.Claims[0]) +
+		MaxNodes*size(inv.Nodes[0])
+	if total > MaxInventoryBytes {
+		t.Fatalf("worst-case inventory = %d bytes, want at most MaxInventoryBytes (%d)", total, MaxInventoryBytes)
+	}
+	t.Logf("worst-case inventory: %d bytes of %d", total, MaxInventoryBytes)
 }

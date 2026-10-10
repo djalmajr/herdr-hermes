@@ -97,6 +97,9 @@ func validateRecord(rec outbox.Record) (time.Time, error) {
 	if rec.Seq < 1 {
 		return time.Time{}, invalidErr("seq", "must be positive")
 	}
+	if len(rec.TS) > maxTSLen {
+		return time.Time{}, invalidErr("ts", "too long")
+	}
 	ts, err := time.Parse(time.RFC3339, rec.TS)
 	if err != nil {
 		return time.Time{}, invalidErr("ts", "must be RFC 3339 with an explicit offset")
@@ -251,6 +254,7 @@ type jobRow struct {
 	obsoleto      int
 	fontePush     int
 	sessaoTs      *int64
+	sessaoSeq     int64
 	encerrado     int
 	encerradoUnix int64
 }
@@ -263,10 +267,10 @@ func jobRowOf(tx *sql.Tx, maquina, chave string) (*jobRow, error) {
 	var encerradoUnix sql.NullInt64
 	var jobID, workspace, workspaceID, agente, agenteFonte, card, projeto, branch, pr, fase, herdrStatus, esperaMotivo, ultima, origem sql.NullString
 	var saida sql.NullInt64
-	var sessaoTs sql.NullInt64
-	err := tx.QueryRow(`SELECT origem, job_id, workspace, workspace_id, agente, agente_fonte, card, projeto, branch, pr, fase, herdr_status, terminal, saida, esperando_humano, espera_motivo, ultimo_seq, ultima_atividade, ultima_atividade_unix, obsoleto, fonte_push, sessao_ts_unix, encerrado, encerrado_unix
+	var sessaoTs, sessaoSeq sql.NullInt64
+	err := tx.QueryRow(`SELECT origem, job_id, workspace, workspace_id, agente, agente_fonte, card, projeto, branch, pr, fase, herdr_status, terminal, saida, esperando_humano, espera_motivo, ultimo_seq, ultima_atividade, ultima_atividade_unix, obsoleto, fonte_push, sessao_ts_unix, sessao_seq, encerrado, encerrado_unix
 		FROM jobs WHERE maquina = ? AND chave = ?`, maquina, chave).
-		Scan(&origem, &jobID, &workspace, &workspaceID, &agente, &agenteFonte, &card, &projeto, &branch, &pr, &fase, &herdrStatus, &terminal, &saida, &esperando, &esperaMotivo, &ultimoSeq, &ultima, &ultimaUnix, &obsoleto, &fontePush, &sessaoTs, &encerrado, &encerradoUnix)
+		Scan(&origem, &jobID, &workspace, &workspaceID, &agente, &agenteFonte, &card, &projeto, &branch, &pr, &fase, &herdrStatus, &terminal, &saida, &esperando, &esperaMotivo, &ultimoSeq, &ultima, &ultimaUnix, &obsoleto, &fontePush, &sessaoTs, &sessaoSeq, &encerrado, &encerradoUnix)
 	if errors.Is(err, errNoRow) {
 		return nil, nil
 	}
@@ -302,6 +306,7 @@ func jobRowOf(tx *sql.Tx, maquina, chave string) (*jobRow, error) {
 		v := sessaoTs.Int64
 		r.sessaoTs = &v
 	}
+	r.sessaoSeq = sessaoSeq.Int64
 	r.encerrado = encerrado
 	if encerradoUnix.Valid {
 		r.encerradoUnix = encerradoUnix.Int64
@@ -372,6 +377,9 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 		// A stale replay below a full ring changes nothing.
 		return false, nil
 	}
+	if len(ev.TS) > maxTSLen {
+		return false, invalidErr("ts", "too long")
+	}
 	evTS, err := time.Parse(time.RFC3339, ev.TS)
 	if err != nil {
 		// The event ts came from the machine's outbox; a broken ts must
@@ -379,8 +387,12 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 		return false, invalidErr("ts", "must be RFC 3339 with an explicit offset")
 	}
 	if row == nil {
-		if err := admitNewLiveJob(tx); err != nil {
-			return false, err
+		// A cleanup of a job never seen before is tombstoned below in
+		// this same transaction, so it takes no live slot.
+		if ev.Tipo != jobapi.TypeCleanup {
+			if err := admitNewLiveJob(tx); err != nil {
+				return false, err
+			}
 		}
 		if _, err := tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, projeto, fonte_push, obsoleto)
 			VALUES(?,?,?, ?,?, 1, 0)`,
@@ -524,9 +536,14 @@ func reduceRefs(refs map[string]any) *string {
 	return &v
 }
 
-// keptRefValue: a JSON string of at most 200 bytes, a JSON number or a
-// boolean is kept; anything else (object, array, null, longer string) is
-// dropped.
+// maxTSLen bounds a record or event timestamp: an RFC 3339 time with
+// nanoseconds and a numeric offset is 35 bytes, and the text is stored as
+// received.
+const maxTSLen = 35
+
+// MaxRefValueBytes bounds a kept ref string. keptRefValue: a JSON string
+// of at most 200 bytes, a JSON number or a boolean is kept; anything else
+// (object, array, null, longer string) is dropped.
 const MaxRefValueBytes = 200
 
 func keptRefValue(v any) bool {
@@ -601,6 +618,9 @@ func ingestDispatch(tx *sql.Tx, rec outbox.Record, ts time.Time) (bool, error) {
 		return true, nil
 	}
 	if row == nil {
+		if err := admitNewLiveJob(tx); err != nil {
+			return false, err
+		}
 		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, projeto, fonte_push, obsoleto, ultima_atividade, ultima_atividade_unix)
 			VALUES(?,?, ?, ?, ?, 1, 0, ?, ?)`,
 			rec.Maquina, jobID, OrigemJob, jobID, nullStr(rec.Projeto), ts.Format(outbox.TSLayout), ts.Unix())
@@ -639,8 +659,9 @@ func ingestSession(tx *sql.Tx, rec outbox.Record, sd sessionDados, ts, now time.
 	if err != nil {
 		return false, err
 	}
-	if row != nil && row.sessaoTs != nil && *row.sessaoTs > ts.Unix() {
-		// An older record after a newer one: ignored.
+	if row != nil && row.sessaoTs != nil && (*row.sessaoTs > ts.Unix() || (*row.sessaoTs == ts.Unix() && row.sessaoSeq >= rec.Seq)) {
+		// An older record after a newer one, or a replay: ignored. The
+		// outbox seq of the machine orders records of the same second.
 		return false, nil
 	}
 	if row == nil {
@@ -662,23 +683,42 @@ func ingestSession(tx *sql.Tx, rec outbox.Record, sd sessionDados, ts, now time.
 				return false, err
 			}
 		}
-		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, card, branch, pr, projeto, fonte_push, sessao_ts_unix, encerrado, encerrado_unix, ultima_atividade, ultima_atividade_unix)
-			VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?)`,
-			rec.Maquina, chave, origem, jobID, sd.Card, sd.Branch, sd.PR, nullStr(projeto), ts.Unix(), encerrado, encerradoUnix, ts.Format(outbox.TSLayout), ts.Unix())
+		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, card, branch, pr, projeto, fonte_push, sessao_ts_unix, sessao_seq, encerrado, encerrado_unix, ultima_atividade, ultima_atividade_unix)
+			VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)`,
+			rec.Maquina, chave, origem, jobID, sd.Card, sd.Branch, sd.PR, nullStr(projeto), ts.Unix(), rec.Seq, encerrado, encerradoUnix, ts.Format(outbox.TSLayout), ts.Unix())
 		return true, err
+	}
+	if row.encerrado == 1 {
+		if row.origem != OrigemSessao || sd.Acao == "end" {
+			// A closed job, or a closed session told again it ended,
+			// stays closed; the ordering facts still move forward.
+			_, err = tx.Exec(`UPDATE jobs SET sessao_ts_unix = ?, sessao_seq = ? WHERE maquina = ? AND chave = ?`,
+				ts.Unix(), rec.Seq, rec.Maquina, chave)
+			return true, err
+		}
+		// A newer start or update opens a new session on the same
+		// project and branch; nothing of the closed one carries over.
+		if err := admitNewLiveJob(tx); err != nil {
+			return false, err
+		}
+		if _, err = tx.Exec(`UPDATE jobs SET encerrado = 0, encerrado_unix = NULL, card = NULL, pr = NULL WHERE maquina = ? AND chave = ?`,
+			rec.Maquina, chave); err != nil {
+			return false, err
+		}
 	}
 	// A validated non-empty field replaces the stored value; an omitted
 	// field keeps it.
 	proj := nullStr(projeto)
 	if _, err = tx.Exec(`UPDATE jobs SET
 		sessao_ts_unix = ?,
+		sessao_seq = ?,
 		fonte_push = 1,
 		card = CASE WHEN ? IS NULL THEN card ELSE ? END,
 		branch = CASE WHEN ? IS NULL THEN branch ELSE ? END,
 		pr = CASE WHEN ? IS NULL THEN pr ELSE ? END,
 		projeto = CASE WHEN ? IS NULL THEN projeto ELSE ? END
 		WHERE maquina = ? AND chave = ?`,
-		ts.Unix(), sd.Card, sd.Card, sd.Branch, sd.Branch, sd.PR, sd.PR, proj, proj, rec.Maquina, chave); err != nil {
+		ts.Unix(), rec.Seq, sd.Card, sd.Card, sd.Branch, sd.Branch, sd.PR, sd.PR, proj, proj, rec.Maquina, chave); err != nil {
 		return false, err
 	}
 	if err := maxUltima(tx, rec.Maquina, chave, ts); err != nil {

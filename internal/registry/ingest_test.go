@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -165,6 +166,10 @@ func TestIngestInvalid(t *testing.T) {
 		{name: "ts without offset", mut: func(r *outbox.Record) { r.TS = "2026-10-10T12:00:00" }},
 		{name: "empty key", mut: func(r *outbox.Record) { r.IdempotencyKey = "" }},
 		{name: "key too long", mut: func(r *outbox.Record) { r.IdempotencyKey = strings.Repeat("k", 201) }},
+		{name: "ts too long", mut: func(r *outbox.Record) { r.TS = "2026-10-10T12:00:00." + strings.Repeat("0", 100) + "-03:00" }},
+		{name: "job_event event ts too long", mut: func(r *outbox.Record) {
+			r.Dados = json.RawMessage(`{"seq":1,"ts":"2026-10-10T11:30:00.` + strings.Repeat("0", 100) + `-03:00","tipo":"accepted","resumo":"x"}`)
+		}},
 		{name: "bad projeto", mut: func(r *outbox.Record) { r.Projeto = "acme" }},
 		{name: "bad job id", mut: func(r *outbox.Record) { r.JobID = ptr(strings.Repeat("j", 65)) }},
 		{name: "dados not an object", mut: func(r *outbox.Record) { r.Dados = json.RawMessage(`[1,2]`) }},
@@ -1117,5 +1122,81 @@ func TestIngestEventRefValueBounds(t *testing.T) {
 	}
 	if v, _ := m["sha"].(string); len(v) != 200 {
 		t.Errorf("sha = %d bytes, want the 200-byte boundary kept", len(v))
+	}
+}
+
+// sessaoSeqRec is sessaoRec with the record's outbox seq.
+func sessaoSeqRec(seq int64, ts, acao, card, branch string) outbox.Record {
+	r := sessaoRec(ts, acao, card, branch, "", "")
+	r.Seq = seq
+	r.IdempotencyKey = fmt.Sprintf("node-a:%d", seq)
+	return r
+}
+
+// TestIngestSessionSameSecond: records of the same second are ordered by
+// the machine's outbox seq, so an older or replayed record of that second
+// changes nothing and a newer one applies (F5).
+func TestIngestSessionSameSecond(t *testing.T) {
+	s := openStore(t)
+	const chave = "sessao:example-org/example-repo#feat/x"
+	const ts = "2026-10-10T11:00:00-03:00"
+	if !mustIngest(t, s, sessaoSeqRec(5, ts, "start", "card-5", "feat/x")) {
+		t.Fatal("start seq 5: applied = false")
+	}
+	if mustIngest(t, s, sessaoSeqRec(4, ts, "update", "card-4", "feat/x")) {
+		t.Error("older record of the same second: applied = true, want false")
+	}
+	if mustIngest(t, s, sessaoSeqRec(5, ts, "update", "card-4", "feat/x")) {
+		t.Error("replay of the same second and seq: applied = true, want false")
+	}
+	if f := jobFact(t, s, "node-a", chave); f.card == nil || *f.card != "CARD-5" {
+		t.Fatalf("after the same-second replays: row = %+v, want card CARD-5", f)
+	}
+	if !mustIngest(t, s, sessaoSeqRec(6, ts, "end", "", "feat/x")) {
+		t.Fatal("newer end of the same second: applied = false")
+	}
+	if f := jobFact(t, s, "node-a", chave); f.encerrado != 1 {
+		t.Fatalf("after the end: row = %+v, want tombstoned", f)
+	}
+	if mustIngest(t, s, sessaoSeqRec(5, ts, "start", "card-5", "feat/x")) {
+		t.Error("replayed start after the end: applied = true, want false")
+	}
+	if f := jobFact(t, s, "node-a", chave); f.encerrado != 1 {
+		t.Errorf("after the replayed start: row = %+v, want still tombstoned", f)
+	}
+}
+
+// TestIngestSessionReopen: a start newer than the end of a session on the
+// same project and branch opens a new live session that carries nothing
+// of the closed one; another end closes it again.
+func TestIngestSessionReopen(t *testing.T) {
+	s := openStore(t)
+	const chave = "sessao:example-org/example-repo#feat/x"
+	mustIngest(t, s, sessaoSeqRec(1, "2026-10-10T10:00:00-03:00", "start", "card-1", "feat/x"))
+	mustIngest(t, s, sessaoSeqRec(2, "2026-10-10T10:30:00-03:00", "end", "", "feat/x"))
+	if !mustIngest(t, s, sessaoSeqRec(3, "2026-10-10T11:00:00-03:00", "start", "", "feat/x")) {
+		t.Fatal("newer start after the end: applied = false")
+	}
+	f := jobFact(t, s, "node-a", chave)
+	if f.encerrado != 0 || f.card != nil {
+		t.Fatalf("after the new start: row = %+v, want live without the old card", f)
+	}
+	res, err := s.Check(CheckRequest{Agente: "dja", Projeto: "example-org/example-repo", Branch: "feat/x"})
+	if err != nil {
+		t.Fatalf("Check branch: %v", err)
+	}
+	if res.Status != CheckDuplicate {
+		t.Errorf("check for the reopened branch = %q, want duplicate", res.Status)
+	}
+	res, err = s.Check(CheckRequest{Agente: "dja", Card: "card-1"})
+	if err != nil {
+		t.Fatalf("Check card: %v", err)
+	}
+	if res.Status != CheckOK {
+		t.Errorf("check for the closed session's card = %q, want ok", res.Status)
+	}
+	mustIngest(t, s, sessaoSeqRec(4, "2026-10-10T11:30:00-03:00", "end", "", "feat/x"))
+	if f := jobFact(t, s, "node-a", chave); f.encerrado != 1 {
+		t.Errorf("after the second end: row = %+v, want tombstoned", f)
 	}
 }

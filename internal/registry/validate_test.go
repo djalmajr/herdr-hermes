@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -431,6 +432,32 @@ func TestAdmissionCaps(t *testing.T) {
 		}))
 		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "jobs limit reached") {
 			t.Fatalf("1001th live job: err = %v, want the jobs limit refusal", err)
+		}
+		// Mutation captured: a dispatch or amend that inserts without the
+		// admission check passes the 1001th live job.
+		for _, tipo := range []string{outbox.TipoDispatch, outbox.TipoAmend} {
+			_, err := s.Ingest(recordBase(func(r *outbox.Record) {
+				r.Tipo = tipo
+				r.JobID = ptr("j-" + tipo)
+				r.IdempotencyKey = "node-a:77"
+				r.Dados = json.RawMessage(`{}`)
+			}))
+			if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "jobs limit reached") {
+				t.Fatalf("%s of a 1001th live job: err = %v, want the jobs limit refusal", tipo, err)
+			}
+		}
+		// Mutation captured: admitting a cleanup of an unseen job like a
+		// live one refuses it at the limit, although it takes no slot.
+		if !mustIngest(t, s, recordBase(func(r *outbox.Record) {
+			r.JobID = ptr("j-gone")
+			r.IdempotencyKey = "j-gone:5"
+			r.Dados = eventData(5, jobapi.TypeCleanup, "x", nil)
+		})) {
+			t.Fatal("cleanup of an unseen job at the limit: applied = false")
+		}
+		inv, err := s.Inventory(Filter{})
+		if err != nil || len(inv.Jobs) != MaxJobs {
+			t.Fatalf("inventory = %d jobs (%v), want %d live", len(inv.Jobs), err, MaxJobs)
 		}
 	})
 	t.Run("claims", func(t *testing.T) {
