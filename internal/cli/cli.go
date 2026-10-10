@@ -52,6 +52,8 @@ var commands = []command{
 	{"plugin", false, true, cmdPlugin},
 	// slice 5: notify
 	{"notify", false, true, cmdNotify},
+	// DJA-195: route
+	{"route", false, true, cmdRoute},
 }
 
 // Run executes args[0] as a command and returns its exit code. An unknown

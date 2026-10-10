@@ -167,6 +167,10 @@ State plainly what is not derived: execution start is never inferred from `accep
 
 A `<ref>` is a `herdr-soho send` reference `<machine>/<ws>:<pane>` or a local agent name; it is validated, never guessed or derived from an event. `list` and `status` work under `HERDR_HERMES_NOWRITE=1`; every other `notify` subcommand is refused under NOWRITE with exit 2, like the other writing commands.
 
+## Routing
+
+`herdr-hermes route [--machine <label>]` is the dispatcher-side machine choice: it runs on the host the dispatcher uses to reach the fleet, probes the configured fleet read-only, picks one machine and prints it as one JSON line. The choice is advisory — `route` never starts, moves or replays a job — and the dispatcher then runs `job start` on the chosen machine through its own remote execution channel, never re-sending the dispatch to another machine after a transport loss or timeout. It is read-only (it works under `HERDR_HERMES_NOWRITE=1` and writes nothing), exits 2 for bad usage, an invalid configuration, `route_machines` not configured, or a requested machine that is not configured, and 4 when no machine is available. The configuration keys, the probe, the selection and tie-break, the outputs and exit codes, and the safety rules are in [`routing.md`](routing.md).
+
 ## Exit codes
 
 | code | meaning |
@@ -174,7 +178,7 @@ A `<ref>` is a `herdr-soho send` reference `<machine>/<ws>:<pane>` or a local ag
 | 0 | success (forwarded commands: whatever `herdr-soho` returned) |
 | 2 | bad usage, input limit exceeded, unknown config key, internal job subcommand refused, a writing command under `HERDR_HERMES_NOWRITE=1`, no user config directory (`no_config_dir`), or a `wake` event that could not be made durable |
 | 3 | unknown job id in `herdr-hermes` bookkeeping (`sync --job`) |
-| 4 | `herdr-soho` not found, not runnable, or killed by the forwarding deadline |
+| 4 | `herdr-soho` not found, not runnable, or killed by the forwarding deadline, or no eligible machine available (`route`) |
 | 40 | no API key configured (push required) |
 | 41 | API key rejected by the dispatcher (401/403) |
 | 42 | dispatcher unreachable or retries exhausted; records stay pending |
@@ -184,7 +188,7 @@ Forwarded `job` subcommands return the `herdr-soho` exit code unchanged; codes 4
 
 ## NOWRITE
 
-`HERDR_HERMES_NOWRITE=1` makes the CLI read-only. The read-only commands work normally and write nothing: `outbox`, `doctor`, `auth status`, `config get` and `config list`, `capabilities`, `version`, `help`, `plugin bridge status`, `notify list` and `notify status`, and the read-only `job` subcommands (`status`, `wait`, `events`, `collect`, `list`, which also skip bookkeeping). Every writing command (`job start|amend|send|ack|cancel|close`, `wake`, `sync`, `push`, `session`, `decision`, `auth login`, `auth logout`, `config set`, `plugin bridge sync`, `notify register`, `notify unregister`, `notify deliver`, `notify ingest`, `notify raise`, `notify ack` and `notify retry`) refuses with exit 2 and `{"status":"nowrite","motivo":"HERDR_HERMES_NOWRITE=1"}` before any side effect. Exception: the plugin entrypoints `plugin startup` and `plugin event` exit 0 under NOWRITE, print `{"status":"skipped","motivo":"HERDR_HERMES_NOWRITE=1"}` and write nothing.
+`HERDR_HERMES_NOWRITE=1` makes the CLI read-only. The read-only commands work normally and write nothing: `outbox`, `route`, `doctor`, `auth status`, `config get` and `config list`, `capabilities`, `version`, `help`, `plugin bridge status`, `notify list` and `notify status`, and the read-only `job` subcommands (`status`, `wait`, `events`, `collect`, `list`, which also skip bookkeeping). Every writing command (`job start|amend|send|ack|cancel|close`, `wake`, `sync`, `push`, `session`, `decision`, `auth login`, `auth logout`, `config set`, `plugin bridge sync`, `notify register`, `notify unregister`, `notify deliver`, `notify ingest`, `notify raise`, `notify ack` and `notify retry`) refuses with exit 2 and `{"status":"nowrite","motivo":"HERDR_HERMES_NOWRITE=1"}` before any side effect. Exception: the plugin entrypoints `plugin startup` and `plugin event` exit 0 under NOWRITE, print `{"status":"skipped","motivo":"HERDR_HERMES_NOWRITE=1"}` and write nothing.
 
 ## Key security
 

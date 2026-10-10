@@ -11,6 +11,7 @@ commands:
   job <sub> [args]                  forward a dispatcher-facing job subcommand to herdr-soho
                                     (start, status, wait, events, collect, amend, send, ack,
                                     cancel, close, list)
+  route [--machine <label>]         choose the machine for a new job (dispatcher side, read-only)
   wake                              read one job event on stdin, record it in the outbox and
                                     attempt one push
   sync [--job <id>] [--push-only]   sync tracked job events and push pending records
@@ -61,7 +62,7 @@ exit codes:
       subcommand refused
   3   unknown job id in herdr-hermes bookkeeping (sync --job) and unknown
       notification id (notify status --id, notify ack, notify retry)
-  4   herdr-soho not found or not runnable
+  4   herdr-soho not found or not runnable; no eligible machine available (route)
   40  no API key configured (push required)
   41  API key rejected by the dispatcher (401/403)
   42  dispatcher unreachable or retries exhausted; records stay pending
