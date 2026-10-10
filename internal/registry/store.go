@@ -119,26 +119,16 @@ func Open(path string, opts Options) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("%w: user_version %d", ErrSchema, version)
 	}
-	if version < SchemaVersion {
-		if err := migrate(db); err != nil {
-			db.Close()
-			return nil, err
-		}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return &Store{db: db, now: now, eventsPerJob: eventsPerJob, onlineWindow: onlineWindow}, nil
 }
 
 // migrations[v] brings a version v schema to version v+1.
 var migrations = map[int]func(*sql.Tx) error{
-	1: func(tx *sql.Tx) error {
-		if err := addColumn(tx, "jobs", "sessao_seq", "INTEGER"); err != nil {
-			return err
-		}
-		// The outbox seq of a session stored before is unknown: no
-		// record of its second may replace it, only a later one.
-		_, err := tx.Exec(`UPDATE jobs SET sessao_seq = ? WHERE sessao_ts_unix IS NOT NULL AND sessao_seq IS NULL`, int64(math.MaxInt64))
-		return err
-	},
+	1: func(tx *sql.Tx) error { return addColumn(tx, "jobs", "sessao_seq", "INTEGER") },
 }
 
 // addColumn adds a column unless the table already has it: one schema 1
@@ -156,9 +146,10 @@ func addColumn(tx *sql.Tx, table, column, typ string) error {
 }
 
 // migrate creates the whole schema on a fresh database, or upgrades an
-// older one step by step, and bumps the version, in one immediate
-// transaction. Another process may have done it between the caller's
-// read and the BEGIN, so the version is read again under the write lock.
+// older one step by step and bumps the version, then repairs the session
+// order, in one immediate transaction on every open. Another process may
+// have done it between the caller's read and the BEGIN, so the version is
+// read again under the write lock.
 func migrate(db *sql.DB) error {
 	txn, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
@@ -173,7 +164,6 @@ func migrate(db *sql.DB) error {
 	case version > SchemaVersion:
 		return fmt.Errorf("%w: user_version %d", ErrSchema, version)
 	case version == SchemaVersion:
-		return nil
 	case version == 0:
 		if _, err := txn.Exec(schemaDDL); err != nil {
 			return err
@@ -185,7 +175,16 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
-	if _, err := txn.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
+	if version != SchemaVersion {
+		if _, err := txn.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
+			return err
+		}
+	}
+	// Every write stores a session's outbox seq with its second, so a
+	// session without one was stored before the seq was kept (schema 1,
+	// or an early schema 2 upgrade): its seq is unknown, and no record of
+	// its second may replace it, only a later one.
+	if _, err := txn.Exec(`UPDATE jobs SET sessao_seq = ? WHERE sessao_ts_unix IS NOT NULL AND sessao_seq IS NULL`, int64(math.MaxInt64)); err != nil {
 		return err
 	}
 	return txn.Commit()

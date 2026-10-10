@@ -130,11 +130,14 @@ func TestOpenMigratesV1(t *testing.T) {
 	if v1DDL == schemaDDL {
 		t.Fatal("schemaDDL no longer holds the schema 2 column; update the v1 fixture")
 	}
-	t.Run("without sessao_seq", func(t *testing.T) { testMigrateV1(t, v1DDL) })
-	t.Run("with sessao_seq", func(t *testing.T) { testMigrateV1(t, schemaDDL) })
+	t.Run("without sessao_seq", func(t *testing.T) { testMigrateV1(t, v1DDL, 1) })
+	t.Run("with sessao_seq", func(t *testing.T) { testMigrateV1(t, schemaDDL, 1) })
+	// An early schema 2 upgrade added the column without the order
+	// repair; the repair runs on every open.
+	t.Run("schema 2 without the order repair", func(t *testing.T) { testMigrateV1(t, schemaDDL, 2) })
 }
 
-func testMigrateV1(t *testing.T, v1DDL string) {
+func testMigrateV1(t *testing.T, v1DDL string, oldVersion int) {
 	path := pathFor(t)
 	db, err := sql.Open("sqlite", dsnFor(path))
 	if err != nil {
@@ -147,7 +150,7 @@ func testMigrateV1(t *testing.T, v1DDL string) {
 		VALUES('node-a', 'sessao:example-org/example-repo#feat/x', 'sessao', 'example-org/example-repo', 'feat/x', 1, ?, 0, '2026-10-10T11:00:00-03:00', ?)`, fixedNow.Unix()-3600, fixedNow.Unix()-3600); err != nil {
 		t.Fatalf("v1 row: %v", err)
 	}
-	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, oldVersion)); err != nil {
 		t.Fatalf("v1 version: %v", err)
 	}
 	db.Close()
