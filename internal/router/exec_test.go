@@ -1,6 +1,7 @@
 package router_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -31,7 +32,7 @@ func TestExecPassThrough(t *testing.T) {
 	)
 	exec := router.NewExec(exe, []string{"PATH=/bin"})
 
-	out, code, err := exec(context.Background(), []string{"agent", "list"})
+	out, _, code, err := exec(context.Background(), []string{"agent", "list"})
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestExecPassThrough(t *testing.T) {
 		t.Errorf("got (%q, %d), want (line1/line2, 0)", out, code)
 	}
 
-	out, code, err = exec(context.Background(), []string{"machine", "list", "--json"})
+	out, _, code, err = exec(context.Background(), []string{"machine", "list", "--json"})
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
@@ -60,7 +61,7 @@ func TestExecArgvLogged(t *testing.T) {
 		{"--machine", "win.a_1-2", "agent", "list"},
 		{"machine", "list", "--json"},
 	} {
-		if _, _, err := exec(context.Background(), argv); err != nil {
+		if _, _, _, err := exec(context.Background(), argv); err != nil {
 			t.Fatalf("exec %v: %v", argv, err)
 		}
 	}
@@ -85,7 +86,7 @@ func TestExecChildEnvExact(t *testing.T) {
 	exe, dir := installFake(t, fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 0})
 	environ := []string{"PATH=" + os.Getenv("PATH"), "HERDR_HERMES_NOWRITE=1"}
 	exec := router.NewExec(exe, environ)
-	if _, _, err := exec(context.Background(), []string{"agent", "list"}); err != nil {
+	if _, _, _, err := exec(context.Background(), []string{"agent", "list"}); err != nil {
 		t.Fatalf("exec: %v", err)
 	}
 	calls, err := fakesoho.ReadCalls(dir)
@@ -117,7 +118,7 @@ func TestExecChildEnvExact(t *testing.T) {
 func TestExecStdinEmpty(t *testing.T) {
 	exe, dir := installFake(t, fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 0})
 	exec := router.NewExec(exe, []string{"PATH=/bin"})
-	if _, _, err := exec(context.Background(), []string{"agent", "list"}); err != nil {
+	if _, _, _, err := exec(context.Background(), []string{"agent", "list"}); err != nil {
 		t.Fatalf("exec: %v", err)
 	}
 	calls, err := fakesoho.ReadCalls(dir)
@@ -145,7 +146,7 @@ func TestExecDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, _, err := exec(ctx, []string{"agent", "list"})
+	_, _, _, err := exec(ctx, []string{"agent", "list"})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("exec = nil error, want an error")
@@ -165,7 +166,7 @@ func TestExecMissingBinary(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "no-such-herdr")
 	exec := router.NewExec(bin, []string{"PATH=/bin"})
-	_, _, err := exec(context.Background(), []string{"agent", "list"})
+	_, _, _, err := exec(context.Background(), []string{"agent", "list"})
 	if err == nil {
 		t.Fatalf("exec = nil error, want an error")
 	}
@@ -183,7 +184,7 @@ func TestExecOversizeCapped(t *testing.T) {
 		Code:        0,
 	})
 	exec := router.NewExec(exe, []string{"PATH=/bin"})
-	out, code, err := exec(context.Background(), []string{"agent", "list"})
+	out, _, code, err := exec(context.Background(), []string{"agent", "list"})
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
@@ -192,5 +193,94 @@ func TestExecOversizeCapped(t *testing.T) {
 	}
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
+	}
+}
+
+// TestExecStderrReturned: the child's stderr comes back unchanged (the
+// Rule's Stderr string and StderrBytes fields), with the stdout and the
+// exit code untouched.
+func TestExecStderrReturned(t *testing.T) {
+	exe, _ := installFake(t,
+		fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 2, Stdout: "out\n", Stderr: "boom: connection refused\n"},
+	)
+	exec := router.NewExec(exe, []string{"PATH=/bin"})
+	out, stderr, code, err := exec(context.Background(), []string{"agent", "list"})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if string(out) != "out\n" || code != 2 {
+		t.Errorf("got (out=%q code=%d), want (out=out code=2)", out, code)
+	}
+	if string(stderr) != "boom: connection refused\n" {
+		t.Errorf("stderr = %q, want the child's stderr", stderr)
+	}
+
+	exe2, _ := installFake(t, fakesoho.Rule{Argv: []string{"machine", "list", "--json"}, Code: 0, StderrBytes: []byte("raw\x1b[31merr")})
+	exec2 := router.NewExec(exe2, []string{"PATH=/bin"})
+	_, stderr2, code2, err2 := exec2(context.Background(), []string{"machine", "list", "--json"})
+	if err2 != nil {
+		t.Fatalf("exec: %v", err2)
+	}
+	if code2 != 0 || !bytes.Equal(stderr2, []byte("raw\x1b[31merr")) {
+		t.Errorf("StderrBytes rule: got (%q, %d), want the raw bytes and 0", stderr2, code2)
+	}
+}
+
+// TestExecStderrCapped: a 64 KiB stderr is kept at exactly MaxProbeDiag
+// bytes and the run itself succeeds with the stdout behavior unchanged.
+func TestExecStderrCapped(t *testing.T) {
+	exe, _ := installFake(t, fakesoho.Rule{
+		Argv:        []string{"agent", "list"},
+		StderrBytes: make([]byte, 64<<10),
+		Stdout:      "ok\n",
+		Code:        3,
+	})
+	exec := router.NewExec(exe, []string{"PATH=/bin"})
+	out, stderr, code, err := exec(context.Background(), []string{"agent", "list"})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if len(stderr) != router.MaxProbeDiag {
+		t.Errorf("stderr length = %d, want %d", len(stderr), router.MaxProbeDiag)
+	}
+	if string(out) != "ok\n" || code != 3 {
+		t.Errorf("got (out=%q code=%d), want (ok, 3)", out, code)
+	}
+}
+
+// TestExecStderrCutJSONAtCap: a recognized herdr JSON error that starts
+// before the MaxProbeDiag cap and ends after it is cut by the real capture;
+// the cut line is not decoded, so it yields no cause and no part of it is
+// reported, while the same line wholly inside the cap is recognized.
+func TestExecStderrCutJSONAtCap(t *testing.T) {
+	line := `{"id":"cli:agent:list","error":{"code":"server_not_running","message":"no herdr server is running at /tmp/hh-test/nx.sock"}}` + "\n"
+	cut := strings.Repeat("x", router.MaxProbeDiag-40) + "\n" + line
+	whole := strings.Repeat("x", router.MaxProbeDiag-len(line)-1) + "\n" + line
+	exe, _ := installFake(t,
+		fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 1, Stderr: cut},
+		fakesoho.Rule{Argv: []string{"--machine", "win-a", "agent", "list"}, Code: 1, Stderr: whole},
+	)
+	exec := router.NewExec(exe, []string{"PATH=/bin"})
+	for _, tc := range []struct {
+		argv []string
+		want string
+	}{
+		{[]string{"agent", "list"}, ""},
+		{[]string{"--machine", "win-a", "agent", "list"}, router.CauseServerNotRunning},
+	} {
+		stdout, stderr, code, err := exec(context.Background(), tc.argv)
+		if err != nil || code != 1 {
+			t.Fatalf("%v: code %d err %v, want 1 nil", tc.argv, code, err)
+		}
+		if len(stderr) > router.MaxProbeDiag {
+			t.Errorf("%v: stderr %d bytes, want at most %d", tc.argv, len(stderr), router.MaxProbeDiag)
+		}
+		if got := router.ClassifyFailure(stdout, stderr); got != tc.want {
+			t.Errorf("%v: cause %q, want %q", tc.argv, got, tc.want)
+		}
+		c := router.Candidate{Machine: "local", State: router.StateUnavailable, Reason: router.ReasonProbeFailed, Cause: router.ClassifyFailure(stdout, stderr), ExitCode: code}
+		if d := c.Diagnostic(); strings.Contains(d, "/tmp/hh-test") || strings.Contains(d, "xxxx") {
+			t.Errorf("%v: diagnostic leaks child output: %q", tc.argv, d)
+		}
 	}
 }

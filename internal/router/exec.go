@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/djalmajr/herdr-hermes/internal/soho"
@@ -26,9 +25,10 @@ const drainBound = 10 * time.Second
 // NewExec returns an Exec that runs bin (the herdr executable) as an
 // argv subprocess: never a shell, exactly environ as the child
 // environment (nothing added, nothing removed), an empty stdin and a
-// discarded stderr. Stdout is kept at most MaxProbeOutput+1 bytes; a
-// longer output is discarded beyond the cap while every write still
-// reports the full length written, so the reader keeps going.
+// stderr kept at most MaxProbeDiag bytes for classification only. Stdout
+// is kept at most MaxProbeOutput+1 bytes; a longer output is discarded
+// beyond the cap while every write still reports the full length written,
+// so the reader keeps going.
 //
 // The bound handed to the runner is the time left until the context's
 // deadline: defaultProbeBound when the context has none, at least
@@ -40,7 +40,7 @@ const drainBound = 10 * time.Second
 // non-zero. Every call builds a fresh runner, which is not safe for
 // concurrent use.
 func NewExec(bin string, environ []string) Exec {
-	return func(ctx context.Context, argv []string) ([]byte, int, error) {
+	return func(ctx context.Context, argv []string) ([]byte, []byte, int, error) {
 		bound := defaultProbeBound
 		if deadline, ok := ctx.Deadline(); ok {
 			bound = time.Until(deadline)
@@ -50,8 +50,10 @@ func NewExec(bin string, environ []string) Exec {
 		}
 		var stdout cappedWriter
 		stdout.limit = MaxProbeOutput + 1
+		var stderr cappedWriter
+		stderr.limit = MaxProbeDiag
 		runner := soho.Runner{Bin: bin, Environ: environ, Now: time.Now}
-		code, err := runner.Run(ctx, argv, bytes.NewReader(nil), &stdout, io.Discard, bound)
+		code, err := runner.Run(ctx, argv, bytes.NewReader(nil), &stdout, &stderr, bound)
 		if waitErr := awaitDrain(runner); err == nil {
 			err = waitErr
 		}
@@ -59,11 +61,11 @@ func NewExec(bin string, environ []string) Exec {
 		var deadlineErr *soho.ErrDeadline
 		switch {
 		case err != nil && errors.As(err, &unavailable):
-			return nil, -1, fmt.Errorf("%w: %s", ErrHerdrUnavailable, unavailable.Error())
+			return nil, nil, -1, fmt.Errorf("%w: %s", ErrHerdrUnavailable, unavailable.Error())
 		case err != nil && errors.As(err, &deadlineErr):
-			return nil, -1, fmt.Errorf("%w: %s", ErrProbeTimeout, deadlineErr.Error())
+			return nil, nil, -1, fmt.Errorf("%w: %s", ErrProbeTimeout, deadlineErr.Error())
 		}
-		return stdout.data, code, err
+		return stdout.data, stderr.data, code, err
 	}
 }
 

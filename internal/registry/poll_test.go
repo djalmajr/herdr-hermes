@@ -31,7 +31,7 @@ func newFakeExec(fn func(argv []string) ([]byte, int, error)) *fakeExec {
 }
 
 // Run implements router.Exec.
-func (f *fakeExec) Run(ctx context.Context, argv []string) ([]byte, int, error) {
+func (f *fakeExec) Run(ctx context.Context, argv []string) ([]byte, []byte, int, error) {
 	dl, ok := ctx.Deadline()
 	var left time.Duration
 	if ok {
@@ -43,7 +43,8 @@ func (f *fakeExec) Run(ctx context.Context, argv []string) ([]byte, int, error) 
 	f.calls = append(f.calls, append([]string(nil), argv...))
 	f.deadlines = append(f.deadlines, left)
 	f.mu.Unlock()
-	return f.fn(argv)
+	stdout, code, err := f.fn(argv)
+	return stdout, nil, code, err
 }
 
 func (f *fakeExec) argvs() [][]string {

@@ -348,6 +348,115 @@ func TestConfigListInvalidRouterValue(t *testing.T) {
 	}
 }
 
+// TestConfigSetRouteUnmatchedWarning: a successful set of route_disabled or
+// route_machines prints one warning line on stderr (after the stdout line,
+// exit 0) when the stored route_disabled labels are not in route_machines;
+// no other command or key warns, and a refused set prints no warning.
+func TestConfigSetRouteUnmatchedWarning(t *testing.T) {
+	warn := "herdr-hermes: config: warning: route_disabled labels not in route_machines exclude nothing: "
+
+	t.Run("empty fleet staging", func(t *testing.T) {
+		dir := t.TempDir()
+		stdout, stderr, exit := runCLI(t, dir, false, "config", "set", "route_disabled", "ghost")
+		if exit != 0 || stdout != "{\"key\":\"route_disabled\",\"value\":\"ghost\"}\n" || stderr != "" {
+			t.Fatalf("staged exclusion: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+		stdout, stderr, exit = runCLI(t, dir, false, "config", "set", "route_machines", "local,win-a")
+		if exit != 0 || stdout != "{\"key\":\"route_machines\",\"value\":\"local,win-a\"}\n" {
+			t.Fatalf("fleet set: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+		if stderr != warn+"ghost\n" {
+			t.Errorf("fleet set stderr = %q, want the warning naming ghost", stderr)
+		}
+	})
+
+	t.Run("matching", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, _, exit := runCLI(t, dir, false, "config", "set", "route_machines", "local,win-a"); exit != 0 {
+			t.Fatalf("setup fleet: exit %d", exit)
+		}
+		stdout, stderr, exit := runCLI(t, dir, false, "config", "set", "route_disabled", "win-a")
+		if exit != 0 || stdout != "{\"key\":\"route_disabled\",\"value\":\"win-a\"}\n" || stderr != "" {
+			t.Fatalf("matching exclusion: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+	})
+
+	t.Run("unmatched", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, _, exit := runCLI(t, dir, false, "config", "set", "route_machines", "local,win-a"); exit != 0 {
+			t.Fatalf("setup fleet: exit %d", exit)
+		}
+		stdout, stderr, exit := runCLI(t, dir, false, "config", "set", "route_disabled", "ghost-box")
+		if exit != 0 || stdout != "{\"key\":\"route_disabled\",\"value\":\"ghost-box\"}\n" {
+			t.Fatalf("unmatched set: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+		if stderr != warn+"ghost-box\n" {
+			t.Errorf("unmatched set stderr = %q, want the warning naming ghost-box", stderr)
+		}
+		stdout, stderr, exit = runCLI(t, dir, false, "config", "set", "route_disabled", "")
+		if exit != 0 || stdout != "{\"key\":\"route_disabled\",\"value\":\"\"}\n" || stderr != "" {
+			t.Fatalf("empty exclusions: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+	})
+
+	t.Run("changed fleet", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, _, exit := runCLI(t, dir, false, "config", "set", "route_machines", "local,win-a"); exit != 0 {
+			t.Fatalf("setup fleet: exit %d", exit)
+		}
+		if _, stderr, exit := runCLI(t, dir, false, "config", "set", "route_disabled", "win-a"); exit != 0 || stderr != "" {
+			t.Fatalf("exclusion before the fleet change: exit %d, stderr %q", exit, stderr)
+		}
+		stdout, stderr, exit := runCLI(t, dir, false, "config", "set", "route_machines", "local")
+		if exit != 0 || stdout != "{\"key\":\"route_machines\",\"value\":\"local\"}\n" {
+			t.Fatalf("shrunken fleet: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+		if stderr != warn+"win-a\n" {
+			t.Errorf("shrunken fleet stderr = %q, want the warning naming win-a", stderr)
+		}
+		stdout, stderr, exit = runCLI(t, dir, false, "config", "set", "route_machines", "local,win-a")
+		if exit != 0 || stdout != "{\"key\":\"route_machines\",\"value\":\"local,win-a\"}\n" || stderr != "" {
+			t.Fatalf("restored fleet: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+	})
+
+	t.Run("other keys never warn", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, _, exit := runCLI(t, dir, false, "config", "set", "route_machines", "local,win-a"); exit != 0 {
+			t.Fatalf("setup fleet: exit %d", exit)
+		}
+		if _, _, exit := runCLI(t, dir, false, "config", "set", "route_disabled", "ghost"); exit != 0 {
+			t.Fatalf("setup exclusion: exit %d", exit)
+		}
+		stdout, stderr, exit := runCLI(t, dir, false, "config", "set", "route_probe_timeout_s", "5")
+		if exit != 0 || stdout != "{\"key\":\"route_probe_timeout_s\",\"value\":\"5\"}\n" || stderr != "" {
+			t.Fatalf("timeout set: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+		stdout, stderr, exit = runCLI(t, dir, false, "config", "get", "route_disabled")
+		if exit != 0 || stdout != "{\"key\":\"route_disabled\",\"value\":\"ghost\"}\n" || stderr != "" {
+			t.Fatalf("get: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+		stdout, stderr, exit = runCLI(t, dir, false, "config", "list")
+		if exit != 0 || stderr != "" || !strings.Contains(stdout, `"route_disabled":"ghost"`) {
+			t.Fatalf("list: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+	})
+
+	t.Run("invalid value warns nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, _, exit := runCLI(t, dir, false, "config", "set", "route_machines", "local,win-a"); exit != 0 {
+			t.Fatalf("setup fleet: exit %d", exit)
+		}
+		stdout, stderr, exit := runCLI(t, dir, false, "config", "set", "route_disabled", "a b")
+		if exit != 2 || !strings.Contains(stdout, `"status":"2"`) || !strings.Contains(stdout, "route_disabled") {
+			t.Fatalf("invalid set: exit %d, stdout %q, stderr %q", exit, stdout, stderr)
+		}
+		if strings.Contains(stderr, "warning:") {
+			t.Errorf("invalid set stderr carries the warning line: %q", stderr)
+		}
+	})
+}
+
 func TestConfigUsage(t *testing.T) {
 	dir := t.TempDir()
 	for _, args := range [][]string{

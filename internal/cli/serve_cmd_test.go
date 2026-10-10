@@ -75,7 +75,12 @@ type fakeHerdr struct {
 	calls [][]string
 }
 
-func (f *fakeHerdr) Run(ctx context.Context, argv []string) ([]byte, int, error) {
+func (f *fakeHerdr) Run(ctx context.Context, argv []string) ([]byte, []byte, int, error) {
+	stdout, code, err := f.answer(argv)
+	return stdout, nil, code, err
+}
+
+func (f *fakeHerdr) answer(argv []string) ([]byte, int, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, append([]string(nil), argv...))
 	f.mu.Unlock()

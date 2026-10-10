@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/djalmajr/herdr-hermes/internal/config"
 )
@@ -62,12 +63,22 @@ func cmdConfig(args []string, env Env) int {
 		}
 		// Print the stored value: the router lists are normalized on set.
 		value := args[2]
+		var warning string
 		if cfg, err := config.Load(env.ConfigDir); err == nil {
 			if stored, err := cfg.Value(args[1]); err == nil {
 				value = stored
 			}
+			if args[1] == "route_disabled" || args[1] == "route_machines" {
+				warning = unmatchedDisabledWarning(cfg)
+			}
 		}
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", keyValuePairJSON(args[1], value))
+		// The warning, if any, goes to stderr after the stdout line and never
+		// changes the exit code: staging an exclusion before the fleet stays
+		// valid.
+		if warning != "" {
+			_, _ = fmt.Fprint(env.Stderr, warning)
+		}
 		return 0
 	default:
 		badUsage(env, "unknown config subcommand "+quote(args[0]))
@@ -81,4 +92,17 @@ func keyValuePairJSON(key, value string) string {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	}{Key: key, Value: value})
+}
+
+// unmatchedDisabledWarning returns the one stderr warning line (with its
+// trailing newline) for a stored configuration whose route_disabled labels
+// are not all in route_machines, or "" when there is nothing to warn about.
+// It exists so the route command can print the same line.
+func unmatchedDisabledWarning(cfg config.Config) string {
+	unmatched := cfg.UnmatchedDisabled()
+	if len(unmatched) == 0 {
+		return ""
+	}
+	return "herdr-hermes: config: warning: route_disabled labels not in route_machines exclude nothing: " +
+		strings.Join(unmatched, ",") + "\n"
 }

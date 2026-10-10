@@ -127,7 +127,8 @@ func (p Poller) PollAll(ctx context.Context, machines []string) []PollResult {
 // otherwise.
 func (p Poller) run(ctx context.Context, timeout time.Duration, argv []string) ([]byte, string) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
-	stdout, code, err := p.Exec(cctx, argv)
+	// The child's stderr is never kept: the outcome alone is the reason.
+	stdout, _, code, err := p.Exec(cctx, argv)
 	cancel()
 	switch {
 	case err != nil && errors.Is(err, router.ErrProbeTimeout):
