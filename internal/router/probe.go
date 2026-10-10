@@ -193,20 +193,26 @@ func (f Fleet) Probe(ctx context.Context) []Candidate {
 
 	if needCatalog {
 		catalogCtx, cancel := context.WithTimeout(ctx, timeout)
-		stdout, code, err := f.Exec(catalogCtx, []string{"machine", "list", "--json"})
+		stdout, stderr, code, err := f.Exec(catalogCtx, []string{"machine", "list", "--json"})
 		cancel()
 		reason := catalogReason(err, code, stdout)
 		if reason != "" {
 			// A failed catalog marks every remaining non-local label
 			// unavailable; local needs no catalog and keeps its own
-			// probe.
+			// probe. When herdr exited on its own, the shared cause and
+			// exit code come from its capped output.
+			cause, exit := "", 0
+			if reason == ReasonCatalogUnavailable && err == nil {
+				cause = ClassifyFailure(stdout, stderr)
+				exit = code
+			}
 			var keep []pendingProbe
 			for _, p := range pending {
 				if p.label == Local {
 					keep = append(keep, p)
 					continue
 				}
-				out[p.index] = Candidate{Machine: p.label, State: StateUnavailable, Reason: reason}
+				out[p.index] = Candidate{Machine: p.label, State: StateUnavailable, Reason: reason, Cause: cause, ExitCode: exit}
 			}
 			pending = keep
 		} else {
@@ -315,7 +321,7 @@ func resolveCatalog(entries []CatalogEntry, label string) (State, string, bool) 
 // anything else is unavailable with the mapped reason.
 func (f Fleet) probeLoad(ctx context.Context, timeout time.Duration, base string, p pendingProbe) Candidate {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
-	stdout, code, err := f.Exec(cctx, p.argv)
+	stdout, stderr, code, err := f.Exec(cctx, p.argv)
 	cancel()
 	switch {
 	case err != nil && errors.Is(err, ErrProbeTimeout):
@@ -323,7 +329,14 @@ func (f Fleet) probeLoad(ctx context.Context, timeout time.Duration, base string
 	case err != nil && errors.Is(err, ErrHerdrUnavailable):
 		return Candidate{Machine: p.label, State: StateUnavailable, Reason: ReasonHerdrUnavailable}
 	case err != nil || code != 0:
-		return Candidate{Machine: p.label, State: StateUnavailable, Reason: ReasonProbeFailed}
+		cand := Candidate{Machine: p.label, State: StateUnavailable, Reason: ReasonProbeFailed}
+		if err == nil {
+			// Herdr exited on its own: classify the capped output and
+			// keep the non-zero exit code.
+			cand.Cause = ClassifyFailure(stdout, stderr)
+			cand.ExitCode = code
+		}
+		return cand
 	case len(stdout) > MaxProbeOutput:
 		return Candidate{Machine: p.label, State: StateUnavailable, Reason: ReasonProbeMalformed}
 	}

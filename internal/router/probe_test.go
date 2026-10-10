@@ -18,15 +18,15 @@ type fakeExec struct {
 	mu        sync.Mutex
 	calls     [][]string
 	deadlines []time.Duration
-	fn        func(argv []string) ([]byte, int, error)
+	fn        func(argv []string) ([]byte, []byte, int, error)
 }
 
-func newFakeExec(fn func(argv []string) ([]byte, int, error)) *fakeExec {
+func newFakeExec(fn func(argv []string) ([]byte, []byte, int, error)) *fakeExec {
 	return &fakeExec{fn: fn}
 }
 
 // Run implements router.Exec.
-func (f *fakeExec) Run(ctx context.Context, argv []string) ([]byte, int, error) {
+func (f *fakeExec) Run(ctx context.Context, argv []string) ([]byte, []byte, int, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, append([]string(nil), argv...))
 	f.deadlines = append(f.deadlines, contextDeadlineIn(ctx))
@@ -164,35 +164,35 @@ func wantCandidate(t *testing.T, got []router.Candidate, i int, m string, s rout
 // the candidates come back in configured order, with the catalog run
 // exactly once and the default orchestrator name counted.
 func TestProbeFleetInConfiguredOrder(t *testing.T) {
-	fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+	fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 		if equalArgv(argv, []string{"machine", "list", "--json"}) {
 			time.Sleep(50 * time.Millisecond)
 			return catalogStdout(
 				catEntry{id: "1", label: "mac-a", enabled: true},
 				catEntry{id: "2", label: "mac-b", enabled: true},
 				catEntry{id: "3", label: "mac-c", enabled: true},
-			), 0, nil
+			), nil, 0, nil
 		}
 		time.Sleep(150 * time.Millisecond)
 		switch {
 		case equalArgv(argv, []string{"agent", "list"}):
-			return agentsJSON(agent{pane: "p1", status: "idle", name: namePtr("orchestrator")}), 0, nil
+			return agentsJSON(agent{pane: "p1", status: "idle", name: namePtr("orchestrator")}), nil, 0, nil
 		case equalArgv(argv, []string{"--machine", "mac-a", "agent", "list"}):
 			return agentsJSON(
 				agent{pane: "p2", status: "working", name: namePtr("orchestrator")},
 				agent{pane: "p3", status: "idle", name: namePtr("build")},
-			), 0, nil
+			), nil, 0, nil
 		case equalArgv(argv, []string{"--machine", "mac-b", "agent", "list"}):
 			return agentsJSON(
 				agent{pane: "p4", status: "idle", name: namePtr("orchestrator")},
 				agent{pane: "p5", status: "idle", name: namePtr("orchestrator-2")},
 				agent{pane: "p6", status: "idle", name: namePtr("review-3")},
-			), 0, nil
+			), nil, 0, nil
 		case equalArgv(argv, []string{"--machine", "mac-c", "agent", "list"}):
-			return agentsJSON(), 0, nil
+			return agentsJSON(), nil, 0, nil
 		}
 		t.Errorf("unexpected exec: %v", argv)
-		return nil, 1, nil
+		return nil, nil, 1, nil
 	})
 	f := router.Fleet{
 		Machines: []string{router.Local, "mac-a", "mac-b", "mac-c"},
@@ -235,12 +235,12 @@ func TestProbeFleetInConfiguredOrder(t *testing.T) {
 // TestProbeCustomOrchestratorName: the configured base name is counted,
 // not the default.
 func TestProbeCustomOrchestratorName(t *testing.T) {
-	fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+	fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 		return agentsJSON(
 			agent{pane: "p1", status: "idle", name: namePtr("build")},
 			agent{pane: "p2", status: "idle", name: namePtr("build-2")},
 			agent{pane: "p3", status: "idle", name: namePtr("orchestrator")},
-		), 0, nil
+		), nil, 0, nil
 	})
 	f := router.Fleet{
 		Machines:         []string{router.Local},
@@ -257,8 +257,8 @@ func TestProbeCustomOrchestratorName(t *testing.T) {
 // TestProbeOnlyLocalNoCatalog: a local-only fleet runs no catalog and one
 // agent-list probe without --machine.
 func TestProbeOnlyLocalNoCatalog(t *testing.T) {
-	fe := newFakeExec(func(argv []string) ([]byte, int, error) {
-		return agentsJSON(agent{pane: "p1", status: "idle", name: namePtr("orchestrator")}), 0, nil
+	fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
+		return agentsJSON(agent{pane: "p1", status: "idle", name: namePtr("orchestrator")}), nil, 0, nil
 	})
 	f := router.Fleet{Machines: []string{router.Local}, Exec: fe.Run}
 	out := f.Probe(context.Background())
@@ -273,7 +273,7 @@ func TestProbeOnlyLocalNoCatalog(t *testing.T) {
 // machines are mapped before any agent-list probe, and a label with dots
 // and dashes is its own --machine argv element.
 func TestProbeCatalogResolution(t *testing.T) {
-	fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+	fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 		if equalArgv(argv, []string{"machine", "list", "--json"}) {
 			return catalogStdout(
 				catEntry{id: "1", label: "mac-a", enabled: true},
@@ -282,9 +282,9 @@ func TestProbeCatalogResolution(t *testing.T) {
 				catEntry{id: "4", label: "dup", enabled: true},
 				catEntry{id: "5", label: "dup", enabled: true},
 				catEntry{id: "6", label: "win.a_1-2", enabled: true},
-			), 0, nil
+			), nil, 0, nil
 		}
-		return agentsJSON(), 0, nil
+		return agentsJSON(), nil, 0, nil
 	})
 	f := router.Fleet{
 		Machines: []string{"mac-a", "mac-b", "mac-c", "ghost", "dup", "win.a_1-2"},
@@ -334,9 +334,9 @@ func TestProbeCatalogResolution(t *testing.T) {
 // mapped before any probe and never reach the Exec, and a local-only
 // remainder runs no catalog.
 func TestProbeConfigExclusions(t *testing.T) {
-	fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+	fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 		t.Errorf("exec must not be called: %v", argv)
-		return nil, 1, nil
+		return nil, nil, 1, nil
 	})
 	f := router.Fleet{
 		Machines: []string{"-bad", "mac-a", ""},
@@ -351,8 +351,8 @@ func TestProbeConfigExclusions(t *testing.T) {
 		t.Errorf("exec calls = %v, want none", got)
 	}
 
-	fe2 := newFakeExec(func(argv []string) ([]byte, int, error) {
-		return agentsJSON(), 0, nil
+	fe2 := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
+		return agentsJSON(), nil, 0, nil
 	})
 	f2 := router.Fleet{
 		Machines: []string{"-bad", router.Local, "mac-a"},
@@ -389,12 +389,12 @@ func TestProbeCatalogErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+			fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 				if equalArgv(argv, []string{"machine", "list", "--json"}) {
-					return tc.stdout, tc.code, tc.err
+					return tc.stdout, nil, tc.code, tc.err
 				}
 				t.Errorf("agent-list probe must not run after a catalog failure: %v", argv)
-				return nil, 1, nil
+				return nil, nil, 1, nil
 			})
 			f := router.Fleet{Machines: []string{"mac-a", "mac-b"}, Exec: fe.Run}
 			out := f.Probe(context.Background())
@@ -410,11 +410,11 @@ func TestProbeCatalogErrors(t *testing.T) {
 // TestProbeCatalogErrorMixedFleet: a failed catalog marks the non-local
 // labels unavailable; local needs no catalog and keeps its own probe.
 func TestProbeCatalogErrorMixedFleet(t *testing.T) {
-	fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+	fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 		if equalArgv(argv, []string{"machine", "list", "--json"}) {
-			return nil, 0, errors.New("boom")
+			return nil, nil, 0, errors.New("boom")
 		}
-		return agentsJSON(agent{pane: "p1", status: "idle", name: namePtr("orchestrator")}), 0, nil
+		return agentsJSON(agent{pane: "p1", status: "idle", name: namePtr("orchestrator")}), nil, 0, nil
 	})
 	f := router.Fleet{Machines: []string{router.Local, "mac-a"}, Exec: fe.Run}
 	out := f.Probe(context.Background())
@@ -457,11 +457,11 @@ func TestProbeAgentListErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+			fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 				if equalArgv(argv, []string{"machine", "list", "--json"}) {
-					return catalogStdout(catEntry{id: "1", label: "mac-a", enabled: true}), 0, nil
+					return catalogStdout(catEntry{id: "1", label: "mac-a", enabled: true}), nil, 0, nil
 				}
-				return tc.stdout, tc.code, tc.err
+				return tc.stdout, nil, tc.code, tc.err
 			})
 			f := router.Fleet{Machines: []string{"mac-a"}, Exec: fe.Run}
 			out := f.Probe(context.Background())
@@ -655,11 +655,11 @@ func TestProbeTimeouts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fe := newFakeExec(func(argv []string) ([]byte, int, error) {
+			fe := newFakeExec(func(argv []string) ([]byte, []byte, int, error) {
 				if equalArgv(argv, []string{"machine", "list", "--json"}) {
-					return catalogStdout(catEntry{id: "1", label: "mac-a", enabled: true}), 0, nil
+					return catalogStdout(catEntry{id: "1", label: "mac-a", enabled: true}), nil, 0, nil
 				}
-				return agentsJSON(), 0, nil
+				return agentsJSON(), nil, 0, nil
 			})
 			f := router.Fleet{Machines: tc.machines, Timeout: tc.timeout, Exec: fe.Run}
 			ctx := context.Background()

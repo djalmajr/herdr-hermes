@@ -265,6 +265,30 @@ func (c Config) RouteDisabledList() []string {
 	return routeList(c.RouteDisabled)
 }
 
+// UnmatchedDisabled returns the route_disabled labels that are not in
+// route_machines, in route_disabled order. It returns nil when
+// route_machines or route_disabled is empty: with no fleet configured
+// yet there is nothing to compare against, so staging an exclusion
+// before the fleet is not reported.
+func (c Config) UnmatchedDisabled() []string {
+	machines := c.RouteMachineList()
+	disabled := c.RouteDisabledList()
+	if len(machines) == 0 || len(disabled) == 0 {
+		return nil
+	}
+	inFleet := make(map[string]struct{}, len(machines))
+	for _, m := range machines {
+		inFleet[m] = struct{}{}
+	}
+	var unmatched []string
+	for _, d := range disabled {
+		if _, ok := inFleet[d]; !ok {
+			unmatched = append(unmatched, d)
+		}
+	}
+	return unmatched
+}
+
 // routeList splits a normalized route list (nil when empty).
 func routeList(value string) []string {
 	if value == "" {
