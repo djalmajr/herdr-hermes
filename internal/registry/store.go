@@ -89,6 +89,11 @@ func Open(path string, opts Options) (*Store, error) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
+		// What MkdirAll created, or found created by someone else in the
+		// meantime, is checked like the rest of the path.
+		if err := unsafeStateCheck(path); err != nil {
+			return nil, err
+		}
 	}
 	// Pre-create the file at 0600 so the WAL and SHM files SQLite opens
 	// alongside it inherit the same mode.
@@ -109,52 +114,58 @@ func Open(path string, opts Options) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	switch {
-	case version > SchemaVersion:
+	if version > SchemaVersion {
 		db.Close()
 		return nil, fmt.Errorf("%w: user_version %d", ErrSchema, version)
-	case version == SchemaVersion:
-		// Existing schema: use it as is.
-	default:
-		// A fresh database: create the whole schema, then bump the
-		// version, in one transaction.
-		txn, err := db.BeginTx(context.Background(), nil)
-		if err != nil {
-			db.Close()
-			return nil, err
-		}
-		// Another process may have created the schema between the read
-		// above and the immediate BEGIN; read the version again under
-		// the write lock.
-		if err := txn.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-			txn.Rollback()
-			db.Close()
-			return nil, err
-		}
-		if version != 0 {
-			txn.Rollback()
-			if version > SchemaVersion {
-				db.Close()
-				return nil, fmt.Errorf("%w: user_version %d", ErrSchema, version)
-			}
-			return &Store{db: db, now: now, eventsPerJob: eventsPerJob, onlineWindow: onlineWindow}, nil
-		}
-		if _, err := txn.Exec(schemaDDL); err != nil {
-			txn.Rollback()
-			db.Close()
-			return nil, err
-		}
-		if _, err := txn.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
-			txn.Rollback()
-			db.Close()
-			return nil, err
-		}
-		if err := txn.Commit(); err != nil {
+	}
+	if version < SchemaVersion {
+		if err := migrate(db); err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
 	return &Store{db: db, now: now, eventsPerJob: eventsPerJob, onlineWindow: onlineWindow}, nil
+}
+
+// migrations[v] brings a version v schema to version v+1.
+var migrations = map[int]string{
+	1: `ALTER TABLE jobs ADD COLUMN sessao_seq INTEGER;`,
+}
+
+// migrate creates the whole schema on a fresh database, or upgrades an
+// older one step by step, and bumps the version, in one immediate
+// transaction. Another process may have done it between the caller's
+// read and the BEGIN, so the version is read again under the write lock.
+func migrate(db *sql.DB) error {
+	txn, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+	var version int
+	if err := txn.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	switch {
+	case version > SchemaVersion:
+		return fmt.Errorf("%w: user_version %d", ErrSchema, version)
+	case version == SchemaVersion:
+		return nil
+	case version == 0:
+		if _, err := txn.Exec(schemaDDL); err != nil {
+			return err
+		}
+	default:
+		for v := version; v < SchemaVersion; v++ {
+			if _, err := txn.Exec(migrations[v]); err != nil {
+				return fmt.Errorf("registry: migrate schema %d to %d: %w", v, v+1, err)
+			}
+		}
+	}
+	if _, err := txn.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
+		return err
+	}
+	return txn.Commit()
 }
 
 // Close closes the database.
@@ -322,8 +333,8 @@ func unsafeStateCheck(path string) error {
 // group or other, is refused; the one exception is a sticky shared
 // directory such as /tmp, where only an entry's owner may replace it: the
 // entry below it must then be a real directory owned by the current user
-// or root, never a symlink. A missing part of the path ends the walk:
-// Open creates it at 0700.
+// or root, never a symlink. A missing part of the path ends the walk once
+// its parent passed: Open creates it at 0700 and checks the path again.
 func checkAncestors(dir string) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -342,6 +353,10 @@ func checkAncestors(dir string) error {
 		if !ownedBySelfOrRoot(parent) {
 			return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeState, cur)
 		}
+		shared := parent.Mode().Perm()&0o022 != 0
+		if shared && parent.Mode()&os.ModeSticky == 0 {
+			return fmt.Errorf("%w: %s allows group or other writes", ErrUnsafeState, cur)
+		}
 		next := filepath.Join(cur, part)
 		entry, err := os.Lstat(next)
 		if errors.Is(err, os.ErrNotExist) {
@@ -350,10 +365,7 @@ func checkAncestors(dir string) error {
 		if err != nil {
 			return err
 		}
-		if parent.Mode().Perm()&0o022 != 0 {
-			if parent.Mode()&os.ModeSticky == 0 {
-				return fmt.Errorf("%w: %s allows group or other writes", ErrUnsafeState, cur)
-			}
+		if shared {
 			if entry.Mode()&os.ModeSymlink != 0 || !ownedBySelfOrRoot(entry) {
 				return fmt.Errorf("%w: %s in a shared directory is not a directory of the current user", ErrUnsafeState, next)
 			}

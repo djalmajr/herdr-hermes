@@ -26,7 +26,7 @@ import (
 // Defaults and bounds.
 const (
 	// SchemaVersion is the SQLite user_version of the registry schema.
-	SchemaVersion = 1
+	SchemaVersion = 2
 	// DefaultEventsPerJob is the number of most recent events kept per job.
 	DefaultEventsPerJob = 20
 	// DefaultOnlineWindow: a node is online when its last contact (a

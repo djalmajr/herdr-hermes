@@ -310,7 +310,7 @@ func TestHandler(t *testing.T) {
 		if w.Code != 200 {
 			t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
 		}
-		if w.Body.String() != `{"status":"ok","schema":1}`+"\n" {
+		if w.Body.String() != fmt.Sprintf(`{"status":"ok","schema":%d}`, SchemaVersion)+"\n" {
 			t.Errorf("body = %q", w.Body.String())
 		}
 		if ct := w.Header().Get("Content-Type"); ct != "application/json" {

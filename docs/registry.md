@@ -70,7 +70,7 @@ Every answer is one JSON line. A request whose `Host` is not a loopback authorit
 
 | method and path | body | answer |
 |---|---|---|
-| `GET /v1/health` | — | `{"status":"ok","schema":1}` |
+| `GET /v1/health` | — | `{"status":"ok","schema":2}`; `schema` is the database schema version |
 | `POST /v1/ingest` | one outbox record (at most 1 MiB) | `{"status":"ok","aplicado":true}`; `aplicado` is false for a duplicate or a refused replay |
 | `GET /v1/jobs[?maquina=&agente=]` | — | the inventory |
 | `POST /v1/check` | `{"agente","card","projeto","branch","pr","workspace","maquina","ttl_s"}` | 200 `{"status":"ok","claim":{…}}`, or 409 `{"status":"duplicate"|"hold","conflitos":[…]}` |
@@ -91,7 +91,7 @@ The inventory:
 
 ## Storage
 
-The database is SQLite in WAL mode (a pure Go driver, no C toolchain), created with mode 0600 in a 0700 directory. `serve` refuses to open a database or a `-wal`, `-shm` or `-journal` file that is a symlink or not a regular file and, outside Windows, one with group or other permission bits or owned by another user; there, every directory on the way to the database must also be owned by the current user or root and not writable by group or other, except a sticky shared directory such as `/tmp`, under which the next entry must be a real directory of the current user or root, never a symlink. Every timestamp it writes or returns carries a numeric offset in the local zone, never `Z`. Admission is bounded: at most 64 nodes, 1000 live jobs, 1000 live claims, 1000 policies and 1000 folder records; a request that would pass a bound is refused as invalid; a `cleanup` of a job the registry never saw is still accepted. With every table at its bound and every kept value at its length limit, a full inventory stays under 256 MiB, which is what `jobs` reads at most; jobs and panes seen by the poll come from the node's own Herdr and are not bounded. It holds only current state: a removed job is remembered for 7 days as a tombstone, the events are capped per job, and an expired claim is deleted at the next check.
+The database is SQLite in WAL mode (a pure Go driver, no C toolchain), created with mode 0600 in a 0700 directory; a database of an older schema version is upgraded in place, in one transaction, when `serve` opens it, and one of a newer version is refused. `serve` refuses to open a database or a `-wal`, `-shm` or `-journal` file that is a symlink or not a regular file and, outside Windows, one with group or other permission bits or owned by another user; there, every directory on the way to the database must also be owned by the current user or root and not writable by group or other, except a sticky shared directory such as `/tmp`, under which the next entry must be a real directory of the current user or root, never a symlink. Every timestamp it writes or returns carries a numeric offset in the local zone, never `Z`. Admission is bounded: at most 64 nodes, 1000 live jobs, 1000 live claims, 1000 policies and 1000 folder records; a request that would pass a bound is refused as invalid; a `cleanup` of a job the registry never saw is still accepted. With every table at its bound and every kept value at its length limit, a full inventory stays under 256 MiB, which is what `jobs` reads at most; jobs and panes seen by the poll come from the node's own Herdr and are not bounded. It holds only current state: a removed job is remembered for 7 days as a tombstone, the events are capped per job, and an expired claim is deleted at the next check.
 
 ## Limitations
 

@@ -1,7 +1,9 @@
 package registry
 
 import (
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -107,11 +109,64 @@ func TestOpen(t *testing.T) {
 	s2.Close()
 
 	// A database written by a newer schema is refused.
-	if _, err := s.db.Exec(`PRAGMA user_version = 2`); err != nil {
+	if _, err := s.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion+1)); err != nil {
 		t.Fatalf("bump user_version: %v", err)
 	}
 	if _, err := Open(path, Options{}); !errors.Is(err, ErrSchema) {
-		t.Fatalf("Open on user_version 2 = %v, want ErrSchema", err)
+		t.Fatalf("Open on a newer user_version = %v, want ErrSchema", err)
+	}
+}
+
+// TestOpenMigratesV1: a database written by schema 1 (no sessao_seq) is
+// upgraded in place on open; its rows survive and every push path works
+// on it afterwards.
+//
+// Mutation captured: without the migration, the job_event ingest fails
+// with "no such column: sessao_seq".
+func TestOpenMigratesV1(t *testing.T) {
+	v1DDL := strings.Replace(schemaDDL, "sessao_seq INTEGER, ", "", 1)
+	if v1DDL == schemaDDL {
+		t.Fatal("schemaDDL no longer holds the schema 2 column; update the v1 fixture")
+	}
+	path := pathFor(t)
+	db, err := sql.Open("sqlite", dsnFor(path))
+	if err != nil {
+		t.Fatalf("open v1: %v", err)
+	}
+	if _, err := db.Exec(v1DDL); err != nil {
+		t.Fatalf("v1 DDL: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(maquina, chave, origem, projeto, branch, fonte_push, sessao_ts_unix, encerrado, ultima_atividade, ultima_atividade_unix)
+		VALUES('node-a', 'sessao:example-org/example-repo#feat/x', 'sessao', 'example-org/example-repo', 'feat/x', 1, ?, 0, '2026-10-10T11:00:00-03:00', ?)`, fixedNow.Unix()-3600, fixedNow.Unix()-3600); err != nil {
+		t.Fatalf("v1 row: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatalf("v1 version: %v", err)
+	}
+	db.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	s, err := Open(path, Options{Now: fixedClock()})
+	if err != nil {
+		t.Fatalf("Open v1: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != SchemaVersion {
+		t.Fatalf("user_version = %d (%v), want %d", version, err, SchemaVersion)
+	}
+	res, err := s.Check(CheckRequest{Agente: "dja", Projeto: "example-org/example-repo", Branch: "feat/x"})
+	if err != nil || res.Status != CheckDuplicate {
+		t.Fatalf("check for the v1 session branch = %+v (%v), want duplicate", res, err)
+	}
+	mustIngest(t, s, recordBase(nil))
+	if !mustIngest(t, s, sessaoRec("2026-10-10T11:30:00-03:00", "end", "", "feat/x", "", "")) {
+		t.Fatal("end of the v1 session: applied = false")
+	}
+	if f := jobFact(t, s, "node-a", "sessao:example-org/example-repo#feat/x"); f.encerrado != 1 {
+		t.Errorf("v1 session after its end: row = %+v, want tombstoned", f)
 	}
 }
 
@@ -286,6 +341,36 @@ func TestOpenUnsafeState(t *testing.T) {
 		if _, err := Open(filepath.Join(state, "registry.db"), Options{Now: fixedClock()}); !errors.Is(err, ErrUnsafeState) {
 			t.Fatalf("Open under a 0777 non-sticky ancestor = %v, want ErrUnsafeState", err)
 		}
+	})
+	t.Run("missing dir under a shared non-sticky ancestor", func(t *testing.T) {
+		shared := filepath.Join(t.TempDir(), "shared")
+		if err := os.Mkdir(shared, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Chmod(shared, 0o777); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		state := filepath.Join(shared, "state")
+		if _, err := Open(filepath.Join(state, "registry.db"), Options{Now: fixedClock()}); !errors.Is(err, ErrUnsafeState) {
+			t.Fatalf("Open of a missing dir under a 0777 non-sticky ancestor = %v, want ErrUnsafeState", err)
+		}
+		if _, err := os.Lstat(state); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("refused Open created %s (%v)", state, err)
+		}
+	})
+	t.Run("missing dir under a sticky shared dir", func(t *testing.T) {
+		shared := filepath.Join(t.TempDir(), "shared")
+		if err := os.Mkdir(shared, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Chmod(shared, 0o777|os.ModeSticky); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		s, err := Open(filepath.Join(shared, "state", "registry.db"), Options{Now: fixedClock()})
+		if err != nil {
+			t.Fatalf("Open of a missing dir under a sticky shared dir: %v", err)
+		}
+		s.Close()
 	})
 	t.Run("symlink in a sticky shared dir", func(t *testing.T) {
 		shared := filepath.Join(t.TempDir(), "shared")
