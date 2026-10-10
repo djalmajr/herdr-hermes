@@ -51,6 +51,20 @@ func lwCount(t *testing.T, raw []byte, base string, want int) {
 	}
 }
 
+// lwSection returns the text of the section that starts at heading, up to
+// the next heading of the same level, or "" when the heading is absent.
+func lwSection(text, heading string) string {
+	i := strings.Index(text, "\n"+heading+"\n")
+	if i < 0 {
+		return ""
+	}
+	rest := text[i+1+len(heading):]
+	if j := strings.Index(rest, "\n## "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
 // TestLoadCountsEveryStatus: a single agent named orchestrator counts
 // under every one of the five statuses, and a list of five recognized
 // names, one per status, counts five.
@@ -92,15 +106,18 @@ func TestLoadRecognizedNamesCountOnce(t *testing.T) {
 		lwAgent{pane: "w1:p12", status: "working", name: lwName("review-2")},
 		lwAgent{pane: "w1:p13", status: "working", nullName: true},
 		lwAgent{pane: "w1:p14", status: "working"},
+		lwAgent{pane: "w1:p15", status: "working", name: lwName("orchestrator-1")},
 	)
-	lwCount(t, raw, "orchestrator", 3)
+	lwCount(t, raw, "orchestrator", 4)
 
 	base := lwAgentsJSON(
 		lwAgent{pane: "w1:p1", status: "working", name: lwName("planner")},
 		lwAgent{pane: "w1:p2", status: "working", name: lwName("planner-3")},
 		lwAgent{pane: "w1:p3", status: "working", name: lwName("orchestrator")},
+		lwAgent{pane: "w1:p4", status: "working", name: lwName("planner-1")},
+		lwAgent{pane: "w1:p5", status: "working", name: lwName("planner-01")},
 	)
-	lwCount(t, base, "planner", 2)
+	lwCount(t, base, "planner", 3)
 }
 
 // TestLoadWordingDocs: the routing documentation keeps the any-status
@@ -146,6 +163,23 @@ func TestLoadWordingDocs(t *testing.T) {
 	} {
 		if !strings.Contains(texts["routing.md"], want) {
 			t.Errorf("routing.md missing %s", want)
+		}
+	}
+	// The load definition itself must sit in the Orchestrator load section,
+	// so the same phrase elsewhere in the file cannot stand in for it.
+	section := lwSection(texts["routing.md"], "## Orchestrator load")
+	for _, want := range []string{
+		"A machine's load is the number of recognized orchestrators in its agent list, whatever their `agent_status`: `idle`, `working`, `blocked`, `done` and `unknown` all count the same. Each recognized agent counts exactly once.",
+		"a finished orchestrator whose pane is still open (usually `done` or `idle`) keeps counting until its agent leaves the Herdr agent list",
+		"The set of counted statuses is not configurable.",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("routing.md section Orchestrator load missing %q", want)
+		}
+	}
+	for _, label := range []string{"routing.md", "SKILL.md", "setup.md"} {
+		if !strings.Contains(texts[label], "`<base>-<n>`") {
+			t.Errorf("%s does not describe the custom base suffix `<base>-<n>`", label)
 		}
 	}
 	if !strings.Contains(texts["protocol.md"], "`idle`, `working`, `blocked`, `done` and `unknown` all count the same") {

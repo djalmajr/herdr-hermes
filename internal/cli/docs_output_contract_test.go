@@ -133,6 +133,7 @@ func TestDocsReadmeOutputContract(t *testing.T) {
 		"for `job events` is JSON lines and a trailer line",
 		"docs/routing.md#preflight-read-only",
 		"orchestrator-<n>",
+		"`<base>` or `<base>-<n>` when `route_orchestrator_name` sets another base",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("README does not contain %q", want)

@@ -69,7 +69,7 @@ herdr-hermes route
 
 The optional keys are `route_disabled` (labels to exclude without editing the Herdr machine profiles), `route_orchestrator_name` (the orchestrator agent base name to count, default `orchestrator`), `route_probe_timeout_s` (the bound of each probe, 1..120 seconds, default 20) and `herdr_bin` (the `herdr` executable, default `herdr`). `route` is read-only and advisory: it prints the chosen machine as one JSON line and never starts, moves or replays a job; the dispatcher then runs `herdr-hermes job start` on the chosen machine through its own channel and never re-sends the dispatch to another machine after a transport loss or timeout.
 
-Run the dispatcher as the operating-system user that saved the Herdr machines, with that user's environment (the same `HOME` on macOS and Linux, the same user profile on Windows): `route` reads the saved machines only through `herdr machine list --json` in its own environment, and another environment usually sees an empty catalog, which turns every saved label into `unsupported` (`unknown_machine`) while `local` still answers. Check it read-only first:
+Run the dispatcher as the operating-system user that saved the Herdr machines, with that user's environment (the same `HOME` on macOS and Linux, the same user profile on Windows): `route` reads its configuration from that user's configuration directory and the saved machines only through `herdr machine list --json` in its own environment. Another environment usually sees an empty configuration, which makes `route` exit 2 before any probe, or an empty catalog, which turns every saved label of a configured fleet into `unsupported` (`unknown_machine`) while `local`, probed on its own, may still be `available`. Check it read-only first; `config get route_machines` must print the intended fleet:
 
 ```text
 herdr machine list --json
@@ -77,7 +77,7 @@ herdr-hermes config get route_machines
 herdr-hermes route
 ```
 
-An orchestrator counts toward its machine's load only when its Herdr agent is named `orchestrator` or `orchestrator-<n>` (or the `route_orchestrator_name` base), as `herdr-soho init` names the calling agent; workers and unnamed agents never count, and a finished orchestrator counts until its pane or workspace closes.
+An orchestrator counts toward its machine's load only when its Herdr agent is named after the orchestrator base — `orchestrator` or `orchestrator-<n>` by default, `<base>` or `<base>-<n>` when `route_orchestrator_name` sets another base — as `herdr-soho init` names the calling agent; agents whose name does not match the base (with the default base, the workers `herdr-soho` spawns and unnamed agents) do not count, and a finished orchestrator counts until its pane or workspace closes.
 
 ## Verify
 
