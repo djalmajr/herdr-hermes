@@ -147,20 +147,19 @@ func TestRouteDiagCatalogConnectionRefused(t *testing.T) {
 	assertNoLeak(t, "stderr", stderr)
 }
 
-// TestRouteDiagUnsupportedAndTimeout: an unknown saved machine and a
-// timed-out probe each get their fixed reason hint.
-func TestRouteDiagUnsupportedAndTimeout(t *testing.T) {
+// TestRouteDiagUnsupported: a label absent from the saved machine catalog
+// gets its fixed reason hint while the other machine wins.
+func TestRouteDiagUnsupported(t *testing.T) {
 	fakeDir := t.TempDir()
 	exe := fakesoho.Install(t, fakeDir,
 		fakesoho.Rule{Argv: []string{"machine", "list", "--json"}, Code: 0, Stdout: routeCatalogWinA},
 		fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 0, Stdout: routeAgentList(0)},
-		fakesoho.Rule{Argv: []string{"--machine", "win-a", "agent", "list"}, Code: 0, Delay: 2500, Stdout: routeAgentList(0)},
+		fakesoho.Rule{Argv: []string{"--machine", "win-a", "agent", "list"}, Code: 0, Stdout: routeAgentList(1)},
 	)
 	dir := t.TempDir()
 	writeRouteConfig(t, dir, map[string]string{
-		"herdr_bin":             exe,
-		"route_machines":        "local,win-a,ghost",
-		"route_probe_timeout_s": "1",
+		"herdr_bin":      exe,
+		"route_machines": "local,win-a,ghost",
 	})
 	stdout, stderr, exit := runCLI(t, dir, false, "route")
 	if exit != 0 {
@@ -169,8 +168,34 @@ func TestRouteDiagUnsupportedAndTimeout(t *testing.T) {
 	if res := parseRouteResult(t, stdout); res.Machine != "local" {
 		t.Errorf("machine = %q, want local", res.Machine)
 	}
-	wantErr := "herdr-hermes: route: win-a unavailable: probe_timeout: the probe did not finish within route_probe_timeout_s\n" +
-		"herdr-hermes: route: ghost unsupported: unknown_machine: not a saved Herdr machine (herdr machine list) and not local\n"
+	wantErr := "herdr-hermes: route: ghost unsupported: unknown_machine: not a saved Herdr machine (herdr machine list) and not local\n"
+	if stderr != wantErr {
+		t.Errorf("stderr = %q, want %q", stderr, wantErr)
+	}
+}
+
+// TestRouteDiagTimeout: the only machine's probe outlives the one-second
+// bound and gets the fixed timeout hint before the exit-4 line. No other
+// probe has to finish within the bound, so a slow test host (the race
+// runtime's exit delay included) cannot turn the expected timeout into
+// another outcome.
+func TestRouteDiagTimeout(t *testing.T) {
+	fakeDir := t.TempDir()
+	exe := fakesoho.Install(t, fakeDir,
+		fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 0, Delay: 2500, Stdout: routeAgentList(0)},
+	)
+	dir := t.TempDir()
+	writeRouteConfig(t, dir, map[string]string{
+		"herdr_bin":             exe,
+		"route_machines":        "local",
+		"route_probe_timeout_s": "1",
+	})
+	stdout, stderr, exit := runRouteEnv(t, dir, []string{"PATH=/bin", "GORACE=atexit_sleep_ms=0"}, "route")
+	if exit != 4 {
+		t.Fatalf("route exit = %d, want 4 (stdout %q, stderr %q)", exit, stdout, stderr)
+	}
+	wantErr := "herdr-hermes: route: local unavailable: probe_timeout: the probe did not finish within route_probe_timeout_s\n" +
+		"herdr-hermes: route: no eligible machine is available\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
