@@ -43,6 +43,14 @@ Agent status of watched panes: `blocked` notifies (class `agent_blocked`, escala
 
 Recipients are registered explicitly (`notify register owner|orchestrator|coordinator|watch|workspace`); a role without a registration has no recipient, a missing owner escalates with `missing_owner`, and a recipient that is the source itself is never delivered to (`self`). Delivery exits: 0 is `accepted`, 15 or a send killed in flight at its deadline is `uncertain` (never resent, so a message is never injected twice), 2, 3 or 18 is `rejected`, and anything else retries after 10 s, 30 s, 90 s, 300 s and 900 s up to 6 attempts, then `exhausted`; `notify retry <nid> --role <role>` re-queues an `uncertain` or `exhausted` delivery once, after you checked that the recipient did not get it. `notify list` and `notify status` are read-only; every other `notify` subcommand is refused under `HERDR_HERMES_NOWRITE=1` with exit 2. The full spec is the "Notifications" section of `docs/protocol.md`.
 
+## Routing
+
+`herdr-hermes route [--machine <label>]` is the dispatcher-side machine choice: it runs on the host the dispatcher uses to reach the fleet, probes the configured fleet read-only, picks one machine and prints it as one JSON line. It is advisory — it never starts, moves or replays a job — and the dispatcher then runs `job start` on the chosen machine through its own remote execution channel, never re-sending the dispatch to another machine after a transport loss or timeout. It is read-only (it works under `HERDR_HERMES_NOWRITE=1` and writes nothing) and exits 2 for bad usage, an invalid configuration, `route_machines` not configured, or a requested machine that is not configured, and 4 when no machine is available.
+
+Configuration keys (set with `herdr-hermes config set <key> <value>`): `route_machines` (the fleet: comma-separated machine labels in priority order; a label is a saved Herdr machine label or the reserved `local` for the host that runs `route`), `route_disabled` (labels to exclude without editing the Herdr machine profiles), `route_orchestrator_name` (the orchestrator agent base name to count, default `orchestrator`), `route_probe_timeout_s` (the bound of each probe, 1..120 seconds, default 20), and `herdr_bin` (the `herdr` executable, default `herdr`).
+
+The probe is read-only and uses only the public Herdr CLI (`herdr machine list --json`, then `herdr agent list` or `herdr --machine <label> agent list` under the bound), never a shell and never the state files. A machine is `available` when it answers a valid agent list; its load is the number of agents whose name is the orchestrator base name or the base name followed by `-<n>`, whatever their status (workers, unnamed panes and other agents are not counted). A machine is `unavailable` when the probe times out, fails or is malformed, or the catalog fails; `disabled` when excluded by `route_disabled` or saved with `enabled: false`; and `unsupported` when the label is unknown or ambiguous. The available machine with the fewest active orchestrators wins, a tie going to the first in `route_machines` order (`motivo: least_load`); a requested `--machine` that is available always wins (`motivo: requested`), and a requested machine that is not available falls back with `motivo: fallback` and `solicitada` set. The full specification, with the reason codes, the outputs and the safety rules, is `docs/routing.md` and the "Routing" section of `docs/protocol.md` in the `herdr-hermes` repository.
+
 ## Exit codes
 
 | code | meaning |
@@ -50,7 +58,7 @@ Recipients are registered explicitly (`notify register owner|orchestrator|coordi
 | 0 | success (forwarded commands: whatever `herdr-soho` returned) |
 | 2 | bad usage, input limit exceeded, unknown config key, internal job subcommand refused, a writing command under `HERDR_HERMES_NOWRITE=1`, no user config directory (`no_config_dir`), or a `wake` event that could not be made durable |
 | 3 | unknown job id in `herdr-hermes` bookkeeping (`sync --job`) |
-| 4 | `herdr-soho` not found, not runnable, or killed by the forwarding deadline |
+| 4 | `herdr-soho` not found, not runnable, or killed by the forwarding deadline, or no eligible machine available (`route`) |
 | 40 | no API key configured (push required) |
 | 41 | API key rejected by the dispatcher (401/403) |
 | 42 | dispatcher unreachable or retries exhausted; records stay pending |

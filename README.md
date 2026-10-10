@@ -27,6 +27,7 @@ The binary must be on your `PATH`; the optional plugin also needs it on the Herd
 4. Register the wake hook in the `herdr-soho` machine configuration: `job_wake_cmd=herdr-hermes wake`, so every job event that wakes the dispatcher is recorded in the outbox as it happens.
 5. Verify with `herdr-hermes doctor`, which reports the `herdr-soho` capabilities, the configuration state, the wake hook and the outbox counts in one JSON line.
 6. Optionally, register the notification recipients so this machine's native events reach them: `herdr-hermes notify register owner --projeto <org>/<repo> --to <ref>`, `herdr-hermes notify register orchestrator --job <id> --to <ref>`, `herdr-hermes notify register coordinator --to <ref>` `herdr-hermes notify register watch --pane <ws:pane>` and `herdr-hermes notify register workspace --workspace <ws>`, where `<ref>` is a `herdr-soho send` reference or a local agent name. Until the first `notify register`, no notification file is written.
+7. On the dispatcher host that chooses machines, list the fleet in priority order: `herdr-hermes config set route_machines <label>,<label>` (dispatcher side only; the nodes do not need it — see [`docs/routing.md`](docs/routing.md)).
 
 ## Commands
 
@@ -37,11 +38,12 @@ Every command prints exactly one JSON line on stdout (diagnostics go to stderr);
 - `sync [--job <id>] [--push-only]` — pull new job events for the tracked jobs into the outbox and push the pending records.
 - `push` — push the pending outbox records to the dispatcher.
 - `outbox [--since <seq>] [--wait <ms>]` — print outbox records with `seq > since` as JSON lines, then the trailer (the dispatcher pull channel; read-only).
+- `route [--machine <label>]` — dispatcher-side machine choice: probe the configured fleet read-only and print the chosen machine as one JSON line (advisory; see [`docs/routing.md`](docs/routing.md)).
 - `session start|update|end` — manage open session records for a project.
 - `decision --projeto <org/repo> --escopo global|projeto --motivo <text> [--job <id>] [<resumo>|-]` — record a decision taken outside a job.
 - `notify <sub>` — native notifications for this machine: `register` and `unregister` the recipients (project `owner`, job `orchestrator`, machine `coordinator`) and sources (watched `pane`, watched `workspace`), `list` and `status` (read-only), `deliver` the pending notifications, `ingest agent-status` or `ingest workspace` a Herdr event, `raise` a `stuck` or `cross_project` escalation explicitly, `ack` a delivered notification, and `retry` once an uncertain or exhausted delivery.
 - `auth login|status|logout` — manage the per-user dispatcher API key.
-- `config get|set|list` — manage the machine configuration (`machine_label`, `dispatcher_url`, `herdr_soho_bin`, `push_timeout_s`).
+- `config get|set|list` — manage the machine configuration (`machine_label`, `dispatcher_url`, `herdr_soho_bin`, `push_timeout_s`, `route_machines`, `route_disabled`, `route_orchestrator_name`, `route_probe_timeout_s`, `herdr_bin`).
 - `doctor` — check the bridge prerequisites and print one status line.
 - `capabilities --json` — print the bridge capability line `{"schema":1,"bridge":1,"outbox":1,"push":1}`.
 - `version` — print the version.

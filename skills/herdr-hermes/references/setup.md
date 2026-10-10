@@ -58,6 +58,17 @@ herdr-hermes notify register workspace --workspace <ws> --job <id>
 
 `<ref>` is a `herdr-soho send` reference `<machine>/<ws>:<pane>` or a local agent name; it is validated, never guessed. `notify list` and `notify status` are read-only; `notify deliver`, `notify ingest agent-status|workspace`, `notify raise`, `notify ack` and `notify retry` write the ledger and are refused under `HERDR_HERMES_NOWRITE=1` with exit 2.
 
+## Dispatcher host (optional)
+
+The host the dispatcher uses to reach the fleet chooses machines with `herdr-hermes route`. List the fleet in priority order with saved Herdr machine labels (`local` is the reserved label for the Herdr server of the host that runs `route`); a dispatch-only host that must never run jobs is simply not listed in the fleet:
+
+```text
+herdr-hermes config set route_machines <label>,<label>
+herdr-hermes route
+```
+
+The optional keys are `route_disabled` (labels to exclude without editing the Herdr machine profiles), `route_orchestrator_name` (the orchestrator agent base name to count, default `orchestrator`), `route_probe_timeout_s` (the bound of each probe, 1..120 seconds, default 20) and `herdr_bin` (the `herdr` executable, default `herdr`). `route` is read-only and advisory: it prints the chosen machine as one JSON line and never starts, moves or replays a job; the dispatcher then runs `herdr-hermes job start` on the chosen machine through its own channel and never re-sends the dispatch to another machine after a transport loss or timeout.
+
 ## Verify
 
 ```text

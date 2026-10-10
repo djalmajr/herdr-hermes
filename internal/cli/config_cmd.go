@@ -60,7 +60,14 @@ func cmdConfig(args []string, env Env) int {
 			fail(env, 2, "config: "+err.Error())
 			return 2
 		}
-		_, _ = fmt.Fprintf(env.Stdout, "%s\n", keyValuePairJSON(args[1], args[2]))
+		// Print the stored value: the router lists are normalized on set.
+		value := args[2]
+		if cfg, err := config.Load(env.ConfigDir); err == nil {
+			if stored, err := cfg.Value(args[1]); err == nil {
+				value = stored
+			}
+		}
+		_, _ = fmt.Fprintf(env.Stdout, "%s\n", keyValuePairJSON(args[1], value))
 		return 0
 	default:
 		badUsage(env, "unknown config subcommand "+quote(args[0]))
