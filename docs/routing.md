@@ -23,12 +23,60 @@ The probe is read-only and uses only the public Herdr CLI, as argv subprocesses 
 1. A label in `route_disabled` is `disabled` (`disabled_by_config`) and is not probed. A label that does not match the label form is `unsupported` (`unknown_machine`).
 2. When at least one remaining label is not `local`, `herdr machine list --json` runs once. If it fails, times out, or its output is not the expected array of `{id,label,enabled}` objects, every non-local label is `unavailable` (`catalog_unavailable`, `catalog_malformed`, or `herdr_unavailable` when the executable is missing). A label absent from the list is `unsupported` (`unknown_machine`), a label listed more than once is `unsupported` (`ambiguous_machine`), and a saved machine with `enabled: false` is `disabled` (`machine_disabled`).
 3. Each remaining machine is probed concurrently with `herdr agent list` (`local`) or `herdr --machine <label> agent list`, each under `route_probe_timeout_s`. A timeout is `probe_timeout`, a non-zero exit is `probe_failed` (even when it printed JSON), a missing executable is `herdr_unavailable`, and output that is not a valid agent list (a Herdr `error` response, a missing `result.agents` array, an agent without a `pane_id`, an agent with an unknown `agent_status`, or oversize output over 8 MiB) is `probe_malformed`; all of them make the machine `unavailable`. Load is never inferred from a failed or malformed probe.
-4. A machine that answered a valid agent list is `available`; its load is the number of active orchestrators: the agents whose `name` is the base name or the base name followed by `-<n>` (for example `orchestrator`, `orchestrator-2`), whatever their status. Workers (for example `build`, `review-2`), unnamed panes and other agents are not counted. There is no resource cap.
+4. A machine that answered a valid agent list is `available`; its load is its number of recognized orchestrators, whatever their status (see [Orchestrator load](#orchestrator-load)). There is no resource cap.
+
+## Orchestrator load
+
+- A recognized orchestrator is a Herdr agent whose `name` is exactly the base name (`route_orchestrator_name`, default `orchestrator`) or the base name followed by `-<n>`, where `<n>` is a positive integer without a leading zero (for example `orchestrator`, `orchestrator-2`, `orchestrator-12`). The match is exact and case-sensitive: `orchestrator-0`, `orchestrator-02`, `orchestrator-x`, `Orchestrator` and `my-orchestrator` are not recognized.
+- A machine's load is the number of recognized orchestrators in its agent list, whatever their `agent_status`: `idle`, `working`, `blocked`, `done` and `unknown` all count the same. Each recognized agent counts exactly once.
+- Load is therefore the number of orchestrator agents open on the machine, not the number working right now: a finished orchestrator whose pane is still open (usually `done` or `idle`) keeps counting until its agent leaves the Herdr agent list, that is until its pane or its workspace is closed. Close the workspaces of finished jobs to release their load. The set of counted statuses is not configurable.
+- A machine with four `done`, one `idle` and two `working` orchestrators has load 7; a machine with two `done` and two `working` orchestrators has load 4; `route` picks the second machine (`least_load`) although both have two working orchestrators.
+- Workers (for example `build`, `build-2`, `review-2`), unnamed agents (no `name`, or `name: null`) and every other agent are not counted, whatever they are doing. `route` never infers a role from a pane, its title, its command or its working directory.
+
+## Orchestrator naming
+
+- An orchestrator is visible to `route` only through its Herdr agent name. Name it with the existing public interfaces: `herdr-soho init`, run from the orchestrator's own pane, names the calling agent `orchestrator` (the `herdr-soho` `orchestrator_name`), or `orchestrator-<n>` when that name is already taken on the same Herdr server; `herdr agent rename <target> <name>` names an agent by hand. An orchestrator started without either stays unnamed and does not count, even while it is working.
+- Workers that `herdr-soho` spawns are named after their lane or role (`build`, `review-2`, `implementer`) and never count.
+- Custom base name: when the fleet's orchestrators use another `herdr-soho` `orchestrator_name`, set `route_orchestrator_name` on the dispatcher host to the same value (`herdr-hermes config set route_orchestrator_name <name>`). One base name applies to every machine in the fleet, so keep `orchestrator_name` the same on every node. With `route_orchestrator_name=planner`, `planner` and `planner-3` count and `orchestrator` does not.
+- Read-only verification:
+
+  ```text
+  herdr agent list
+  herdr --machine <label> agent list
+  herdr-hermes route
+  ```
+
+  In each agent list, count the agents whose `name` matches the rule in [Orchestrator load](#orchestrator-load), whatever their `agent_status`; that number is the `orquestradores` value `route` reports for that machine in `candidatos`. An orchestrator you expect to count but that is missing from the number is unnamed or misnamed: name it as above.
+
+## Dispatcher environment
+
+- `route` sees the fleet only through the `herdr` it runs (`herdr_bin`), in the dispatcher's own environment: it passes its environment to `herdr` unchanged and adds nothing. Two pieces of per-user state decide the result:
+- The saved-machine catalog belongs to Herdr and to the operating-system user that saved the machines (`herdr machine add`). `route` reads it only through `herdr machine list --json`, never from a file.
+- The `herdr-hermes` configuration (`route_machines` and the other keys) lives in the configuration directory of the user that runs `herdr-hermes`: `~/Library/Application Support/herdr-hermes/config` on macOS, `%AppData%\herdr-hermes\config` on Windows, and `$XDG_CONFIG_HOME/herdr-hermes/config` (by default `~/.config/herdr-hermes/config`) on Linux.
+- Run the dispatcher as the user that saved the machines, with that user's normal environment: on macOS and Linux the same `HOME`; on Windows the same user profile (`USERPROFILE`, `APPDATA` and `LOCALAPPDATA`). A service account, a scheduler, a sandbox or a wrapper that changes these variables sees another user's catalog and configuration, usually empty ones.
+- The `local` label is probed through the host's own Herdr server, which `herdr` reaches on its own or through `HERDR_SOCKET_PATH`; a dispatcher in the wrong environment can therefore still see `local` as `available` while every saved label is `unsupported` (`unknown_machine`).
+- Do not copy or edit the Herdr catalog or the machine profiles to work around this: save the machines as the dispatcher user with `herdr machine add`, or run the dispatcher as the user that already has them.
+
+### Preflight (read-only)
+
+```text
+herdr machine list --json
+herdr-hermes config get route_machines
+herdr-hermes route
+```
+
+Run it as the dispatcher user, in the dispatcher's environment (the same service, scheduler or shell). Every saved label in `route_machines` must appear exactly once in `herdr machine list --json` with `enabled: true`; `local` never appears there and needs no entry. An empty list `[]` where you expect saved machines means this environment is not the one of the user that saved them. All three commands are read-only and work under `HERDR_HERMES_NOWRITE=1`.
+
+### Labels and reason codes
+
+- `local` is reserved: it always means the Herdr server of the host that runs `route`, it is probed with `herdr agent list` and it is never looked up in the catalog. Every other label is a saved Herdr machine label resolved through the catalog. Do not save a machine with the label `local`: `route` would probe the host's own server instead.
+- `unsupported` with `unknown_machine`: the catalog that `herdr machine list --json` returned in this environment has no machine with that label (a typo, a machine this user never saved, or a dispatcher running in another user's environment), or the label does not match the label form. It is a configuration problem; retrying does not help.
+- `unavailable` (`probe_failed`, `probe_timeout`, `probe_malformed`, `catalog_unavailable`, `catalog_malformed`, `herdr_unavailable`): the label is `local` or known to the catalog (or the catalog itself could not be read), but `herdr` could not answer for it. It is a reachability problem: the machine may be powered off, unreachable or busy, and a later `route` may see it again.
 
 ## Selection
 
 - `--machine <label>` names a requested machine. A label not in `route_machines` exits 2 without probing. A requested machine that is `available` wins even when another machine has fewer orchestrators (`motivo: requested`).
-- Otherwise the available machine with the fewest active orchestrators wins; a tie goes to the first in `route_machines` order (`motivo: least_load`). When a requested machine is not available, the same rule picks another one and `motivo` is `fallback`, with `solicitada` set.
+- Otherwise the available machine with the lowest orchestrator load wins; a tie goes to the first in `route_machines` order (`motivo: least_load`). When a requested machine is not available, the same rule picks another one and `motivo` is `fallback`, with `solicitada` set.
 - When no machine is available, `route` exits 4.
 
 ## Output

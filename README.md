@@ -27,11 +27,11 @@ The binary must be on your `PATH`; the optional plugin also needs it on the Herd
 4. Register the wake hook in the `herdr-soho` machine configuration: `job_wake_cmd=herdr-hermes wake`, so every job event that wakes the dispatcher is recorded in the outbox as it happens.
 5. Verify with `herdr-hermes doctor`, which reports the `herdr-soho` capabilities, the configuration state, the wake hook and the outbox counts in one JSON line.
 6. Optionally, register the notification recipients so this machine's native events reach them: `herdr-hermes notify register owner --projeto <org>/<repo> --to <ref>`, `herdr-hermes notify register orchestrator --job <id> --to <ref>`, `herdr-hermes notify register coordinator --to <ref>` `herdr-hermes notify register watch --pane <ws:pane>` and `herdr-hermes notify register workspace --workspace <ws>`, where `<ref>` is a `herdr-soho send` reference or a local agent name. Until the first `notify register`, no notification file is written.
-7. On the dispatcher host that chooses machines, list the fleet in priority order: `herdr-hermes config set route_machines <label>,<label>` (dispatcher side only; the nodes do not need it — see [`docs/routing.md`](docs/routing.md)).
+7. On the dispatcher host that chooses machines, list the fleet in priority order: `herdr-hermes config set route_machines <label>,<label>` (dispatcher side only; the nodes do not need it — see [`docs/routing.md`](docs/routing.md)). Run the read-only preflight in [`docs/routing.md`](docs/routing.md#preflight-read-only) as the operating-system user that saved the Herdr machines, and make sure each orchestrator's Herdr agent is named `orchestrator` or `orchestrator-<n>` (as `herdr-soho init` names it), or it does not count toward its machine's load.
 
 ## Commands
 
-Every command prints exactly one JSON line on stdout (diagnostics go to stderr); the exit codes are `0`, `2`, `3`, `4`, `40`, `41`, `42`, `43`.
+Every command prints exactly one JSON line on stdout and its diagnostics on stderr, with these exceptions: `help` and `herdr-hermes` run with no arguments print the plain-text usage on stdout and exit 0; `outbox` prints one JSON line per record and then the trailer line; and the forwarded `job` subcommands copy the stdout of `herdr-soho job` unchanged, which for `job events` is JSON lines and a trailer line. On bad usage the usage text goes to stderr and stdout still carries one JSON error line. The exit codes are `0`, `2`, `3`, `4`, `40`, `41`, `42`, `43`.
 
 - `job <sub> [args]` — forward a dispatcher-facing job subcommand to `herdr-soho` (`start`, `status`, `wait`, `events`, `collect`, `amend`, `send`, `ack`, `cancel`, `close`, `list`), applying the contract input limits first.
 - `wake` — read one job event on stdin, record it in the outbox and attempt one push (configured as the `herdr-soho` wake hook).
@@ -47,7 +47,7 @@ Every command prints exactly one JSON line on stdout (diagnostics go to stderr);
 - `doctor` — check the bridge prerequisites and print one status line.
 - `capabilities --json` — print the bridge capability line `{"schema":1,"bridge":1,"outbox":1,"push":1}`.
 - `version` — print the version.
-- `help` — print the usage.
+- `help` — print the usage as plain text (not JSON); running `herdr-hermes` with no arguments does the same.
 - `plugin startup|event|bridge` — Herdr plugin entry points (see the optional plugin below).
 
 ## Pull and push
