@@ -237,6 +237,45 @@ func TestRouteLabelFormatsValid(t *testing.T) {
 	}
 }
 
+// TestUnmatchedDisabled: the route_disabled labels that are not in
+// route_machines, in route_disabled order; nil when either list is empty or
+// every exclusion matches the fleet (staging an exclusion before the fleet
+// is not reported).
+func TestUnmatchedDisabled(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		machines string
+		disabled string
+		want     []string
+	}{
+		{"empty fleet staged exclusion", "", "ghost", nil},
+		{"both lists empty", "", "", nil},
+		{"fleet without exclusions", "local,win-a", "", nil},
+		{"every exclusion matches", "local,win-a", "win-a", nil},
+		{"one unmatched", "local,win-a", "ghost-box", []string{"ghost-box"}},
+		{"mixed keeps route_disabled order", "local,win-a", "ghost,win-a,typo", []string{"ghost", "typo"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{RouteMachines: tc.machines, RouteDisabled: tc.disabled}
+			got := cfg.UnmatchedDisabled()
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("UnmatchedDisabled = %v, want nil", got)
+				}
+				return
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("UnmatchedDisabled = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("UnmatchedDisabled = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // TestRouteListLimits: 32 labels are the limit and valid, 33 are refused.
 func TestRouteListLimits(t *testing.T) {
 	labels := make([]string, 0, 33)
