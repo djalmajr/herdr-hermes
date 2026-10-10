@@ -41,14 +41,38 @@ const (
 // the operating system allows.
 var sunPathMarker = []byte("sun_path")
 
-// ClassifyFailure maps the capped stdout and stderr of a failed herdr
-// probe to one of the Cause constants, or "" when no cause is recognized.
-// It is pure and first-match-wins: a herdr JSON error object whose code is
-// exactly one of the mapped codes (scanned line by line on the first
-// MaxProbeDiag bytes of stderr, then of stdout), then a case-sensitive
-// sun_path marker in stderr, then the fixed case-insensitive substrings of
-// stderr in order. It never returns any part of the input.
+// diagWindow returns the bytes of raw that classification may read: at
+// most the first MaxProbeDiag bytes and, when raw reaches that bound and
+// the window does not end with a newline, without its trailing partial
+// line, because a record cut by the cap is never classified. A child
+// output of exactly MaxProbeDiag bytes without a final newline cannot be
+// told apart from a cut one and is treated as cut.
+func diagWindow(raw []byte) []byte {
+	if len(raw) < MaxProbeDiag {
+		return raw
+	}
+	w := raw[:MaxProbeDiag]
+	if w[len(w)-1] == '\n' {
+		return w
+	}
+	if i := bytes.LastIndexByte(w, '\n'); i >= 0 {
+		return w[:i+1]
+	}
+	return nil
+}
+
+// ClassifyFailure maps the stdout and stderr of a failed herdr probe to
+// one of the Cause constants, or "" when no cause is recognized. Both
+// inputs are first reduced to diagWindow, so a record cut by the
+// MaxProbeDiag cap is never classified, from any branch. It is pure and
+// first-match-wins: a herdr JSON error object whose code is exactly one
+// of the mapped codes (scanned line by line on stderr, then of stdout),
+// then a case-sensitive sun_path marker in stderr, then the fixed
+// case-insensitive substrings of stderr in order. It never returns any
+// part of the input.
 func ClassifyFailure(stdout, stderr []byte) string {
+	stderr = diagWindow(stderr)
+	stdout = diagWindow(stdout)
 	if cause := herdrJSONCause(stderr); cause != "" {
 		return cause
 	}

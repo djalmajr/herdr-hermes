@@ -174,6 +174,97 @@ func TestRouteDiagUnsupported(t *testing.T) {
 	}
 }
 
+// cutJSONStderr is a herdr stderr whose valid JSON error line exceeds the
+// 4096-byte capture: the message contains a transport phrase before byte
+// 4096 and the capture cuts the line inside the message. The cut record
+// must yield no cause and the transport phrase must not be printed.
+var cutJSONStderr = `{"error":{"code":"server_not_running","message":"no herdr server is running at /tmp/connection refused/` + strings.Repeat("x", 5000) + `"}}` + "\n"
+
+// validPrefixObj is a complete valid JSON error object; validPrefixStderr
+// pads it with a filler line so that the object ends exactly at byte 4096
+// while the line continues past the capture with an invalid suffix. The
+// cut record must yield no cause.
+const validPrefixObj = `{"error":{"code":"server_not_running"}}`
+
+var validPrefixStderr = strings.Repeat("x", 4096-len(validPrefixObj)-1) + "\n" + validPrefixObj + "garbage\n"
+
+// TestRouteDiagCutJSONNoCause: a local probe whose stderr is a valid JSON
+// error line cut inside the message at the 4096-byte cap yields no cause;
+// the route still falls back with exit 0 and prints no part of the line.
+func TestRouteDiagCutJSONNoCause(t *testing.T) {
+	if m := strings.Index(cutJSONStderr, "connection refused"); m >= 4096 {
+		t.Fatalf("marker at byte %d, want inside the first 4096 bytes", m)
+	}
+	if len(cutJSONStderr) <= 4096 {
+		t.Fatalf("payload is %d bytes, want more than 4096", len(cutJSONStderr))
+	}
+	fakeDir := t.TempDir()
+	exe := fakesoho.Install(t, fakeDir,
+		fakesoho.Rule{Argv: []string{"machine", "list", "--json"}, Code: 0, Stdout: routeCatalogWinA},
+		fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 1, Stderr: cutJSONStderr},
+		fakesoho.Rule{Argv: []string{"--machine", "win-a", "agent", "list"}, Code: 0, Stdout: routeAgentList(1)},
+	)
+	dir := t.TempDir()
+	writeRouteConfig(t, dir, map[string]string{
+		"herdr_bin":      exe,
+		"route_machines": "local,win-a",
+	})
+	stdout, stderr, exit := runCLI(t, dir, false, "route", "--machine", "local")
+	if exit != 0 {
+		t.Fatalf("route exit = %d, stderr %q", exit, stderr)
+	}
+	wantOut := `{"maquina":"win-a","motivo":"fallback","solicitada":"local","orquestradores":1,"candidatos":[{"maquina":"local","estado":"unavailable","motivo":"probe_failed"},{"maquina":"win-a","estado":"available","orquestradores":1}]}` + "\n"
+	if stdout != wantOut {
+		t.Errorf("stdout = %q, want %q", stdout, wantOut)
+	}
+	wantErr := "herdr-hermes: route: local unavailable: probe_failed (herdr exit 1): herdr reported no recognized cause\n"
+	if stderr != wantErr {
+		t.Errorf("stderr = %q, want %q", stderr, wantErr)
+	}
+	for _, bad := range []string{"/tmp/", "connection"} {
+		if strings.Contains(stderr, bad) {
+			t.Errorf("stderr contains %q: %q", bad, stderr)
+		}
+	}
+}
+
+// TestRouteDiagValidPrefixInvalidSuffixNoCause: a local probe whose stderr
+// is a line whose first 4096 bytes form a complete valid JSON error object
+// (the line itself is not valid JSON) yields no cause; the route falls
+// back with exit 0 and prints no part of the line.
+func TestRouteDiagValidPrefixInvalidSuffixNoCause(t *testing.T) {
+	if len(validPrefixStderr) <= 4096 {
+		t.Fatalf("payload is %d bytes, want more than 4096", len(validPrefixStderr))
+	}
+	if !strings.HasSuffix(validPrefixStderr[:4096], validPrefixObj) {
+		t.Fatalf("payload: the object does not end exactly at byte 4096")
+	}
+	fakeDir := t.TempDir()
+	exe := fakesoho.Install(t, fakeDir,
+		fakesoho.Rule{Argv: []string{"machine", "list", "--json"}, Code: 0, Stdout: routeCatalogWinA},
+		fakesoho.Rule{Argv: []string{"agent", "list"}, Code: 1, Stderr: validPrefixStderr},
+		fakesoho.Rule{Argv: []string{"--machine", "win-a", "agent", "list"}, Code: 0, Stdout: routeAgentList(1)},
+	)
+	dir := t.TempDir()
+	writeRouteConfig(t, dir, map[string]string{
+		"herdr_bin":      exe,
+		"route_machines": "local,win-a",
+	})
+	stdout, stderr, exit := runCLI(t, dir, false, "route", "--machine", "local")
+	if exit != 0 {
+		t.Fatalf("route exit = %d, stderr %q", exit, stderr)
+	}
+	wantOut := `{"maquina":"win-a","motivo":"fallback","solicitada":"local","orquestradores":1,"candidatos":[{"maquina":"local","estado":"unavailable","motivo":"probe_failed"},{"maquina":"win-a","estado":"available","orquestradores":1}]}` + "\n"
+	if stdout != wantOut {
+		t.Errorf("stdout = %q, want %q", stdout, wantOut)
+	}
+	wantErr := "herdr-hermes: route: local unavailable: probe_failed (herdr exit 1): herdr reported no recognized cause\n"
+	if stderr != wantErr {
+		t.Errorf("stderr = %q, want %q", stderr, wantErr)
+	}
+	assertNoLeak(t, "stdout", stdout)
+}
+
 // TestRouteDiagTimeout: the only machine's probe outlives the one-second
 // bound and gets the fixed timeout hint before the exit-4 line. No other
 // probe has to finish within the bound, so a slow test host (the race

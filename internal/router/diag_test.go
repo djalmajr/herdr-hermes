@@ -88,6 +88,71 @@ func TestClassifyFailureOnlyFirstDiagBytes(t *testing.T) {
 	}
 }
 
+// TestClassifyFailureCapWindow: a record cut by the MaxProbeDiag cap is
+// never classified — not from a complete JSON prefix of the cut line,
+// not from a substring or sun_path marker past the bound — while
+// complete earlier lines inside the window keep their cause.
+func TestClassifyFailureCapWindow(t *testing.T) {
+	cutJSON := `{"error":{"code":"server_not_running","message":"no herdr server is running at /tmp/connection refused/` +
+		strings.Repeat("x", 5000) + `"}}` + "\n"
+	if m := strings.Index(cutJSON, "connection refused"); m < 0 || m >= router.MaxProbeDiag {
+		t.Fatalf("marker at byte %d, want inside the first %d bytes", m, router.MaxProbeDiag)
+	}
+	if len(cutJSON) <= router.MaxProbeDiag {
+		t.Fatalf("cut JSON payload is %d bytes, want more than %d", len(cutJSON), router.MaxProbeDiag)
+	}
+	if !json.Valid([]byte(cutJSON[:len(cutJSON)-1])) {
+		t.Fatalf("cut JSON fixture is not valid JSON before the cut")
+	}
+	if json.Valid([]byte(cutJSON[:router.MaxProbeDiag])) {
+		t.Fatalf("cut JSON fixture is still valid JSON at the cap")
+	}
+
+	obj := `{"error":{"code":"server_not_running"}}`
+	validPrefix := strings.Repeat("x", router.MaxProbeDiag-len(obj)-1) + "\n" + obj + "garbage" + "\n"
+	if len(validPrefix) <= router.MaxProbeDiag {
+		t.Fatalf("valid-prefix payload is %d bytes, want more than %d", len(validPrefix), router.MaxProbeDiag)
+	}
+	prefix := validPrefix[:router.MaxProbeDiag]
+	if !json.Valid([]byte(prefix[strings.LastIndexByte(prefix, '\n')+1:])) {
+		t.Fatalf("valid-prefix fixture: the last line of the first %d bytes is not valid JSON", router.MaxProbeDiag)
+	}
+	if json.Valid([]byte(obj + "garbage")) {
+		t.Fatalf("valid-prefix fixture: the full line is valid JSON, want it invalid")
+	}
+
+	objPM := `{"error":{"code":"protocol_mismatch"}}`
+	validPrefixPM := strings.Repeat("x", router.MaxProbeDiag-len(objPM)-1) + "\n" + objPM + "garbage" + "\n"
+
+	atBound := strings.Repeat("y", router.MaxProbeDiag-29) + "dial tcp: connection refused\n"
+	if len(atBound) != router.MaxProbeDiag || !strings.HasSuffix(atBound, "\n") {
+		t.Fatalf("at-bound fixture is %d bytes, want exactly %d ending with a newline", len(atBound), router.MaxProbeDiag)
+	}
+
+	cases := []struct {
+		name   string
+		stdout []byte
+		stderr []byte
+		want   string
+	}{
+		{"cut JSON message yields no cause", nil, []byte(cutJSON), ""},
+		{"valid prefix invalid suffix yields no cause", nil, []byte(validPrefix), ""},
+		{"marker beyond the window", nil, []byte(strings.Repeat("x", 4100) + " connection refused\n"), ""},
+		{"sun_path beyond the window", nil, []byte(strings.Repeat("x", 4100) + " sun_path\n"), ""},
+		{"complete earlier text line kept", nil, append([]byte("dial tcp: connection refused\n"), []byte(cutJSON)...), router.CauseConnectionRefused},
+		{"complete earlier JSON line kept", nil, append([]byte(`{"error":{"code":"endpoint_timeout"}}`+"\n"), []byte(cutJSON)...), router.CauseEndpointTimeout},
+		{"line ending exactly at the bound", nil, []byte(atBound), router.CauseConnectionRefused},
+		{"stdout window", []byte(validPrefixPM), nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := router.ClassifyFailure(tc.stdout, tc.stderr); got != tc.want {
+				t.Errorf("ClassifyFailure = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestCauseHintExact: every cause maps to its exact fixed hint and an
 // empty or unknown cause gets the neutral hint.
 func TestCauseHintExact(t *testing.T) {
