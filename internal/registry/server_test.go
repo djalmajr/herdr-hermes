@@ -792,7 +792,7 @@ func TestHandlerIngest(t *testing.T) {
 // literal) with a port in 0..65535 are accepted; everything else is an
 // ErrInvalid wrap.
 // Mutation captured: accepting any host (dropping the loopback check)
-// makes the 192.168.1.10 case pass.
+// makes the 192.0.2.10 case pass.
 func TestCheckLoopback(t *testing.T) {
 	ok := []string{
 		"127.0.0.1:7429",
@@ -814,7 +814,7 @@ func TestCheckLoopback(t *testing.T) {
 		":7429",
 		"0.0.0.0:7429",
 		"[::]:1",
-		"192.168.1.10:80",
+		"192.0.2.10:80",
 		"example.com:80",
 		"127.0.0.1",
 		"127.0.0.1:99999",

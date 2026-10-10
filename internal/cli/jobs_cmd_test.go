@@ -122,7 +122,7 @@ func TestJobsUsage(t *testing.T) {
 		{"node bad manutencao", []string{"node", "set", "--maquina", "m", "--manutencao", "maybe"}, "usage: jobs"},
 		{"node empty runners", []string{"node", "set", "--maquina", "m", "--runners", ""}, "usage: jobs"},
 		{"node unknown flag", []string{"node", "set", "--maquina", "m", "--soho-version", "0.9.1", "--bogus"}, "usage: jobs"},
-		{"server plain http non-loopback", []string{"--server", "http://192.168.1.10:80"}, "jobs: invalid --server"},
+		{"server plain http non-loopback", []string{"--server", "http://192.0.2.10:80"}, "jobs: invalid --server"},
 		{"server http userinfo", []string{"--server", "http://user@127.0.0.1:7429"}, "jobs: invalid --server"},
 		{"server http query", []string{"--server", "http://127.0.0.1:7429?x=1"}, "jobs: invalid --server"},
 		{"server http fragment", []string{"--server", "http://127.0.0.1:7429#f"}, "jobs: invalid --server"},
