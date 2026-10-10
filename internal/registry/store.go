@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -128,8 +129,30 @@ func Open(path string, opts Options) (*Store, error) {
 }
 
 // migrations[v] brings a version v schema to version v+1.
-var migrations = map[int]string{
-	1: `ALTER TABLE jobs ADD COLUMN sessao_seq INTEGER;`,
+var migrations = map[int]func(*sql.Tx) error{
+	1: func(tx *sql.Tx) error {
+		if err := addColumn(tx, "jobs", "sessao_seq", "INTEGER"); err != nil {
+			return err
+		}
+		// The outbox seq of a session stored before is unknown: no
+		// record of its second may replace it, only a later one.
+		_, err := tx.Exec(`UPDATE jobs SET sessao_seq = ? WHERE sessao_ts_unix IS NOT NULL AND sessao_seq IS NULL`, int64(math.MaxInt64))
+		return err
+	},
+}
+
+// addColumn adds a column unless the table already has it: one schema 1
+// layout was written with it.
+func addColumn(tx *sql.Tx, table, column, typ string) error {
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, typ))
+	return err
 }
 
 // migrate creates the whole schema on a fresh database, or upgrades an
@@ -157,7 +180,7 @@ func migrate(db *sql.DB) error {
 		}
 	default:
 		for v := version; v < SchemaVersion; v++ {
-			if _, err := txn.Exec(migrations[v]); err != nil {
+			if err := migrations[v](txn); err != nil {
 				return fmt.Errorf("registry: migrate schema %d to %d: %w", v, v+1, err)
 			}
 		}

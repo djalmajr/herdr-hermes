@@ -117,17 +117,24 @@ func TestOpen(t *testing.T) {
 	}
 }
 
-// TestOpenMigratesV1: a database written by schema 1 (no sessao_seq) is
-// upgraded in place on open; its rows survive and every push path works
-// on it afterwards.
+// TestOpenMigratesV1: a database written by schema 1 is upgraded in place
+// on open, with or without the sessao_seq column (both layouts were
+// written as version 1); its rows survive, every push path works on it
+// afterwards, and a second open finds it current.
 //
 // Mutation captured: without the migration, the job_event ingest fails
-// with "no such column: sessao_seq".
+// with "no such column: sessao_seq"; an unconditional ALTER fails the
+// layout that already has the column with "duplicate column name".
 func TestOpenMigratesV1(t *testing.T) {
 	v1DDL := strings.Replace(schemaDDL, "sessao_seq INTEGER, ", "", 1)
 	if v1DDL == schemaDDL {
 		t.Fatal("schemaDDL no longer holds the schema 2 column; update the v1 fixture")
 	}
+	t.Run("without sessao_seq", func(t *testing.T) { testMigrateV1(t, v1DDL) })
+	t.Run("with sessao_seq", func(t *testing.T) { testMigrateV1(t, schemaDDL) })
+}
+
+func testMigrateV1(t *testing.T, v1DDL string) {
 	path := pathFor(t)
 	db, err := sql.Open("sqlite", dsnFor(path))
 	if err != nil {
@@ -162,12 +169,26 @@ func TestOpenMigratesV1(t *testing.T) {
 		t.Fatalf("check for the v1 session branch = %+v (%v), want duplicate", res, err)
 	}
 	mustIngest(t, s, recordBase(nil))
+	// The stored session's outbox seq is unknown: a record of its very
+	// second is refused, whatever its seq.
+	if mustIngest(t, s, sessaoRec("2026-10-10T11:00:00-03:00", "update", "card-7", "feat/x", "", "")) {
+		t.Error("same-second record after the migration: applied = true, want false")
+	}
+	if f := jobFact(t, s, "node-a", "sessao:example-org/example-repo#feat/x"); f.card != nil {
+		t.Errorf("v1 session after a same-second record: row = %+v, want unchanged", f)
+	}
 	if !mustIngest(t, s, sessaoRec("2026-10-10T11:30:00-03:00", "end", "", "feat/x", "", "")) {
 		t.Fatal("end of the v1 session: applied = false")
 	}
 	if f := jobFact(t, s, "node-a", "sessao:example-org/example-repo#feat/x"); f.encerrado != 1 {
 		t.Errorf("v1 session after its end: row = %+v, want tombstoned", f)
 	}
+	s.Close()
+	s2, err := Open(path, Options{Now: fixedClock()})
+	if err != nil {
+		t.Fatalf("reopen of the migrated database: %v", err)
+	}
+	s2.Close()
 }
 
 // TestOpenParentDirMode: the created parent directory is 0700.
