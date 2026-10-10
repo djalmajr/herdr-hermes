@@ -267,8 +267,50 @@ func TestRouteRequestedNotConfigured(t *testing.T) {
 	}
 }
 
-// TestRouteBadUsage: every malformed argument form exits 2 with the usage
-// line and never calls herdr.
+// routeUsageText and routeHelpText are the exact route-scoped texts the
+// command must print on stderr (they pin routeUsage and routeHelp in
+// route_cmd.go to the DJA-240 wording).
+const routeUsageText = "usage: herdr-hermes route [--machine <label>]\nrun 'herdr-hermes route --help' for the route options\n"
+
+const routeHelpText = `usage: herdr-hermes route [--machine <label>]
+
+Choose the machine for a new job (dispatcher side, read-only). Prints one
+JSON line on stdout; diagnostics go to stderr.
+
+options:
+  --machine <label>   prefer this configured machine; the label is a separate
+                      argument (the --machine=<label> form is not accepted)
+
+configuration (herdr-hermes config set <key> <value>):
+  route_machines, route_disabled, route_orchestrator_name,
+  route_probe_timeout_s, herdr_bin
+
+exit codes:
+  0   a machine was chosen
+  2   bad usage, invalid configuration, route_machines not configured or
+      the requested machine is not configured
+  4   no eligible machine is available
+`
+
+// The exact stdout error line per detail class. json.Marshal escapes the
+// < and > characters, so the literals carry the \u003c and \u003e
+// sequences as bytes.
+const (
+	routeOutHelp        = `{"status":"2","motivo":"route: help requested; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutEquals      = `{"status":"2","motivo":"route: the --machine=\u003clabel\u003e form is not accepted; pass the label as a separate argument: --machine \u003clabel\u003e; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutNeedsLabel  = `{"status":"2","motivo":"route: --machine needs a machine label; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutRepeated    = `{"status":"2","motivo":"route: --machine is given more than once; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutEmpty       = `{"status":"2","motivo":"route: the machine label is empty; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutFlagLike    = `{"status":"2","motivo":"route: the --machine value looks like a flag; a machine label starts with a letter or digit; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutTooLong     = `{"status":"2","motivo":"route: the machine label is longer than 64 characters; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutInvalid     = `{"status":"2","motivo":"route: invalid machine label: use a letter or digit, then up to 63 letters, digits, '.', '_' or '-'; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutUnknownFlag = `{"status":"2","motivo":"route: unknown flag; usage: route [--machine \u003clabel\u003e]"}`
+	routeOutUnexpected  = `{"status":"2","motivo":"route: unexpected argument; usage: route [--machine \u003clabel\u003e]"}`
+)
+
+// TestRouteBadUsage: every malformed argument class exits 2 with its own
+// exact motivo on stdout and the route-scoped diagnostic on stderr (the
+// global usage is never printed), and never calls herdr.
 func TestRouteBadUsage(t *testing.T) {
 	fakeDir := t.TempDir()
 	exe := fakesoho.Install(t, fakeDir,
@@ -279,29 +321,153 @@ func TestRouteBadUsage(t *testing.T) {
 		"herdr_bin":      exe,
 		"route_machines": "local,win-a",
 	})
-	cases := [][]string{
-		{"--machine"},
-		{"--machine", "local", "--machine", "win-a"},
-		{"--machine=local"},
-		{"--machine=-x"},
-		{"--machine", "-x"},
-		{"--bogus"},
-		{"extra"},
-		{"--machine", "local", "extra"},
+	cases := []struct {
+		name    string
+		args    []string
+		detail  string
+		wantOut string
+	}{
+		{"equals form", []string{"--machine=local"}, "the --machine=<label> form is not accepted; pass the label as a separate argument: --machine <label>", routeOutEquals},
+		{"equals form empty", []string{"--machine="}, "the --machine=<label> form is not accepted; pass the label as a separate argument: --machine <label>", routeOutEquals},
+		{"missing value", []string{"--machine"}, "--machine needs a machine label", routeOutNeedsLabel},
+		{"repeated flag", []string{"--machine", "local", "--machine", "win-a"}, "--machine is given more than once", routeOutRepeated},
+		{"empty value", []string{"--machine", ""}, "the machine label is empty", routeOutEmpty},
+		{"flag-like value", []string{"--machine", "-x"}, "the --machine value looks like a flag; a machine label starts with a letter or digit", routeOutFlagLike},
+		{"flag-like value --help", []string{"--machine", "--help"}, "the --machine value looks like a flag; a machine label starts with a letter or digit", routeOutFlagLike},
+		{"flag-like value -h", []string{"--machine", "-h"}, "the --machine value looks like a flag; a machine label starts with a letter or digit", routeOutFlagLike},
+		{"too long value", []string{"--machine", strings.Repeat("a", 65)}, "the machine label is longer than 64 characters", routeOutTooLong},
+		{"invalid label space", []string{"--machine", "bad label"}, "invalid machine label: use a letter or digit, then up to 63 letters, digits, '.', '_' or '-'", routeOutInvalid},
+		{"invalid label leading dot", []string{"--machine", ".x"}, "invalid machine label: use a letter or digit, then up to 63 letters, digits, '.', '_' or '-'", routeOutInvalid},
+		{"invalid label slash", []string{"--machine", "a/b"}, "invalid machine label: use a letter or digit, then up to 63 letters, digits, '.', '_' or '-'", routeOutInvalid},
+		{"invalid label non-ascii", []string{"--machine", "é"}, "invalid machine label: use a letter or digit, then up to 63 letters, digits, '.', '_' or '-'", routeOutInvalid},
+		{"unknown flag long", []string{"--bogus"}, "unknown flag", routeOutUnknownFlag},
+		{"unknown flag short", []string{"-x"}, "unknown flag", routeOutUnknownFlag},
+		{"unknown flag --", []string{"--"}, "unknown flag", routeOutUnknownFlag},
+		{"unexpected argument", []string{"extra"}, "unexpected argument", routeOutUnexpected},
+		{"unexpected bare label", []string{"local"}, "unexpected argument", routeOutUnexpected},
+		{"unexpected after valid flag", []string{"--machine", "local", "extra"}, "unexpected argument", routeOutUnexpected},
+		{"unexpected before flag", []string{"extra", "--machine", "local"}, "unexpected argument", routeOutUnexpected},
+		{"help after unknown flag", []string{"--bogus", "--help"}, "help requested", routeOutHelp},
+		{"short help", []string{"-h"}, "help requested", routeOutHelp},
+		{"long help", []string{"--help"}, "help requested", routeOutHelp},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wantErr := "herdr-hermes: route: " + tc.detail + "\n" + routeUsageText
+			if tc.detail == "help requested" {
+				wantErr = routeHelpText
+			}
+			stdout, stderr, exit := runCLI(t, dir, false, append([]string{"route"}, tc.args...)...)
+			if exit != 2 {
+				t.Fatalf("route %v exit = %d, want 2", tc.args, exit)
+			}
+			if stdout != tc.wantOut+"\n" {
+				t.Errorf("stdout = %q, want exactly %q", stdout, tc.wantOut+"\n")
+			}
+			if stderr != wantErr {
+				t.Errorf("stderr = %q, want exactly %q", stderr, wantErr)
+			}
+			if strings.Contains(stderr, "commands:") {
+				t.Errorf("stderr contains the global usage: %q", stderr)
+			}
+		})
+	}
+	if got := routeCalls(t, fakeDir); len(got) != 0 {
+		t.Errorf("calls = %v, want none", got)
+	}
+}
+
+// TestRouteNoEchoOfOffendingValue: an argument value that looks like a
+// secret or carries control bytes never appears on stdout or stderr,
+// whatever the error is: the diagnostics are fixed detail text and the
+// JSON line is one.
+func TestRouteNoEchoOfOffendingValue(t *testing.T) {
+	secret := "sk-test-SECRET-0123456789"
+	longValue := strings.Repeat(secret, 8) // 200 bytes
+	escapeValue := "\n\x1b[31m"
+	cases := [][]string{
+		{"--machine", secret},
+		{"--machine=" + secret},
+		{"--sk-test-SECRET-flag"},
+		{"--machine", longValue},
+		{"--machine", escapeValue},
+	}
+	fakeDir := t.TempDir()
+	exe := fakesoho.Install(t, fakeDir,
+		fakesoho.Rule{Argv: []string{"machine", "list", "--json"}, Code: 0, Stdout: routeCatalogWinA},
+	)
+	dir := t.TempDir()
+	writeRouteConfig(t, dir, map[string]string{
+		"herdr_bin":      exe,
+		"route_machines": "local,win-a",
+	})
 	for _, args := range cases {
 		stdout, stderr, exit := runCLI(t, dir, false, append([]string{"route"}, args...)...)
 		if exit != 2 {
 			t.Errorf("route %v exit = %d, want 2", args, exit)
 			continue
 		}
-		if !strings.Contains(stderr, "commands:") {
-			t.Errorf("route %v: usage not printed to stderr", args)
+		if strings.Count(stdout, "\n") != 1 {
+			t.Errorf("route %v stdout = %q, want exactly one line", args, stdout)
 		}
-		// json.Marshal escapes < and > in the motivo.
-		if !strings.Contains(stdout, `"motivo":"usage: route [--machine \u003clabel\u003e]"`) {
-			t.Errorf("route %v stdout = %q, want the usage motivo", args, stdout)
+		combined := stdout + stderr
+		if strings.Contains(combined, secret) {
+			t.Errorf("route %v: the secret appears on stdout or stderr: %q", args, combined)
 		}
+		if strings.Contains(combined, "\x1b") {
+			t.Errorf("route %v: an escape byte appears on stdout or stderr", args)
+		}
+		for _, value := range args {
+			if value == "--machine" {
+				continue
+			}
+			if strings.Contains(stdout, value) || strings.Contains(stderr, value) {
+				t.Errorf("route %v: the raw argument %q is echoed (stdout %q, stderr %q)", args, value, stdout, stderr)
+			}
+		}
+	}
+	if got := routeCalls(t, fakeDir); len(got) != 0 {
+		t.Errorf("calls = %v, want none", got)
+	}
+}
+
+// TestRouteNoConfigReadBeforeValidation: a usage problem is decided
+// before the config file is read: with an invalid config file the
+// malformed route invocations still give the usage motivo, not the
+// config error; the valid syntax with the same file gives the config
+// error (control that the file is really invalid).
+func TestRouteNoConfigReadBeforeValidation(t *testing.T) {
+	fakeDir := t.TempDir()
+	exe := fakesoho.Install(t, fakeDir,
+		fakesoho.Rule{Argv: []string{"machine", "list", "--json"}, Code: 0, Stdout: routeCatalogWinA},
+	)
+	dir := t.TempDir()
+	writeRouteConfig(t, dir, map[string]string{
+		"herdr_bin":             exe,
+		"route_probe_timeout_s": "0",
+	})
+	for _, args := range [][]string{
+		{"route", "--machine=local"},
+		{"route", "--bogus"},
+	} {
+		stdout, stderr, exit := runCLI(t, dir, false, args...)
+		if exit != 2 {
+			t.Errorf("%v exit = %d, want 2", args, exit)
+			continue
+		}
+		if strings.Contains(stdout, "config:") {
+			t.Errorf("%v stdout = %q, want the usage motivo, not the config error", args, stdout)
+		}
+		if !strings.Contains(stdout, `usage: route [--machine \u003clabel\u003e]`) {
+			t.Errorf("%v stdout = %q, want the route usage in the motivo", args, stdout)
+		}
+		if strings.Contains(stderr, "config:") {
+			t.Errorf("%v stderr = %q, want the route diagnostic, not the config error", args, stderr)
+		}
+	}
+	stdout, _, exit := runCLI(t, dir, false, "route")
+	if exit != 2 || !strings.Contains(stdout, "config: route_probe_timeout_s must be an integer from 1 to 120") {
+		t.Errorf("route with invalid config: exit %d stdout %q, want the config error", exit, stdout)
 	}
 	if got := routeCalls(t, fakeDir); len(got) != 0 {
 		t.Errorf("calls = %v, want none", got)
@@ -354,8 +520,13 @@ func TestRouteAllUnavailable(t *testing.T) {
 		res.Candidates[1].Machine != "win-a" || res.Candidates[1].State != "unavailable" || res.Candidates[1].Reason != "catalog_unavailable" {
 		t.Errorf("candidates = %+v, want both unavailable catalog_unavailable", res.Candidates)
 	}
-	if stderr != "herdr-hermes: route: no eligible machine is available\n" {
-		t.Errorf("stderr = %q", stderr)
+	// One diagnostic line per unavailable machine (DJA-238), then the
+	// exit-4 line.
+	wantErr := "herdr-hermes: route: mac-a unavailable: catalog_unavailable (herdr exit 1): herdr reported no recognized cause\n" +
+		"herdr-hermes: route: win-a unavailable: catalog_unavailable (herdr exit 1): herdr reported no recognized cause\n" +
+		"herdr-hermes: route: no eligible machine is available\n"
+	if stderr != wantErr {
+		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
 }
 

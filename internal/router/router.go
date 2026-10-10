@@ -44,6 +44,11 @@ const DefaultOrchestratorName = "orchestrator"
 // is a malformed probe.
 const MaxProbeOutput = 8 << 20
 
+// MaxProbeDiag caps the child stderr kept per probe. The bytes are used
+// only to classify a failed probe into the fixed Cause vocabulary; they
+// are never printed, returned to callers or embedded in any diagnostic.
+const MaxProbeDiag = 4096
+
 // State is the availability of one configured machine after the probe.
 type State string
 
@@ -84,12 +89,17 @@ const (
 
 // Candidate is one configured machine after the probe, in configured order.
 // Orchestrators is set only when State is StateAvailable; Reason only when
-// it is not.
+// it is not. Cause and ExitCode are operator diagnostics excluded from the
+// JSON: Cause holds one of the Cause constants when a failure was
+// classified from the capped probe output, and ExitCode the non-zero exit
+// code of a herdr child that exited on its own.
 type Candidate struct {
 	Machine       string `json:"maquina"`
 	State         State  `json:"estado"`
 	Orchestrators *int   `json:"orquestradores,omitempty"`
 	Reason        string `json:"motivo,omitempty"`
+	Cause         string `json:"-"`
+	ExitCode      int    `json:"-"`
 }
 
 // Result is the routing decision. Requested is the requested label or empty;
@@ -119,10 +129,12 @@ var ErrHerdrUnavailable = errors.New("router: herdr unavailable")
 
 // Exec runs the herdr CLI with argv (the arguments after the executable,
 // never a shell) and empty stdin. It returns the child's stdout (at most
-// MaxProbeOutput+1 bytes) and its exit code. err is non-nil only when the
-// child did not exit on its own: it wraps ErrProbeTimeout on the deadline
-// and ErrHerdrUnavailable when the executable is missing or not runnable.
-type Exec func(ctx context.Context, argv []string) (stdout []byte, code int, err error)
+// MaxProbeOutput+1 bytes), its stderr (at most MaxProbeDiag bytes, used
+// only to classify a failed probe) and its exit code. err is non-nil only
+// when the child did not exit on its own: it wraps ErrProbeTimeout on the
+// deadline and ErrHerdrUnavailable when the executable is missing or not
+// runnable.
+type Exec func(ctx context.Context, argv []string) (stdout, stderr []byte, code int, err error)
 
 // Fleet is the configured fleet and how to probe it.
 type Fleet struct {
