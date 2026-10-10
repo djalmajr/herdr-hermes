@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -64,10 +65,11 @@ type okBody struct {
 
 // NewHandler returns the read/write API over b. Every answer is one
 // JSON line; errors are {"status":"<code>","motivo":"<text>"}, with
-// invalid (400), not_found (404, also an unknown path),
-// method_not_allowed (405, with an Allow header), too_large (413),
-// unsupported_media_type (415) and error (500, never the Go error
-// text).
+// forbidden (403, a request whose Host or Origin authority is not
+// loopback, refused before routing), invalid (400), not_found (404,
+// also an unknown path), method_not_allowed (405, with an Allow
+// header), too_large (413), unsupported_media_type (415) and error
+// (500, never the Go error text).
 func NewHandler(b Backend) http.Handler {
 	return &apiHandler{b: b}
 }
@@ -78,8 +80,14 @@ type apiHandler struct {
 	b Backend
 }
 
-// ServeHTTP implements http.Handler.
+// ServeHTTP implements http.Handler. It refuses the request before any
+// routing when its authority is not loopback, and routes by path with
+// the method check, so the 404 and 405 answers stay JSON.
 func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !loopbackRequest(r) {
+		writeError(w, http.StatusForbidden, "forbidden", "request authority is not loopback")
+		return
+	}
 	path := r.URL.Path
 	switch {
 	case path == "/v1/health":
@@ -115,6 +123,50 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 	}
+}
+
+// loopbackRequest reports whether r is addressed to a loopback
+// authority: its Host must be one, and an Origin header, when present,
+// must be an http or https origin of one; the CLI and the bridge push
+// send no Origin, so an absent header is fine.
+func loopbackRequest(r *http.Request) bool {
+	if !loopbackAuthority(r.Host) {
+		return false
+	}
+	if o := r.Header.Get("Origin"); o != "" && !loopbackOrigin(o) {
+		return false
+	}
+	return true
+}
+
+// loopbackAuthority reports whether host is a loopback authority: the
+// host part (split from a port when one is present; a bare host is
+// allowed) is localhost, case-insensitive, or an IP literal with
+// IsLoopback (127.0.0.0/8, ::1; an IPv4-mapped address counts only if
+// IsLoopback says so).
+func loopbackAuthority(host string) bool {
+	h := host
+	if p, _, err := net.SplitHostPort(host); err == nil {
+		h = p
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+// loopbackOrigin reports whether o is an http or https URL to a
+// loopback authority and nothing else: no user info, path or query.
+func loopbackOrigin(o string) bool {
+	u, err := url.Parse(o)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	if u.User != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" {
+		return false
+	}
+	return loopbackAuthority(u.Host)
 }
 
 // route runs fn when r.Method is among the allowed methods and

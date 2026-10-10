@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/djalmajr/herdr-hermes/internal/outbox"
 )
 
 // checkNorm is the validated and normalized input of one Check.
@@ -141,12 +143,15 @@ func (s *Store) Check(req CheckRequest) (CheckResult, error) {
 		if err != nil {
 			return err
 		}
-		criado := now.Format(time.RFC3339)
+		if err := admitNewClaim(tx); err != nil {
+			return err
+		}
+		criado := now.Format(outbox.TSLayout)
 		expira := now.Add(n.ttl)
 		if _, err := tx.Exec(`INSERT INTO claims(id, agente, maquina, card, projeto, branch, pr, workspace, ref, criado, criado_unix, expira, expira_unix)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			id, n.agente, nullStr(n.maquina), nullStr(n.card), nullStr(n.projeto), nullStr(n.branch), nullStr(n.pr), nullStr(n.workspace), nullStr(n.ref),
-			criado, now.Unix(), expira.Format(time.RFC3339), expira.Unix()); err != nil {
+			criado, now.Unix(), expira.Format(outbox.TSLayout), expira.Unix()); err != nil {
 			return err
 		}
 		result = CheckResult{
@@ -162,7 +167,7 @@ func (s *Store) Check(req CheckRequest) (CheckResult, error) {
 				Workspace: nullStr(n.workspace),
 				Ref:       nullStr(n.ref),
 				Criado:    criado,
-				Expira:    expira.Format(time.RFC3339),
+				Expira:    expira.Format(outbox.TSLayout),
 			},
 		}
 		return nil

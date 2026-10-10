@@ -858,3 +858,264 @@ func pathFor(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), "registry.db")
 }
+
+// sessaoRec builds one session record on the fixed machine; job != ""
+// targets the named job (the branch is a field there, not part of the key).
+func sessaoRec(ts, acao, card, branch, pr, job string) outbox.Record {
+	dados := map[string]any{"acao": acao, "projeto": "example-org/example-repo"}
+	if card != "" {
+		dados["card"] = card
+	}
+	if branch != "" {
+		dados["branch"] = branch
+	}
+	if pr != "" {
+		dados["pr"] = pr
+	}
+	if job != "" {
+		dados["job"] = job
+	}
+	b, _ := json.Marshal(dados)
+	return recordBase(func(r *outbox.Record) {
+		r.Tipo = outbox.TipoSession
+		r.TS = ts
+		if job != "" {
+			r.JobID = ptr(job)
+		}
+		r.IdempotencyKey = "node-a:s" + ts
+		r.Projeto = "example-org/example-repo"
+		r.Dados = b
+	})
+}
+
+// TestIngestSessionFieldsReplace: after the ordering guard accepts a newer
+// session record, every validated non-empty field it carries replaces the
+// stored value; an omitted field keeps the stored value, and an older
+// replay changes nothing (R1).
+func TestIngestSessionFieldsReplace(t *testing.T) {
+	s := openStore(t)
+	const chave = "job-500"
+	if !mustIngest(t, s, sessaoRec("2026-10-10T11:00:00-03:00", "start", "card-1", "feat/old", "1", chave)) {
+		t.Fatal("start: applied = false")
+	}
+	if !mustIngest(t, s, sessaoRec("2026-10-10T11:30:00-03:00", "update", "card-2", "feat/current", "2", chave)) {
+		t.Fatal("update: applied = false")
+	}
+	f := jobFact(t, s, "node-a", chave)
+	if !f.exists || f.branch == nil || *f.branch != "feat/current" || f.card == nil || *f.card != "CARD-2" || f.pr == nil || *f.pr != "2" {
+		t.Fatalf("after the update: row = %+v, want the replaced values", f)
+	}
+	inv, err := s.Inventory(Filter{})
+	if err != nil {
+		t.Fatalf("Inventory: %v", err)
+	}
+	var shown *Job
+	for i := range inv.Jobs {
+		if inv.Jobs[i].Chave == chave {
+			shown = &inv.Jobs[i]
+		}
+	}
+	if shown == nil || shown.Branch == nil || *shown.Branch != "feat/current" {
+		t.Fatalf("inventory shows %+v, want the new branch", shown)
+	}
+	// A record that omits a field keeps the stored value for it.
+	if !mustIngest(t, s, sessaoRec("2026-10-10T11:45:00-03:00", "update", "card-3", "", "", chave)) {
+		t.Fatal("partial update: applied = false")
+	}
+	f = jobFact(t, s, "node-a", chave)
+	if f.card == nil || *f.card != "CARD-3" || f.branch == nil || *f.branch != "feat/current" || f.pr == nil || *f.pr != "2" {
+		t.Errorf("after the partial update: row = %+v, want the card replaced and the omitted fields kept", f)
+	}
+	res, err := s.Check(CheckRequest{Agente: "dja", Card: "card-2", Projeto: "example-org/example-repo", Branch: "feat/current"})
+	if err != nil {
+		t.Fatalf("Check card-2: %v", err)
+	}
+	if res.Status != CheckDuplicate {
+		t.Errorf("check for the new card = %q, want duplicate", res.Status)
+	}
+	res, err = s.Check(CheckRequest{Agente: "dja", Card: "card-1"})
+	if err != nil {
+		t.Fatalf("Check card-1: %v", err)
+	}
+	if res.Status != CheckOK {
+		t.Errorf("check for the old card = %q, want ok", res.Status)
+	}
+	// An older replay of the start changes nothing.
+	if mustIngest(t, s, sessaoRec("2026-10-10T10:00:00-03:00", "start", "card-1", "feat/old", "1", chave)) {
+		t.Fatal("older replay: applied = true, want false")
+	}
+	f = jobFact(t, s, "node-a", chave)
+	if f.branch == nil || *f.branch != "feat/current" || f.card == nil || *f.card != "CARD-3" {
+		t.Errorf("after the older replay: row = %+v, want unchanged", f)
+	}
+}
+
+// TestIngestSessionEndFirst: a jobless end for a target that does not
+// exist yet creates the row already tombstoned, and an older start
+// arriving later is ignored by the ordering guard (R2).
+func TestIngestSessionEndFirst(t *testing.T) {
+	s := openStore(t)
+	const chave = "sessao:example-org/example-repo#feat/x"
+	// The end arrives first for a target that does not exist yet.
+	if !mustIngest(t, s, sessaoRec("2026-10-10T11:30:00-03:00", "end", "card-9", "feat/x", "", "")) {
+		t.Fatal("end-first: applied = false")
+	}
+	f := jobFact(t, s, "node-a", chave)
+	if !f.exists || f.encerrado != 1 {
+		t.Fatalf("row = %+v, want created and tombstoned", f)
+	}
+	var encerradoUnix sql.NullInt64
+	if err := s.db.QueryRow(`SELECT encerrado_unix FROM jobs WHERE maquina = ? AND chave = ?`, "node-a", chave).Scan(&encerradoUnix); err != nil {
+		t.Fatalf("encerrado_unix: %v", err)
+	}
+	if !encerradoUnix.Valid || encerradoUnix.Int64 != fixedNow.Unix() {
+		t.Errorf("encerrado_unix = %v, want the store now", encerradoUnix)
+	}
+	// The tombstone never appears in the inventory.
+	inv, err := s.Inventory(Filter{})
+	if err != nil {
+		t.Fatalf("Inventory: %v", err)
+	}
+	for _, j := range inv.Jobs {
+		if j.Chave == chave {
+			t.Fatalf("inventory lists the tombstoned row %+v", j)
+		}
+	}
+	// And the check for its branch is free.
+	res, err := s.Check(CheckRequest{Agente: "dja", Projeto: "example-org/example-repo", Branch: "feat/x"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if res.Status != CheckOK {
+		t.Errorf("check for the tombstoned branch = %q, want ok", res.Status)
+	}
+	// An older start arriving later is ignored.
+	if mustIngest(t, s, sessaoRec("2026-10-10T11:00:00-03:00", "start", "card-1", "feat/x", "", "")) {
+		t.Fatal("older start after the end: applied = true, want false")
+	}
+	f = jobFact(t, s, "node-a", chave)
+	if f.encerrado != 1 || f.card == nil || *f.card != "CARD-9" {
+		t.Errorf("after the older start: row = %+v, want unchanged", f)
+	}
+}
+
+// TestIngestReplayKeepsObsoleto: the replay refusals of a job_event are
+// decided before any update of the job row, so an applied = false record
+// changes no job column (R4).
+func TestIngestReplayKeepsObsoleto(t *testing.T) {
+	s := openStore(t)
+	rec := recordBase(nil)
+	if !mustIngest(t, s, rec) {
+		t.Fatal("first ingest: applied = false")
+	}
+	mustApplyPoll(t, s, PollResult{Maquina: "node-a", At: fixedNow, OK: false, Motivo: "probe_timeout"})
+	if f := jobFact(t, s, "node-a", "job-1"); f.obsoleto != 1 {
+		t.Fatalf("after the failed poll: obsoleto = %d, want 1", f.obsoleto)
+	}
+	if mustIngest(t, s, rec) {
+		t.Fatal("replay: applied = true, want false")
+	}
+	f := jobFact(t, s, "node-a", "job-1")
+	if f.obsoleto != 1 {
+		t.Errorf("after the replay: obsoleto = %d, want 1 (the replay changed no column)", f.obsoleto)
+	}
+}
+
+// TestIngestSessionProvenanceSurvivesPoll: a job row created by a session
+// record has the push provenance, so a poll that does not list its
+// workspace only clears the workspace fields and never deletes it (R5).
+func TestIngestSessionProvenanceSurvivesPoll(t *testing.T) {
+	s := openStore(t)
+	mustIngest(t, s, recordBase(func(r *outbox.Record) {
+		r.Tipo = outbox.TipoSession
+		r.TS = "2026-10-10T11:30:00-03:00"
+		r.JobID = ptr("job-300")
+		r.IdempotencyKey = "node-a:s300"
+		r.Dados = json.RawMessage(`{"acao":"start","projeto":"example-org/example-repo","branch":"feat/survive","card":"card-7","job":"job-300"}`)
+	}))
+	mustApplyPoll(t, s, okPoll("node-a", "", PolledWorkspace{ID: "w9", Label: "hm-first-impl-ref9", AgentStatus: "working"}))
+	f := jobFact(t, s, "node-a", "job-300")
+	if !f.exists {
+		t.Fatal("the pushed session job was deleted by the poll")
+	}
+	if f.workspace != nil {
+		t.Errorf("job after the poll = %+v, want the workspace fields cleared", f)
+	}
+	if f.branch == nil || *f.branch != "feat/survive" {
+		t.Errorf("job after the poll = %+v, want the branch kept", f)
+	}
+	res, err := s.Check(CheckRequest{Agente: "dja", Card: "card-7", Projeto: "example-org/example-repo", Branch: "feat/survive"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if res.Status != CheckDuplicate {
+		t.Errorf("check for the surviving branch = %q, want duplicate", res.Status)
+	}
+}
+
+// TestIngestEventTipoPattern: the event tipo must match
+// ^[a-z][a-z0-9_]{0,63}$ or the record is ErrInvalid (R7a).
+func TestIngestEventTipoPattern(t *testing.T) {
+	s := openStore(t)
+	for _, bad := range []string{"Question", "bad-type", "9lives", strings.Repeat("a", 65), ""} {
+		_, err := s.Ingest(recordBase(func(r *outbox.Record) {
+			r.Dados = eventData(1, bad, "x", nil)
+		}))
+		if !errors.Is(err, ErrInvalid) {
+			t.Errorf("tipo %q: err = %v, want ErrInvalid", bad, err)
+		}
+	}
+	if n := tableCount(t, s, "events"); n != 0 {
+		t.Errorf("events = %d, want 0", n)
+	}
+	// A well-formed underscored tipo is admitted.
+	if !mustIngest(t, s, recordBase(func(r *outbox.Record) {
+		r.Dados = eventData(1, "my_new_type", "x", nil)
+	})) {
+		t.Error("my_new_type: applied = false, want true")
+	}
+}
+
+// TestIngestEventRefValueBounds: a kept ref value must be a JSON string of
+// at most 200 bytes, a JSON number or a boolean; anything else is dropped
+// from the stored refs, not an error (R7b).
+func TestIngestEventRefValueBounds(t *testing.T) {
+	s := openStore(t)
+	refs := map[string]any{
+		"pane":    "w1:p1",
+		"sha":     strings.Repeat("a", 200),
+		"papel":   42,
+		"motivo":  true,
+		"agente":  strings.Repeat("b", 201),
+		"seq_ref": map[string]any{"k": 1},
+		"exit":    []any{7},
+		"pr":      nil,
+	}
+	rec := recordBase(func(r *outbox.Record) {
+		r.Dados = eventData(1, jobapi.TypeCommit, "x", refs)
+	})
+	if !mustIngest(t, s, rec) {
+		t.Fatal("ingest: applied = false")
+	}
+	var refsJSON sql.NullString
+	if err := s.db.QueryRow(`SELECT refs FROM events WHERE maquina = 'node-a' AND chave = 'job-1'`).Scan(&refsJSON); err != nil {
+		t.Fatalf("refs: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(refsJSON.String), &m); err != nil {
+		t.Fatalf("refs json: %v", err)
+	}
+	for _, kept := range []string{"pane", "sha", "papel", "motivo"} {
+		if _, ok := m[kept]; !ok {
+			t.Errorf("refs %q dropped, want kept", kept)
+		}
+	}
+	for _, dropped := range []string{"agente", "seq_ref", "exit", "pr"} {
+		if _, ok := m[dropped]; ok {
+			t.Errorf("refs %q kept, want dropped", dropped)
+		}
+	}
+	if v, _ := m["sha"].(string); len(v) != 200 {
+		t.Errorf("sha = %d bytes, want the 200-byte boundary kept", len(v))
+	}
+}

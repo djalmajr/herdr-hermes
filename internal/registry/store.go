@@ -3,14 +3,18 @@ package registry
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // driver "sqlite"
+
+	"github.com/djalmajr/herdr-hermes/internal/outbox"
 )
 
 // Store is one open registry database. All access goes through a single
@@ -23,6 +27,11 @@ type Store struct {
 	eventsPerJob int
 	onlineWindow time.Duration
 }
+
+// ErrUnsafeState: the database or one of its state files is a symlink or
+// non-regular file, or (outside Windows) carries group or other mode bits,
+// or its parent directory allows group or other writes.
+var ErrUnsafeState = errors.New("registry: unsafe state file")
 
 // schemaDDL is the v1 schema, created in one transaction. Every *_unix
 // column is the Unix seconds of its text column; comparisons use the unix
@@ -55,7 +64,10 @@ func dsnFor(path string) string {
 
 // Open opens (creating the parent dir, the file and the schema when
 // missing) the registry database at path. A database written by a newer
-// schema is refused with ErrSchema.
+// schema is refused with ErrSchema, and a database or sidecar that is a
+// symlink or non-regular file, that carries group or other mode bits,
+// or that sits in a parent directory writable by group or other is
+// refused with ErrUnsafeState.
 func Open(path string, opts Options) (*Store, error) {
 	now := opts.Now
 	if now == nil {
@@ -70,6 +82,9 @@ func Open(path string, opts Options) (*Store, error) {
 		onlineWindow = DefaultOnlineWindow
 	}
 
+	if err := unsafeStateCheck(path); err != nil {
+		return nil, err
+	}
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
@@ -163,9 +178,145 @@ func (s *Store) tx(fn func(*sql.Tx) error) error {
 	return txn.Commit()
 }
 
-// stamp is the store clock as an RFC 3339 local-offset string and its Unix
-// seconds: the text column and its *_unix companion of one instant.
+// admitNewNode refuses a node that would be the MaxNodes+1-th one.
+func admitNewNode(tx *sql.Tx, maquina string) error {
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM nodes WHERE maquina = ?`, maquina).Scan(&exists); err != nil {
+		return err
+	}
+	if exists > 0 {
+		return nil
+	}
+	var total int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&total); err != nil {
+		return err
+	}
+	if total >= MaxNodes {
+		return invalidErr("nodes", "limit reached")
+	}
+	return nil
+}
+
+// admitNewLiveJob refuses a live job row that would be the MaxJobs+1-th
+// one. Polls are not capped.
+func admitNewLiveJob(tx *sql.Tx) error {
+	var live int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE encerrado = 0`).Scan(&live); err != nil {
+		return err
+	}
+	if live >= MaxJobs {
+		return invalidErr("jobs", "limit reached")
+	}
+	return nil
+}
+
+// admitNewClaim refuses a claim that would be the MaxClaims+1-th live
+// one, called after the expired claims are deleted.
+func admitNewClaim(tx *sql.Tx) error {
+	var live int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM claims`).Scan(&live); err != nil {
+		return err
+	}
+	if live >= MaxClaims {
+		return invalidErr("claims", "limit reached")
+	}
+	return nil
+}
+
+// admitNewPolicy refuses a policy that would be the MaxPolicies+1-th one;
+// an update of an existing policy is not capped.
+func admitNewPolicy(tx *sql.Tx, escopo, valor string) error {
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM policies WHERE escopo = ? AND valor = ?`, escopo, valor).Scan(&exists); err != nil {
+		return err
+	}
+	if exists > 0 {
+		return nil
+	}
+	var total int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM policies`).Scan(&total); err != nil {
+		return err
+	}
+	if total >= MaxPolicies {
+		return invalidErr("policies", "limit reached")
+	}
+	return nil
+}
+
+// admitNewFolder refuses a folder record that would be the MaxFolders+1-th
+// one; an update of an existing record is not capped.
+func admitNewFolder(tx *sql.Tx, maquina, caminho string) error {
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM folders WHERE maquina = ? AND caminho = ?`, maquina, caminho).Scan(&exists); err != nil {
+		return err
+	}
+	if exists > 0 {
+		return nil
+	}
+	var total int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM folders`).Scan(&total); err != nil {
+		return err
+	}
+	if total >= MaxFolders {
+		return invalidErr("folders", "limit reached")
+	}
+	return nil
+}
+
+// stamp is the store clock as a TSLayout string in the clock's own
+// location (always a numeric offset, never Z) and its Unix seconds: the
+// text column and its *_unix companion of one instant.
 func (s *Store) stamp() (string, int64) {
 	t := s.now()
-	return t.Format(time.RFC3339), t.Unix()
+	return t.Format(outbox.TSLayout), t.Unix()
+}
+
+// unsafeStateCheck runs before SQLite touches the path: the database and
+// each existing sidecar must be regular files, and outside Windows none
+// of them may carry group or other mode bits, nor may the parent
+// directory allow group or other writes. The errors name the file and
+// the reason, never its content.
+func unsafeStateCheck(path string) error {
+	type state struct {
+		path string
+		fi   os.FileInfo
+	}
+	var existing []state
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+		st, err := os.Lstat(p)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s is a symlink", ErrUnsafeState, p)
+		}
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("%w: %s is not a regular file", ErrUnsafeState, p)
+		}
+		existing = append(existing, state{path: p, fi: st})
+	}
+	if runtime.GOOS != "windows" {
+		for _, st := range existing {
+			if perm := st.fi.Mode().Perm() & 0o077; perm != 0 {
+				return fmt.Errorf("%w: %s has group or other mode bits (%o)", ErrUnsafeState, st.path, perm)
+			}
+		}
+		dir := filepath.Dir(path)
+		if dir != "" {
+			dst, err := os.Lstat(dir)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil // MkdirAll creates it at 0700
+				}
+				return err
+			}
+			if perm := dst.Mode().Perm() & 0o022; perm != 0 {
+				return fmt.Errorf("%w: %s allows group or other writes (%o)", ErrUnsafeState, dir, perm)
+			}
+		}
+	}
+	return nil
 }

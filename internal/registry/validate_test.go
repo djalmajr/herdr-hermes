@@ -2,9 +2,13 @@ package registry
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/herdr-hermes/internal/outbox"
 )
 
 // TestNormalizePR: the accepted forms reduce to the decimal number;
@@ -383,3 +387,110 @@ func TestCodePointLimit(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// TestAdmissionCaps: every admission cap admits the N-th row and refuses
+// the N+1-th with an ErrInvalid whose text is "<what> limit reached" (R7c).
+func TestAdmissionCaps(t *testing.T) {
+	t.Run("nodes", func(t *testing.T) {
+		s := openStore(t)
+		for i := 1; i < MaxNodes; i++ {
+			if _, err := s.db.Exec(`INSERT INTO nodes(maquina) VALUES(?)`, fmt.Sprintf("node-%03d", i)); err != nil {
+				t.Fatalf("seed node %d: %v", i, err)
+			}
+		}
+		if err := s.SetNode(NodeUpdate{Maquina: fmt.Sprintf("node-%03d", MaxNodes)}); err != nil {
+			t.Fatalf("the %d-th node: %v", MaxNodes, err)
+		}
+		err := s.SetNode(NodeUpdate{Maquina: "node-999"})
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "nodes limit reached") {
+			t.Fatalf("65th node: err = %v, want the nodes limit refusal", err)
+		}
+		if _, err := s.Ingest(recordBase(func(r *outbox.Record) { r.Maquina = "node-999" })); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("record for a new 65th node: err = %v, want ErrInvalid", err)
+		}
+	})
+	t.Run("jobs", func(t *testing.T) {
+		s := openStore(t)
+		for i := 1; i < MaxJobs; i++ {
+			if _, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id) VALUES('node-a', ?, 'job', ?)`,
+				fmt.Sprintf("j%04d", i), fmt.Sprintf("j%04d", i)); err != nil {
+				t.Fatalf("seed job %d: %v", i, err)
+			}
+		}
+		if !mustIngest(t, s, recordBase(func(r *outbox.Record) {
+			r.JobID = ptr("j-last")
+			r.IdempotencyKey = "j-last:1"
+			r.Dados = eventData(1, jobapi.TypeAccepted, "x", nil)
+		})) {
+			t.Fatal("the 1000th live job: applied = false")
+		}
+		_, err := s.Ingest(recordBase(func(r *outbox.Record) {
+			r.JobID = ptr("j-more")
+			r.IdempotencyKey = "j-more:1"
+			r.Dados = eventData(1, jobapi.TypeAccepted, "x", nil)
+		}))
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "jobs limit reached") {
+			t.Fatalf("1001th live job: err = %v, want the jobs limit refusal", err)
+		}
+	})
+	t.Run("claims", func(t *testing.T) {
+		s := openStore(t)
+		for i := 1; i < MaxClaims; i++ {
+			if _, err := s.db.Exec(`INSERT INTO claims(id, agente, card, criado, criado_unix, expira, expira_unix)
+				VALUES(?,?,?,?,?,?,?)`,
+				fmt.Sprintf("%032x", i), "dja", fmt.Sprintf("dja-%04d", i),
+				"2026-10-10T12:00:00-03:00", fixedNow.Unix(),
+				"2026-10-10T13:00:00-03:00", fixedNow.Unix()+3600); err != nil {
+				t.Fatalf("seed claim %d: %v", i, err)
+			}
+		}
+		res, err := s.Check(CheckRequest{Agente: "dja", Card: "dja-9998"})
+		if err != nil || res.Status != CheckOK {
+			t.Fatalf("the 1000th claim: %v %q", err, res.Status)
+		}
+		res, err = s.Check(CheckRequest{Agente: "dja", Card: "dja-9999"})
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "claims limit reached") {
+			t.Fatalf("1001th claim: %v %q, want the claims limit refusal", err, res.Status)
+		}
+	})
+	t.Run("policies", func(t *testing.T) {
+		s := openStore(t)
+		for i := 1; i < MaxPolicies; i++ {
+			if _, err := s.db.Exec(`INSERT INTO policies(escopo, valor, hold, atualizado) VALUES('projeto', ?, 1, ?)`,
+				fmt.Sprintf("org%03d/repo", i), "2026-10-10T12:00:00-03:00"); err != nil {
+				t.Fatalf("seed policy %d: %v", i, err)
+			}
+		}
+		if err := s.SetPolicy(PolicyInput{Escopo: EscopoProjeto, Valor: fmt.Sprintf("org%03d/repo", MaxPolicies), Hold: true}); err != nil {
+			t.Fatalf("the 1000th policy: %v", err)
+		}
+		err := s.SetPolicy(PolicyInput{Escopo: EscopoProjeto, Valor: "org-9999/repo", Hold: true})
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "policies limit reached") {
+			t.Fatalf("1001th policy: %v, want the policies limit refusal", err)
+		}
+		// Updating an existing policy is not capped.
+		if err := s.SetPolicy(PolicyInput{Escopo: EscopoProjeto, Valor: "org001/repo", Hold: true}); err != nil {
+			t.Fatalf("updating an existing policy: %v", err)
+		}
+	})
+	t.Run("folders", func(t *testing.T) {
+		s := openStore(t)
+		for i := 1; i < MaxFolders; i++ {
+			if _, err := s.db.Exec(`INSERT INTO folders(maquina, caminho, pedido, criado) VALUES('node-a', ?, 'x', ?)`,
+				fmt.Sprintf("p%04d", i), "2026-10-10T12:00:00-03:00"); err != nil {
+				t.Fatalf("seed folder %d: %v", i, err)
+			}
+		}
+		if err := s.SetFolder(FolderInput{Maquina: "node-a", Caminho: fmt.Sprintf("p%04d", MaxFolders), Pedido: "x"}); err != nil {
+			t.Fatalf("the 1000th folder: %v", err)
+		}
+		err := s.SetFolder(FolderInput{Maquina: "node-a", Caminho: "p-9999", Pedido: "x"})
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "folders limit reached") {
+			t.Fatalf("1001th folder: %v, want the folders limit refusal", err)
+		}
+		// Updating an existing folder is not capped.
+		if err := s.SetFolder(FolderInput{Maquina: "node-a", Caminho: "p0001", Pedido: "y"}); err != nil {
+			t.Fatalf("updating an existing folder: %v", err)
+		}
+	})
+}

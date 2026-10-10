@@ -22,14 +22,15 @@ The registry infers nothing that no producer reports; an unknown value is `null`
 
 ## Ownership from the workspace name
 
-A workspace named `hm-<agent>-<type>-<ref>` (type `impl`, `review`, `fix` or `plan`) is a job owned by `<agent>`, keyed by its Herdr workspace id. The name is split on `-`; it resolves only when exactly one token is one of the four types with at least one token before and after it, for example `hm-example-agent-impl-card12` (agent `example-agent`, type `impl`, ref `card12`). A name with no such token or with more than one (`hm-a-review-impl-x`) is not guessed: the job is listed with a `null` owner. A workspace named `job-<id>` is the workspace of the contract job `<id>`. Any other workspace is not a job and is ignored. A claim made with `--workspace <name>` gives its card, project, branch and pull request to the workspace job when it appears, and its agent when the name did not resolve.
+A workspace named `hm-<agent>-<type>-<ref>` (type `impl`, `review`, `fix` or `plan`) is a job owned by `<agent>`, keyed by its Herdr workspace id. The name is split on `-`; it resolves only when exactly one token is one of the four types with at least one token before and after it, for example `hm-example-agent-impl-card12` (agent `example-agent`, type `impl`, ref `card12`). A name with no such token or with more than one (`hm-a-review-impl-x`) is not guessed: the job is listed with a `null` owner. The owner is derived again from the label on every successful poll, so a renamed workspace changes its owner and ref, and a label that no longer resolves clears them. A workspace named `job-<id>` is the workspace of the contract job `<id>`. Any other workspace is not a job and is ignored. A claim made with `--workspace <name>` gives its card, project, branch and pull request to the workspace job when it appears, and its agent when the name did not resolve.
 
 ## Projection
 
-- `job_event`: the job keyed by its id. `question` and `blocked` mark it as waiting for a person and `unblocked` clears that; `terminal` marks it terminal with its `refs.exit`, waiting for a person when the exit is 7, 11 or 14 (the contract's blocked exits); `cleanup` removes the job (it is remembered for 7 days so a replayed event cannot bring it back); `refs.pr` fills the pull request. Every other type, including types added later to the contract, only moves the phase. Events are deduplicated by job and seq; an event older than the latest one is stored but does not move the state. Only the contract refs `agente`, `papel`, `pane`, `sha`, `pr`, `motivo`, `exit` and `seq_ref` are kept: local paths (`report`, `brief`) are dropped.
+- `job_event`: the job keyed by its id. `question` and `blocked` mark it as waiting for a person and `unblocked` clears that; `terminal` marks it terminal with its `refs.exit`, waiting for a person when the exit is 7, 11 or 14 (the contract's blocked exits); `cleanup` removes the job (it is remembered for 7 days so a replayed event cannot bring it back); `refs.pr` fills the pull request. Every other type, including types added later to the contract, only moves the phase. Events are deduplicated by job and seq; an event older than the latest one is stored but does not move the state. Only the contract refs `agente`, `papel`, `pane`, `sha`, `pr`, `motivo`, `exit` and `seq_ref` are kept: local paths (`report`, `brief`) are dropped. A refused record (a closed job, a seq already stored, or a replay older than every stored event) changes nothing. An event `tipo` must match `^[a-z][a-z0-9_]{0,63}$`, and a kept ref value must be a string of at most 200 bytes, a number or a boolean; other values are dropped.
 - `dispatch` and `amend`: the job exists from then on.
-- `session`: a session with a job fills the card, branch and pull request of that job; a session without a job is listed as active work keyed by its project and branch until its `end`. Records older than the latest applied one are ignored.
+- `session`: a session with a job sets the card, branch and pull request of that job; a session without a job is listed as active work keyed by its project and branch until its `end`. A newer record replaces every valid field it carries and keeps the ones it omits; records older than the latest applied one are ignored, and an `end` that arrives before anything else of its session closes it at once.
 - `decision`: only the job's last activity; decisions are not kept here.
+- A job created or updated by a pushed record keeps that provenance: a poll that stops listing its workspace only clears the workspace fields, and the job leaves only with its `cleanup` event (or its session `end`).
 - Idle time is the time since the latest event or record of the job, or since the poll last saw its workspace working or change status; it is never more precise than the poll interval.
 - A node is online when a poll succeeded or a record arrived in the last 3 minutes. When a poll fails, the jobs of that node stay listed with `obsoleto: true`: unknown is not free.
 
@@ -58,19 +59,19 @@ herdr-hermes jobs folder clear --maquina <label> --caminho <path> [--server <url
 herdr-hermes jobs node set --maquina <label> [--manutencao on|off] [--motivo <text>] [--soho-version <version>] [--runners <a,b>] [--server <url>]
 ```
 
-- `serve` listens on `--listen` (default `127.0.0.1:7429`), which must be a loopback address; a non-loopback address exits 2. The database defaults to `registry.db` in the state directory. It prints one JSON line when it is listening, `{"status":"serving","listen":"127.0.0.1:7429","maquinas":["local","node-b"],"poll_s":60}`, and serves until it is interrupted. It is a writing command, refused under `HERDR_HERMES_NOWRITE=1`.
+- `serve` listens on `--listen` (default `127.0.0.1:7429`), which must be a loopback address; a non-loopback address, or a name that does not bind to a loopback address, exits 2. The database defaults to `registry.db` in the state directory. It prints one JSON line when it is listening, `{"status":"serving","listen":"127.0.0.1:7429","maquinas":["local","node-b"],"poll_s":60}`, and serves until it is interrupted. It is a writing command, refused under `HERDR_HERMES_NOWRITE=1`.
 - `jobs` prints the server's answer as one JSON line. `--server` defaults to `http://127.0.0.1:7429`; plain HTTP is accepted only for a loopback host. Under `HERDR_HERMES_NOWRITE=1` only the plain inventory runs.
 
 Exit codes: 0 success; 2 bad usage or a request the registry rejected as invalid; 3 unknown claim, policy or folder; 4 the registry is unreachable or answered unexpectedly, or `serve` could not open its database or listen; 44 the pre-dispatch check refused the request (duplicate work or a hold).
 
 ## HTTP API
 
-Every answer is one JSON line. Errors are `{"status":"<code>","motivo":"<text>"}` with `invalid` (400), `not_found` (404), `method_not_allowed` (405), `too_large` (413), `unsupported_media_type` (415) and `error` (500).
+Every answer is one JSON line. A request whose `Host` is not a loopback authority (`localhost` or a loopback IP, with or without a port), or that carries an `Origin` other than an `http` or `https` loopback origin, is refused before routing. Errors are `{"status":"<code>","motivo":"<text>"}` with `forbidden` (403, the authority rule), `invalid` (400), `not_found` (404), `method_not_allowed` (405), `too_large` (413), `unsupported_media_type` (415) and `error` (500).
 
 | method and path | body | answer |
 |---|---|---|
 | `GET /v1/health` | — | `{"status":"ok","schema":1}` |
-| `POST /v1/ingest` | one outbox record (at most 1 MiB) | `{"status":"ok","aplicado":true}`; `aplicado` is false for a duplicate |
+| `POST /v1/ingest` | one outbox record (at most 1 MiB) | `{"status":"ok","aplicado":true}`; `aplicado` is false for a duplicate or a refused replay |
 | `GET /v1/jobs[?maquina=&agente=]` | — | the inventory |
 | `POST /v1/check` | `{"agente","card","projeto","branch","pr","workspace","maquina","ttl_s"}` | 200 `{"status":"ok","claim":{…}}`, or 409 `{"status":"duplicate"|"hold","conflitos":[…]}` |
 | `DELETE /v1/claims/{id}` | — | `{"status":"ok"}` or 404 |
@@ -90,7 +91,7 @@ The inventory:
 
 ## Storage
 
-The database is SQLite in WAL mode (a pure Go driver, no C toolchain), created with mode 0600 in a 0700 directory. It holds only current state: a removed job is remembered for 7 days as a tombstone, the events are capped per job, and an expired claim is deleted at the next check.
+The database is SQLite in WAL mode (a pure Go driver, no C toolchain), created with mode 0600 in a 0700 directory. `serve` refuses to open a database or a `-wal`, `-shm` or `-journal` file that is a symlink or not a regular file and, outside Windows, one with group or other permission bits or in a directory writable by group or other. Every timestamp it writes or returns carries a numeric offset in the local zone, never `Z`. Admission is bounded: at most 64 nodes, 1000 live jobs, 1000 live claims, 1000 policies and 1000 folder records; a request that would pass a bound is refused as invalid. It holds only current state: a removed job is remembered for 7 days as a tombstone, the events are capped per job, and an expired claim is deleted at the next check.
 
 ## Limitations
 

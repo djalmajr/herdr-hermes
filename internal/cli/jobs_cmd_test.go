@@ -290,8 +290,8 @@ func TestJobsErrors(t *testing.T) {
 		}
 		requireCapture(t, ch)
 	})
-	t.Run("body over the 16 MiB cap maps to 4 malformed", func(t *testing.T) {
-		big := strings.Repeat("a", (16<<20)+1)
+	t.Run("body over the 64 MiB cap maps to 4 malformed", func(t *testing.T) {
+		big := strings.Repeat("a", (64<<20)+1)
 		srv, ch, _ := captureServer(t, http.StatusOK, []byte(`{"pad":"`+big+`"}`), false)
 		dir := t.TempDir()
 		stdout, _, exit := runCLI(t, dir, false, "jobs", "--server", srv.URL)
@@ -300,6 +300,18 @@ func TestJobsErrors(t *testing.T) {
 		}
 		if !strings.Contains(stdout, "registry answered malformed") {
 			t.Errorf("stdout = %q, want registry answered malformed", stdout)
+		}
+		requireCapture(t, ch)
+	})
+	// Boundary: a full response just under the 64 MiB cap is accepted and
+	// printed; the old 16 MiB cap refused it.
+	t.Run("body just under the 64 MiB cap passes", func(t *testing.T) {
+		big := strings.Repeat("a", 64<<20-10) // with the JSON padding, 64 MiB - 4 bytes
+		srv, ch, _ := captureServer(t, http.StatusOK, []byte(`{"pad":"`+big+`"}`), false)
+		dir := t.TempDir()
+		stdout, _, exit := runCLI(t, dir, false, "jobs", "--server", srv.URL)
+		if exit != 0 {
+			t.Fatalf("jobs under-cap body exit = %d, want 0 (stdout %q)", exit, stdout)
 		}
 		requireCapture(t, ch)
 	})
@@ -322,8 +334,9 @@ func TestJobsErrors(t *testing.T) {
 // query, body and headers — and the 200 path (compact single line, exit
 // 0). No request ever carries an Authorization header.
 //
-// Mutation captured: dropping the 16 MiB body cap makes the over-cap body
-// parse and the case exit 0 instead of 4.
+// Mutation captured: dropping the 64 MiB body cap (or keeping the old
+// 16 MiB one) makes the just-under-cap body exit 4 instead of 0, and
+// raising it makes the over-cap body exit 0 instead of 4.
 func TestJobsRequests(t *testing.T) {
 	ok := []byte(`{"status":"ok"}`)
 	t.Run("inventory", func(t *testing.T) {
@@ -462,6 +475,24 @@ func TestJobsRequests(t *testing.T) {
 		}
 		if c.body != `{"manutencao":true,"manutencao_motivo":"maintenance","soho_version":"0.9.1","runners":["a","b"]}` {
 			t.Errorf("node set body = %q", c.body)
+		}
+		assertWireHeaders(t, c, true)
+	})
+	// Regression: --manutencao off sent nothing, so a node that left
+	// maintenance never left it. on and off are both sent; absent sends
+	// nothing.
+	// Mutation captured: sending off as nil (the pre-fix boolPtr
+	// behavior) drops the field and the off body is {}.
+	t.Run("node set manutencao off sends false", func(t *testing.T) {
+		srv, ch, _ := captureServer(t, http.StatusOK, ok, false)
+		dir := t.TempDir()
+		stdout, _, exit := runCLI(t, dir, false, "jobs", "--server", srv.URL, "node", "set", "--maquina", "m1", "--manutencao", "off")
+		if exit != 0 {
+			t.Fatalf("jobs node set off exit = %d (stdout %q)", exit, stdout)
+		}
+		c := requireCapture(t, ch)
+		if c.body != `{"manutencao":false}` {
+			t.Errorf("node set off body = %q, want {\"manutencao\":false}", c.body)
 		}
 		assertWireHeaders(t, c, true)
 	})

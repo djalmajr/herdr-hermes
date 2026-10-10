@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -233,6 +234,31 @@ func TestServeNowrite(t *testing.T) {
 		t.Errorf("stdout = %q", stdout)
 	}
 	assertDirEmpty(t, dir)
+}
+
+// TestListenerIsLoopback: the post-bind check is true only for loopback
+// TCP listener addresses; a non-TCP address and a nil address fail it.
+//
+// Mutation captured: never checking the bound address (the post-Listen
+// gate in cmdServe) lets a non-loopback bind through; this test fails
+// to build when the helper is reverted with the fix.
+func TestListenerIsLoopback(t *testing.T) {
+	cases := []struct {
+		addr net.Addr
+		want bool
+	}{
+		{&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5}, true},
+		{&net.TCPAddr{IP: net.ParseIP("::1"), Port: 5}, true},
+		{&net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 5}, false},
+		{&net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 5}, false},
+		{&net.UnixAddr{Name: "/tmp/x"}, false},
+		{nil, false},
+	}
+	for _, c := range cases {
+		if got := listenerIsLoopback(c.addr); got != c.want {
+			t.Errorf("listenerIsLoopback(%v) = %v, want %v", c.addr, got, c.want)
+		}
+	}
 }
 
 // TestServeEndToEnd: serve runs the inventory push, the poll and the HTTP

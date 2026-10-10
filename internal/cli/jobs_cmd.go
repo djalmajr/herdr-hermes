@@ -17,7 +17,7 @@ import (
 const (
 	jobsDefaultServer = "http://127.0.0.1:7429"
 	jobsUsageText     = "usage: jobs [check|release|policy|folder|node] …"
-	jobsRespCap       = 16 << 20
+	jobsRespCap       = 64 << 20
 	jobsTimeout       = 30 * time.Second
 )
 
@@ -342,7 +342,7 @@ func (f jobsForm) buildRequest(base string) (method, target string, body []byte)
 			Motivo      *string   `json:"manutencao_motivo,omitempty"`
 			SohoVersion *string   `json:"soho_version,omitempty"`
 			Runners     *[]string `json:"runners,omitempty"`
-		}{Manutencao: boolPtr(f.manutencao == "on"), Motivo: strPtr(f.motivo), SohoVersion: strPtr(f.sohoVersion), Runners: runnerList(f.runners)})
+		}{Manutencao: manutencaoPtr(f.manutencao), Motivo: strPtr(f.motivo), SohoVersion: strPtr(f.sohoVersion), Runners: runnerList(f.runners)})
 	}
 	if len(q) > 0 {
 		target += "?" + q.Encode()
@@ -373,12 +373,19 @@ func strPtr(s string) *string {
 	return &s
 }
 
-func boolPtr(b bool) *bool {
-	if !b {
-		return nil
+// manutencaoPtr maps the --manutencao flag to its wire value: on and off
+// are both sent (true and false) so a node can leave maintenance; absent
+// sends nothing.
+func manutencaoPtr(s string) *bool {
+	switch s {
+	case "on":
+		v := true
+		return &v
+	case "off":
+		v := false
+		return &v
 	}
-	v := true
-	return &v
+	return nil
 }
 
 // runnerList splits the comma-separated --runners value.
@@ -453,7 +460,7 @@ func cmdJobs(args []string, env Env) int {
 		return 4
 	}
 	if over {
-		_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs: response body exceeds 16 MiB")
+		_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs: response body exceeds 64 MiB")
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry answered malformed"}))
 		return 4
 	}

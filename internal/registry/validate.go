@@ -21,6 +21,7 @@ var (
 	workspacePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	jobIDPattern       = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 	runnerPattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,31}$`)
+	eventTypePattern   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	digitsPattern      = regexp.MustCompile(`^[0-9]+$`)
 	claimIDPattern     = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
@@ -102,6 +103,15 @@ func validateWorkspace(workspace string) error {
 func validateJobID(jobID string) error {
 	if !jobIDPattern.MatchString(jobID) {
 		return invalidErr("job_id", "bad format")
+	}
+	return nil
+}
+
+// validateEventType checks the event tipo shape (R7a); the contract types
+// all pass it, and a new well-formed type does not break the ingest.
+func validateEventType(tipo string) error {
+	if !eventTypePattern.MatchString(tipo) {
+		return invalidErr("tipo", "bad format")
 	}
 	return nil
 }

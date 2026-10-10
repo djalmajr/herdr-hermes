@@ -186,6 +186,9 @@ func doReq(t *testing.T, h http.Handler, method, target, body string, headers ma
 		rdr = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, target, rdr)
+	// The handler refuses a non-loopback authority; httptest's default
+	// Host is example.com, so set the loopback one explicitly.
+	req.Host = "127.0.0.1:7429"
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -222,6 +225,69 @@ func wantJSONLine(t *testing.T, body, status, motivo string) {
 	}
 	if e.Motivo != motivo {
 		t.Errorf("response motivo = %q, want %q (body %s)", e.Motivo, motivo, body)
+	}
+}
+
+// TestHandlerAuthority: before any routing, the handler refuses with a
+// one-line 403 a request whose Host is not a loopback authority or that
+// carries an Origin that is not an http(s) loopback origin; an absent
+// Origin is fine; the backend receives no call on a refusal.
+//
+// Mutation captured: removing the authority gate lets the foreign Host
+// and Origin cases reach the backend: they answer 200 and the backend's
+// gotInv flag is set.
+func TestHandlerAuthority(t *testing.T) {
+	const forbidden = `{"status":"forbidden","motivo":"request authority is not loopback"}` + "\n"
+	for _, tc := range []struct {
+		name   string
+		host   string
+		origin string
+		want   int
+	}{
+		{"loopback v4", "127.0.0.1:7429", "", http.StatusOK},
+		{"loopback name", "localhost:7429", "", http.StatusOK},
+		{"loopback v6", "[::1]:7429", "", http.StatusOK},
+		{"uppercase name bare", "LOCALHOST", "", http.StatusOK},
+		{"foreign name", "example.com", "", http.StatusForbidden},
+		{"foreign name with port", "example.com:7429", "", http.StatusForbidden},
+		{"foreign ip", "192.0.2.1:7429", "", http.StatusForbidden},
+		{"non-loopback ip", "0.0.0.0:7429", "", http.StatusForbidden},
+		{"empty host", "", "", http.StatusForbidden},
+		{"loopback origin", "127.0.0.1:7429", "http://127.0.0.1:7429", http.StatusOK},
+		{"loopback https origin", "localhost:7429", "https://localhost", http.StatusOK},
+		{"absent origin", "127.0.0.1:7429", "", http.StatusOK},
+		{"foreign origin", "127.0.0.1:7429", "http://example.com", http.StatusForbidden},
+		{"null origin", "127.0.0.1:7429", "null", http.StatusForbidden},
+		{"file origin", "127.0.0.1:7429", "file://", http.StatusForbidden},
+		{"origin with path", "127.0.0.1:7429", "http://127.0.0.1:7429/x", http.StatusForbidden},
+		{"origin with userinfo", "127.0.0.1:7429", "http://user@127.0.0.1:7429", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &fakeBackend{}
+			h := NewHandler(b)
+			req := httptest.NewRequest("GET", "/v1/jobs", nil)
+			req.Host = tc.host
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("Host %q origin %q status = %d, want %d (body %q)", tc.host, tc.origin, w.Code, tc.want, w.Body.String())
+			}
+			if tc.want == http.StatusForbidden {
+				if w.Body.String() != forbidden {
+					t.Errorf("Host %q origin %q body = %q, want %q", tc.host, tc.origin, w.Body.String(), forbidden)
+				}
+				if b.gotInv {
+					t.Errorf("Host %q origin %q: the backend was called, want no call", tc.host, tc.origin)
+				}
+				return
+			}
+			if !b.gotInv {
+				t.Errorf("Host %q origin %q: the backend was not called", tc.host, tc.origin)
+			}
+		})
 	}
 }
 

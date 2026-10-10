@@ -47,6 +47,9 @@ func (s *Store) Ingest(rec outbox.Record) (bool, error) {
 		if ev.Seq < 1 {
 			return false, invalidErr("seq", "must be positive")
 		}
+		if err := validateEventType(ev.Tipo); err != nil {
+			return false, err
+		}
 		if rec.IdempotencyKey != *rec.JobID+":"+strconv.FormatInt(ev.Seq, 10) {
 			return false, invalidErr("idempotency_key", "must be <job_id>:<event seq>")
 		}
@@ -199,11 +202,14 @@ func decodeSession(rec outbox.Record) (sessionDados, error) {
 
 // touchNode upserts the node and moves its last contact forward.
 func touchNode(tx *sql.Tx, maquina string, at time.Time) error {
+	if err := admitNewNode(tx, maquina); err != nil {
+		return err
+	}
 	_, err := tx.Exec(`INSERT INTO nodes(maquina, ultimo_contato, ultimo_contato_unix) VALUES(?,?,?)
 		ON CONFLICT(maquina) DO UPDATE SET
 			ultimo_contato = excluded.ultimo_contato,
 			ultimo_contato_unix = excluded.ultimo_contato_unix`,
-		maquina, at.Format(time.RFC3339), at.Unix())
+		maquina, at.Format(outbox.TSLayout), at.Unix())
 	return err
 }
 
@@ -339,7 +345,9 @@ func ringEvents(tx *sql.Tx, maquina, chave string) ([]ringEvent, error) {
 
 // ingestJobEvent applies one job event: the job row, the per-job event
 // ring and the event's state mapping. It reports applied = false for a
-// tombstoned job, a duplicate and a stale replay below a full ring.
+// tombstoned job, a duplicate and a stale replay below a full ring; the
+// refusals are decided before the job row is touched, so a refused record
+// changes no job column.
 func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.Event, now time.Time) (bool, error) {
 	jobID := *rec.JobID
 	row, err := jobRowOf(tx, rec.Maquina, jobID)
@@ -350,19 +358,6 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 		// A tombstoned job ignores every event.
 		return false, nil
 	}
-	if row == nil {
-		if _, err := tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, projeto, fonte_push, obsoleto)
-			VALUES(?,?,?, ?,?, 1, 0)`,
-			rec.Maquina, jobID, OrigemJob, jobID, nullStr(rec.Projeto)); err != nil {
-			return false, err
-		}
-	} else {
-		if _, err := tx.Exec(`UPDATE jobs SET fonte_push = 1, obsoleto = 0, projeto = COALESCE(projeto, ?)
-			WHERE maquina = ? AND chave = ?`, nullStr(rec.Projeto), rec.Maquina, jobID); err != nil {
-			return false, err
-		}
-	}
-
 	stored, err := ringEvents(tx, rec.Maquina, jobID)
 	if err != nil {
 		return false, err
@@ -382,6 +377,21 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 		// The event ts came from the machine's outbox; a broken ts must
 		// not corrupt the registry.
 		return false, invalidErr("ts", "must be RFC 3339 with an explicit offset")
+	}
+	if row == nil {
+		if err := admitNewLiveJob(tx); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, projeto, fonte_push, obsoleto)
+			VALUES(?,?,?, ?,?, 1, 0)`,
+			rec.Maquina, jobID, OrigemJob, jobID, nullStr(rec.Projeto)); err != nil {
+			return false, err
+		}
+	} else {
+		if _, err := tx.Exec(`UPDATE jobs SET fonte_push = 1, obsoleto = 0, projeto = COALESCE(projeto, ?)
+			WHERE maquina = ? AND chave = ?`, nullStr(rec.Projeto), rec.Maquina, jobID); err != nil {
+			return false, err
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo, refs) VALUES(?,?,?,?,?,?,?)`,
 		rec.Maquina, jobID, ev.Seq, ev.TS, ev.Tipo, cutResumo(ev.Resumo), reduceRefs(ev.Refs)); err != nil {
@@ -485,8 +495,10 @@ func cutResumo(resumo string) string {
 	return string([]rune(resumo)[:MaxResumo])
 }
 
-// reduceRefs keeps only the allowlisted refs keys (registry.EventRefsKeys);
-// the local paths (report, brief) are dropped. nil when empty.
+// reduceRefs keeps only the allowlisted refs keys (registry.EventRefsKeys)
+// whose value is a JSON string of at most MaxRefValueBytes bytes, a JSON
+// number or a boolean; the local paths (report, brief) and the other
+// values are dropped, never an error. nil when empty.
 func reduceRefs(refs map[string]any) *string {
 	if len(refs) == 0 {
 		return nil
@@ -497,7 +509,7 @@ func reduceRefs(refs map[string]any) *string {
 	}
 	out := make(map[string]any, 0)
 	for k, v := range refs {
-		if allowed[k] {
+		if allowed[k] && keptRefValue(v) {
 			out[k] = v
 		}
 	}
@@ -510,6 +522,23 @@ func reduceRefs(refs map[string]any) *string {
 	}
 	v := string(b)
 	return &v
+}
+
+// keptRefValue: a JSON string of at most 200 bytes, a JSON number or a
+// boolean is kept; anything else (object, array, null, longer string) is
+// dropped.
+const MaxRefValueBytes = 200
+
+func keptRefValue(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return len(t) <= MaxRefValueBytes
+	case float64:
+		return true
+	case bool:
+		return true
+	}
+	return false
 }
 
 // parseRefPR extracts a parseable refs.pr.
@@ -547,13 +576,15 @@ func parseSaida(refs map[string]any) *int {
 	return nil
 }
 
-// maxUltima sets the last activity forward only, by unix seconds.
+// maxUltima sets the last activity forward only, by unix seconds, and
+// stamps the push provenance of the job it touches.
 func maxUltima(tx *sql.Tx, maquina, chave string, ts time.Time) error {
 	_, err := tx.Exec(`UPDATE jobs SET
+		fonte_push = 1,
 		ultima_atividade = CASE WHEN ultima_atividade_unix IS NULL OR ultima_atividade_unix < ? THEN ? ELSE ultima_atividade END,
 		ultima_atividade_unix = CASE WHEN ultima_atividade_unix IS NULL OR ultima_atividade_unix < ? THEN ? ELSE ultima_atividade_unix END
 		WHERE maquina = ? AND chave = ?`,
-		ts.Unix(), ts.Format(time.RFC3339), ts.Unix(), ts.Unix(), maquina, chave)
+		ts.Unix(), ts.Format(outbox.TSLayout), ts.Unix(), ts.Unix(), maquina, chave)
 	return err
 }
 
@@ -572,7 +603,7 @@ func ingestDispatch(tx *sql.Tx, rec outbox.Record, ts time.Time) (bool, error) {
 	if row == nil {
 		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, projeto, fonte_push, obsoleto, ultima_atividade, ultima_atividade_unix)
 			VALUES(?,?, ?, ?, ?, 1, 0, ?, ?)`,
-			rec.Maquina, jobID, OrigemJob, jobID, nullStr(rec.Projeto), ts.Format(time.RFC3339), ts.Unix())
+			rec.Maquina, jobID, OrigemJob, jobID, nullStr(rec.Projeto), ts.Format(outbox.TSLayout), ts.Unix())
 		return true, err
 	}
 	if _, err = tx.Exec(`UPDATE jobs SET fonte_push = 1, obsoleto = 0, projeto = COALESCE(projeto, ?)
@@ -583,7 +614,11 @@ func ingestDispatch(tx *sql.Tx, rec outbox.Record, ts time.Time) (bool, error) {
 }
 
 // ingestSession applies a session record to its target: the named job or
-// the sessao:<projeto>#<branch> row.
+// the sessao:<projeto>#<branch> row. An accepted record replaces the
+// stored value of every validated non-empty field it carries; a field it
+// omits (or carries invalid) keeps the stored value. A jobless end for a
+// target that does not exist yet creates the row already tombstoned.
+// Every job it creates or updates gets the push provenance.
 func ingestSession(tx *sql.Tx, rec outbox.Record, sd sessionDados, ts, now time.Time) (bool, error) {
 	projeto := sd.Projeto
 	if projeto == "" {
@@ -613,19 +648,37 @@ func ingestSession(tx *sql.Tx, rec outbox.Record, sd sessionDados, ts, now time.
 		if origem == OrigemJob {
 			jobID = strPtr(chave)
 		}
-		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, card, branch, pr, projeto, sessao_ts_unix, ultima_atividade, ultima_atividade_unix)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-			rec.Maquina, chave, origem, jobID, sd.Card, sd.Branch, sd.PR, nullStr(projeto), ts.Unix(), ts.Format(time.RFC3339), ts.Unix())
+		encerrado := 0
+		var encerradoUnix *int64
+		if sd.Acao == "end" && origem == OrigemSessao {
+			// The end-first target is created already tombstoned, so it
+			// never appears in the inventory or the check.
+			encerrado = 1
+			v := now.Unix()
+			encerradoUnix = &v
+		}
+		if encerrado == 0 {
+			if err := admitNewLiveJob(tx); err != nil {
+				return false, err
+			}
+		}
+		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, card, branch, pr, projeto, fonte_push, sessao_ts_unix, encerrado, encerrado_unix, ultima_atividade, ultima_atividade_unix)
+			VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?)`,
+			rec.Maquina, chave, origem, jobID, sd.Card, sd.Branch, sd.PR, nullStr(projeto), ts.Unix(), encerrado, encerradoUnix, ts.Format(outbox.TSLayout), ts.Unix())
 		return true, err
 	}
+	// A validated non-empty field replaces the stored value; an omitted
+	// field keeps it.
+	proj := nullStr(projeto)
 	if _, err = tx.Exec(`UPDATE jobs SET
 		sessao_ts_unix = ?,
-		card = COALESCE(card, ?),
-		branch = COALESCE(branch, ?),
-		pr = COALESCE(pr, ?),
-		projeto = COALESCE(projeto, ?)
+		fonte_push = 1,
+		card = CASE WHEN ? IS NULL THEN card ELSE ? END,
+		branch = CASE WHEN ? IS NULL THEN branch ELSE ? END,
+		pr = CASE WHEN ? IS NULL THEN pr ELSE ? END,
+		projeto = CASE WHEN ? IS NULL THEN projeto ELSE ? END
 		WHERE maquina = ? AND chave = ?`,
-		ts.Unix(), sd.Card, sd.Branch, sd.PR, nullStr(projeto), rec.Maquina, chave); err != nil {
+		ts.Unix(), sd.Card, sd.Card, sd.Branch, sd.Branch, sd.PR, sd.PR, proj, proj, rec.Maquina, chave); err != nil {
 		return false, err
 	}
 	if err := maxUltima(tx, rec.Maquina, chave, ts); err != nil {

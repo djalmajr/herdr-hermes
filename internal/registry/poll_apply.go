@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/djalmajr/herdr-hermes/internal/outbox"
 )
 
 // ApplyPoll applies the outcome of polling one machine, in one
@@ -21,7 +23,7 @@ func (s *Store) ApplyPoll(p PollResult) error {
 			return err
 		}
 		at := p.At
-		atTS := at.Format(time.RFC3339)
+		atTS := at.Format(outbox.TSLayout)
 		if p.OK {
 			if err := touchPollNode(tx, p.Maquina, p.HerdrVersion, at); err != nil {
 				return err
@@ -49,7 +51,7 @@ func (s *Store) ApplyPoll(p PollResult) error {
 // poll was valid, the contact and the version (never cleared by an empty
 // one).
 func touchPollNode(tx *sql.Tx, maquina, herdrVersion string, at time.Time) error {
-	atTS := at.Format(time.RFC3339)
+	atTS := at.Format(outbox.TSLayout)
 	_, err := tx.Exec(`INSERT INTO nodes(maquina, ultimo_poll, poll_status, ultimo_contato, ultimo_contato_unix, herdr_version)
 		VALUES(?, ?, 'ok', ?, ?, ?)
 		ON CONFLICT(maquina) DO UPDATE SET
@@ -75,10 +77,11 @@ func workspaceChave(label, id string) (key, origem string, ok bool) {
 	return "", "", false
 }
 
-// applyPollWorkspaces upserts one job row per seen workspace, binds the
-// matching claims and clears the rows that disappeared.
+// applyPollWorkspaces upserts one job row per seen workspace, re-derives
+// the owner of an hm row from its current label, binds the matching
+// claims and clears the rows that disappeared.
 func applyPollWorkspaces(tx *sql.Tx, p PollResult, at, now time.Time) error {
-	atTS := at.Format(time.RFC3339)
+	atTS := at.Format(outbox.TSLayout)
 	seen := make(map[string]bool, len(p.Workspaces))
 	for _, ws := range p.Workspaces {
 		chave, origem, ok := workspaceChave(ws.Label, ws.ID)
@@ -121,6 +124,23 @@ func applyPollWorkspaces(tx *sql.Tx, p PollResult, at, now time.Time) error {
 			var args []any
 			sets = append(sets, "workspace = ?", "workspace_id = ?", "herdr_status = ?", "obsoleto = 0", "visto_poll = ?", "fonte_poll = 1")
 			args = append(args, ws.Label, ws.ID, ws.AgentStatus, atTS)
+			if origem == OrigemWorkspace {
+				// The hm row re-derives its owner from the current label:
+				// a resolved name sets it, an unparsable one clears the
+				// name-derived owner and the ref; the claim binding runs
+				// after and may fill a null agente.
+				if n, resolved := ParseWorkspaceName(ws.Label); resolved {
+					sets = append(sets, "agente = ?", "agente_fonte = ?", "trabalho = ?", "ref = ?")
+					args = append(args, n.Agente, AgenteFonteNome, n.Trabalho, n.Ref)
+				} else {
+					sets = append(sets,
+						"trabalho = NULL",
+						"ref = NULL",
+						"agente = CASE WHEN agente_fonte = ? THEN NULL ELSE agente END",
+						"agente_fonte = CASE WHEN agente_fonte = ? THEN NULL ELSE agente_fonte END")
+					args = append(args, AgenteFonteNome, AgenteFonteNome)
+				}
+			}
 			if moves {
 				sets = append(sets, "ultima_atividade = ?", "ultima_atividade_unix = ?")
 				args = append(args, atTS, at.Unix())
@@ -221,7 +241,7 @@ func dropUnseen(tx *sql.Tx, maquina string, seen map[string]bool) error {
 // this poll: the since of a pane that was already waiting is kept, a new
 // pane starts at the poll time.
 func replaceWaits(tx *sql.Tx, p PollResult, at time.Time) error {
-	atTS := at.Format(time.RFC3339)
+	atTS := at.Format(outbox.TSLayout)
 	old, err := tx.Query(`SELECT pane, desde, desde_unix FROM waits WHERE maquina = ?`, p.Maquina)
 	if err != nil {
 		return err

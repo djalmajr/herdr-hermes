@@ -46,6 +46,9 @@ func (s *Store) SetPolicy(in PolicyInput) error {
 		return err
 	}
 	return s.tx(func(tx *sql.Tx) error {
+		if err := admitNewPolicy(tx, escopo, valor); err != nil {
+			return err
+		}
 		atualizado, _ := s.stamp()
 		_, err := tx.Exec(`INSERT INTO policies(escopo, valor, hold, prioridade, motivo, atualizado) VALUES(?,?,?,?,?,?)
 			ON CONFLICT(escopo, valor) DO UPDATE SET hold = excluded.hold, prioridade = excluded.prioridade, motivo = excluded.motivo, atualizado = excluded.atualizado`,
@@ -86,6 +89,9 @@ func (s *Store) SetFolder(in FolderInput) error {
 		return err
 	}
 	return s.tx(func(tx *sql.Tx) error {
+		if err := admitNewFolder(tx, in.Maquina, in.Caminho); err != nil {
+			return err
+		}
 		criado, _ := s.stamp()
 		_, err := tx.Exec(`INSERT INTO folders(maquina, caminho, tamanho_bytes, pedido, job, criado) VALUES(?,?,?,?,?,?)
 			ON CONFLICT(maquina, caminho) DO UPDATE SET tamanho_bytes = excluded.tamanho_bytes, pedido = excluded.pedido, job = excluded.job`,
@@ -141,6 +147,9 @@ func (s *Store) SetNode(u NodeUpdate) error {
 		}
 	}
 	return s.tx(func(tx *sql.Tx) error {
+		if err := admitNewNode(tx, u.Maquina); err != nil {
+			return err
+		}
 		cols := []string{"maquina"}
 		updates := make([]string, 0, 4)
 		args := []any{u.Maquina}

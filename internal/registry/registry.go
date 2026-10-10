@@ -41,6 +41,13 @@ const (
 	TombstoneTTL = 7 * 24 * time.Hour
 	// MaxResumo is the cut of an event resumo, in code points.
 	MaxResumo = 280
+
+	// Admission caps: what the registry admits before it refuses.
+	MaxNodes    = 64
+	MaxJobs     = 1000
+	MaxClaims   = 1000
+	MaxPolicies = 1000
+	MaxFolders  = 1000
 )
 
 // Job origins.

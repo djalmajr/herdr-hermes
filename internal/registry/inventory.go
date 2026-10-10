@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"sort"
 	"time"
+
+	"github.com/djalmajr/herdr-hermes/internal/outbox"
 )
 
 // Inventory reads the whole current state, as the jobs API returns it.
@@ -28,7 +30,7 @@ func (s *Store) Inventory(f Filter) (Inventory, error) {
 	defer txn.Rollback()
 	now := s.now()
 	inv := Inventory{
-		Gerado:    now.Format(time.RFC3339),
+		Gerado:    now.Format(outbox.TSLayout),
 		Nodes:     []Node{},
 		Jobs:      []Job{},
 		Esperas:   []Wait{},

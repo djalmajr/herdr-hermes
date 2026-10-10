@@ -312,3 +312,45 @@ func TestApplyPollSweep(t *testing.T) {
 		t.Errorf("stale tombstones left = %d, want 0", n)
 	}
 }
+
+// TestApplyPollOwnerFromCurrentLabel: on every OK poll an hm row re-
+// derives its owner from the current label; a resolved name sets it, an
+// unparsable label clears the name-derived owner and the ref, and then
+// the claim binding may fill a null agente (R3).
+func TestApplyPollOwnerFromCurrentLabel(t *testing.T) {
+	s := openStore(t)
+	const chave = "ws:w7"
+	mustApplyPoll(t, s, okPoll("node-a", "", PolledWorkspace{ID: "w7", Label: "hm-first-impl-ref1", AgentStatus: "working"}))
+	f := jobFact(t, s, "node-a", chave)
+	if f.agente == nil || *f.agente != "first" || f.trabalho == nil || *f.trabalho != "impl" || f.ref == nil || *f.ref != "ref1" {
+		t.Fatalf("after poll 1: owner = (%v, %v, %v), want first/impl/ref1", f.agente, f.trabalho, f.ref)
+	}
+	// The label changes: the owner is re-derived from it.
+	mustApplyPoll(t, s, okPoll("node-a", "", PolledWorkspace{ID: "w7", Label: "hm-second-review-ref2", AgentStatus: "working"}))
+	f = jobFact(t, s, "node-a", chave)
+	if f.agente == nil || *f.agente != "second" || f.trabalho == nil || *f.trabalho != "review" || f.ref == nil || *f.ref != "ref2" || f.fonte == nil || *f.fonte != AgenteFonteNome {
+		t.Fatalf("after poll 2: owner = (%v, %v, %v, %v), want second/review/ref2 from the name", f.agente, f.trabalho, f.ref, f.fonte)
+	}
+	// A check for the ref (any type token) is a duplicate on the ref.
+	res, err := s.Check(CheckRequest{Agente: "second", Workspace: "hm-second-impl-ref2"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if res.Status != CheckDuplicate {
+		t.Fatalf("check for the ref2 workspace = %q, want duplicate", res.Status)
+	}
+	// An unparsable label clears the name-derived owner and the ref.
+	mustApplyPoll(t, s, okPoll("node-a", "", PolledWorkspace{ID: "w7", Label: "hm-first-implement-ref1", AgentStatus: "working"}))
+	f = jobFact(t, s, "node-a", chave)
+	if f.agente != nil || f.fonte != nil || f.trabalho != nil || f.ref != nil {
+		t.Fatalf("after the unparsable label: owner = (%v, %v, %v, %v), want all null", f.agente, f.fonte, f.trabalho, f.ref)
+	}
+	// And the check for that ref is free again.
+	res, err = s.Check(CheckRequest{Agente: "first", Workspace: "hm-first-impl-ref1"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if res.Status != CheckOK {
+		t.Fatalf("check after the owner was cleared = %q, want ok", res.Status)
+	}
+}

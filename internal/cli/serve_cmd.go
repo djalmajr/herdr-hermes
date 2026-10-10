@@ -191,6 +191,15 @@ func cmdServe(args []string, env Env) int {
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "serve: cannot listen on " + listen}))
 		return 4
 	}
+	// The flag check sees the address as typed; the listener sees the
+	// resolved one, and localhost may resolve elsewhere. Re-check the
+	// bound address and refuse like the flag check.
+	if !listenerIsLoopback(ln.Addr()) {
+		_ = ln.Close()
+		_ = store.Close()
+		fail(env, 2, "serve: --listen must be a loopback address")
+		return 2
+	}
 
 	// The poll loop and the HTTP handler write to stderr concurrently:
 	// one protected writer.
@@ -259,6 +268,17 @@ func cmdServe(args []string, env Env) int {
 	polling.Wait()
 	_ = store.Close()
 	return code
+}
+
+// listenerIsLoopback reports whether the bound address of a listener is
+// a loopback IP: the check of the resolved address, not only of the
+// flag, because localhost may resolve elsewhere.
+func listenerIsLoopback(addr net.Addr) bool {
+	ta, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	return ta.IP.IsLoopback()
 }
 
 // servePollLoop runs one immediate round, then a round every interval,
