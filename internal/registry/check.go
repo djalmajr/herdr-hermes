@@ -249,7 +249,7 @@ func (s *Store) jobConflicts(tx *sql.Tx, n checkNorm) ([]Conflict, error) {
 		if n.pr != "" && pr.Valid && pr.String == n.pr && projeto.Valid && strings.EqualFold(projeto.String, n.projeto) {
 			out = append(out, base(CampoPR, pr.String))
 		}
-		if n.ref != "" && ref.Valid && agente.Valid && agente.String == n.agente && strings.EqualFold(ref.String, n.ref) {
+		if n.ref != "" && ref.Valid && agente.Valid && agente.String == n.agente && strings.EqualFold(RefBase(ref.String), RefBase(n.ref)) {
 			out = append(out, base(CampoRef, ref.String))
 		}
 	}
@@ -293,7 +293,7 @@ func (s *Store) claimConflicts(tx *sql.Tx, n checkNorm) ([]Conflict, error) {
 		if n.pr != "" && pr.Valid && pr.String == n.pr && projeto.Valid && strings.EqualFold(projeto.String, n.projeto) {
 			out = append(out, base(CampoPR, pr.String))
 		}
-		if n.ref != "" && ref.Valid && strings.EqualFold(ref.String, n.ref) && agente == n.agente {
+		if n.ref != "" && ref.Valid && strings.EqualFold(RefBase(ref.String), RefBase(n.ref)) && agente == n.agente {
 			out = append(out, base(CampoRef, ref.String))
 		}
 	}

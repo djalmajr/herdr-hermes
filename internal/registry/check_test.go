@@ -441,3 +441,36 @@ func TestCheckInvalid(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckRefCollisionSuffix: a workspace re-opened under its collision
+// name (hm-<agent>-<type>-<ref>-2) is the same work as the plain ref, in
+// both directions, while a ref whose last part is not a one-digit
+// collision suffix stays distinct.
+// Mutation captured: comparing the raw refs instead of RefBase lets
+// hm-example-impl-x245 pass while hm-example-impl-x245-2 is active.
+func TestCheckRefCollisionSuffix(t *testing.T) {
+	cases := []struct {
+		name     string
+		stored   string
+		request  string
+		conflict bool
+	}{
+		{"active -2, plain request", "x245-2", "hm-example-review-x245", true},
+		{"active plain, -3 request", "x245", "hm-example-fix-x245-3", true},
+		{"range is not a suffix", "x238-241", "hm-example-impl-x238", false},
+		{"part is not a suffix", "x194-p2", "hm-example-impl-x194", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			insertJob(t, s, map[string]any{"maquina": "node-a", "chave": "ws:w1", "origem": "workspace", "workspace": "hm-example-impl-" + tc.stored, "agente": "example", "ref": tc.stored})
+			res, err := s.Check(CheckRequest{Agente: "example", Workspace: tc.request})
+			if err != nil {
+				t.Fatalf("Check: %v", err)
+			}
+			if got := res.Status == CheckDuplicate; got != tc.conflict {
+				t.Fatalf("status = %q, want conflict %v (%+v)", res.Status, tc.conflict, res.Conflitos)
+			}
+		})
+	}
+}

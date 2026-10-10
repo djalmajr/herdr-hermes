@@ -71,3 +71,15 @@ func TestJobIDFromWorkspace(t *testing.T) {
 		}
 	}
 }
+
+// TestRefBase: only a trailing one-digit collision suffix from 2 to 9 is
+// dropped.
+// Mutation captured: a suffix pattern of -[0-9]+ turns the range
+// "x238-241" into "x238".
+func TestRefBase(t *testing.T) {
+	for ref, want := range map[string]string{"pr64-2": "pr64", "dja245-9": "dja245", "dja238-241": "dja238-241", "dja194-p2": "dja194-p2", "pr4-win": "pr4-win", "x-1": "x-1", "card12": "card12", "-2": "-2"} {
+		if got := RefBase(ref); got != want {
+			t.Errorf("RefBase(%q) = %q, want %q", ref, got, want)
+		}
+	}
+}

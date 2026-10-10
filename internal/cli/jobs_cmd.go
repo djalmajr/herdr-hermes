@@ -49,6 +49,7 @@ type jobsForm struct {
 	manutencao   string
 	sohoVersion  string
 	runners      string
+	runnersSet   bool
 	nodeOptional bool
 }
 
@@ -177,7 +178,7 @@ func parseJobsArgs(args []string) (jobsForm, bool) {
 		case "--soho-version":
 			f.sohoVersion = fl.value
 		case "--runners":
-			f.runners = fl.value
+			f.runners, f.runnersSet = fl.value, true
 		case "--hold":
 			f.hold = true
 		}
@@ -215,7 +216,7 @@ func (f jobsForm) validValues() bool {
 		if f.manutencao != "" && f.manutencao != "on" && f.manutencao != "off" {
 			return false
 		}
-		if f.runners == "" {
+		if f.runnersSet && f.runners == "" {
 			return false
 		}
 	}

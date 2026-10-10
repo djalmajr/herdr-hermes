@@ -51,14 +51,14 @@ func (s *Store) ApplyPoll(p PollResult) error {
 func touchPollNode(tx *sql.Tx, maquina, herdrVersion string, at time.Time) error {
 	atTS := at.Format(time.RFC3339)
 	_, err := tx.Exec(`INSERT INTO nodes(maquina, ultimo_poll, poll_status, ultimo_contato, ultimo_contato_unix, herdr_version)
-		VALUES(?, 'ok', 'ok', ?, ?, ?)
+		VALUES(?, ?, 'ok', ?, ?, ?)
 		ON CONFLICT(maquina) DO UPDATE SET
 			ultimo_poll = excluded.ultimo_poll,
 			poll_status = excluded.poll_status,
 			ultimo_contato = excluded.ultimo_contato,
 			ultimo_contato_unix = excluded.ultimo_contato_unix,
 			herdr_version = CASE WHEN excluded.herdr_version IS NULL THEN herdr_version ELSE excluded.herdr_version END`,
-		maquina, atTS, at.Unix(), nullStr(herdrVersion))
+		maquina, atTS, atTS, at.Unix(), nullStr(herdrVersion))
 	return err
 }
 

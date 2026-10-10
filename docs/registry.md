@@ -37,7 +37,7 @@ A workspace named `hm-<agent>-<type>-<ref>` (type `impl`, `review`, `fix` or `pl
 
 Before an agent opens a job, a workspace or a branch, it runs `herdr-hermes jobs check` and opens nothing unless the check exits 0. The check is atomic: in one SQLite immediate transaction it compares the request with the active jobs (not terminal), the unexpired claims and the holds, and either refuses or records a claim, so two concurrent checks for the same work never both pass. A request names its agent and at least one of:
 
-- `--workspace`: the same workspace name, and for an `hm-` name the same agent and ref (an `impl` and a `review` workspace of the same ref overlap);
+- `--workspace`: the same workspace name, and for an `hm-` name the same agent and ref (an `impl` and a `review` workspace of the same ref overlap, and a ref followed by a collision suffix `-2` to `-9`, as in `hm-example-agent-fix-pr64-2`, is the same ref as `pr64`; a longer last part such as `card238-241` stays a distinct ref);
 - `--card`: the same card (case-insensitive);
 - `--branch` with `--projeto`: the same branch of the same project;
 - `--pr` with `--projeto`: the same pull request (`67`, `#67` and a pull request URL are the same).

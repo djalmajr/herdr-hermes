@@ -64,3 +64,18 @@ func JobIDFromWorkspace(label string) (string, bool) {
 	}
 	return id, true
 }
+
+// collisionSuffix is the "-2" to "-9" a workspace name gets when its name
+// is already taken: hm-<agent>-<type>-<ref>-2 is the same ref again.
+var collisionSuffix = regexp.MustCompile(`-[2-9]$`)
+
+// RefBase is the ref without its collision suffix, the form the
+// pre-dispatch check compares: "pr64-2" and "pr64" are the same work,
+// while "dja238-241" (a range) and "dja194-p2" (a part) keep their whole
+// ref.
+func RefBase(ref string) string {
+	if base := collisionSuffix.ReplaceAllString(ref, ""); base != "" {
+		return base
+	}
+	return ref
+}

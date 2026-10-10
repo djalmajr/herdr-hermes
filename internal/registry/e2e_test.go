@@ -85,6 +85,10 @@ func TestStoreOverHTTP(t *testing.T) {
 	if len(inv.Nodes) != 2 || !inv.Nodes[0].Online || !inv.Nodes[1].Online {
 		t.Fatalf("nodes = %+v, want node-a and node-b online", inv.Nodes)
 	}
+	// Regression: the last poll time read "ok" instead of the poll time.
+	if p := inv.Nodes[0].UltimoPoll; p == nil || *p != "2026-10-10T12:00:00-03:00" {
+		t.Fatalf("ultimo_poll = %v, want the poll time", p)
+	}
 	var keys []string
 	for _, j := range inv.Jobs {
 		keys = append(keys, j.Maquina+"/"+j.Chave)

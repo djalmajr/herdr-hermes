@@ -465,6 +465,21 @@ func TestJobsRequests(t *testing.T) {
 		}
 		assertWireHeaders(t, c, true)
 	})
+	// Regression: node set without --runners was refused as bad usage.
+	// Mutation captured: requiring a non-empty runners value even when
+	// --runners is absent makes this form exit 2.
+	t.Run("node set without runners", func(t *testing.T) {
+		srv, ch, _ := captureServer(t, http.StatusOK, ok, false)
+		dir := t.TempDir()
+		stdout, _, exit := runCLI(t, dir, false, "jobs", "--server", srv.URL, "node", "set", "--maquina", "m1", "--soho-version", "0.2.0")
+		if exit != 0 {
+			t.Fatalf("jobs node set exit = %d (stdout %q)", exit, stdout)
+		}
+		c := requireCapture(t, ch)
+		if c.body != `{"soho_version":"0.2.0"}` {
+			t.Errorf("node set body = %q", c.body)
+		}
+	})
 	t.Run("node set with only runners", func(t *testing.T) {
 		srv, ch, _ := captureServer(t, http.StatusOK, ok, false)
 		dir := t.TempDir()
