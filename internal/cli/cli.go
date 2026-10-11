@@ -54,6 +54,9 @@ var commands = []command{
 	{"notify", false, true, cmdNotify},
 	// DJA-195: route
 	{"route", false, true, cmdRoute},
+	// DJA-229: registry service and its client
+	{"serve", true, true, cmdServe},
+	{"jobs", false, false, cmdJobs},
 }
 
 // Run executes args[0] as a command and returns its exit code. An unknown
