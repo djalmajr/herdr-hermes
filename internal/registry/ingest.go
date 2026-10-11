@@ -203,15 +203,16 @@ func decodeSession(rec outbox.Record) (sessionDados, error) {
 	return sd, nil
 }
 
-// touchNode upserts the node and moves its last contact forward.
+// touchNode upserts the node; the last contact moves forward only, by
+// the unix column, so a late record never regresses a newer contact.
 func touchNode(tx *sql.Tx, maquina string, at time.Time) error {
 	if err := admitNewNode(tx, maquina); err != nil {
 		return err
 	}
 	_, err := tx.Exec(`INSERT INTO nodes(maquina, ultimo_contato, ultimo_contato_unix) VALUES(?,?,?)
 		ON CONFLICT(maquina) DO UPDATE SET
-			ultimo_contato = excluded.ultimo_contato,
-			ultimo_contato_unix = excluded.ultimo_contato_unix`,
+			ultimo_contato = CASE WHEN ultimo_contato_unix IS NULL OR ultimo_contato_unix < excluded.ultimo_contato_unix THEN excluded.ultimo_contato ELSE ultimo_contato END,
+			ultimo_contato_unix = CASE WHEN ultimo_contato_unix IS NULL OR ultimo_contato_unix < excluded.ultimo_contato_unix THEN excluded.ultimo_contato_unix ELSE ultimo_contato_unix END`,
 		maquina, at.Format(outbox.TSLayout), at.Unix())
 	return err
 }
@@ -386,6 +387,10 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 		// not corrupt the registry.
 		return false, invalidErr("ts", "must be RFC 3339 with an explicit offset")
 	}
+	// The instant is kept, in the canonical numeric-offset layout: a `Z`
+	// input is stored as `+00:00` and sub-second digits are dropped, as
+	// in the record path.
+	evTSOut := evTS.Format(outbox.TSLayout)
 	if row == nil {
 		// A cleanup of a job never seen before is tombstoned below in
 		// this same transaction, so it takes no live slot.
@@ -406,11 +411,11 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 		}
 	}
 	if _, err := tx.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo, refs) VALUES(?,?,?,?,?,?,?)`,
-		rec.Maquina, jobID, ev.Seq, ev.TS, ev.Tipo, cutResumo(ev.Resumo), reduceRefs(ev.Refs)); err != nil {
+		rec.Maquina, jobID, ev.Seq, evTSOut, ev.Tipo, cutResumo(ev.Resumo), reduceRefs(ev.Refs)); err != nil {
 		return false, err
 	}
 	// Keep only the EventsPerJob highest seqs, dropping the oldest.
-	full := append(append([]ringEvent{}, stored...), ringEvent{seq: ev.Seq, ts: ev.TS})
+	full := append(append([]ringEvent{}, stored...), ringEvent{seq: ev.Seq, ts: evTSOut})
 	sort.Slice(full, func(i, j int) bool {
 		if full[i].seq != full[j].seq {
 			return full[i].seq < full[j].seq
@@ -429,7 +434,7 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 	// seconds, so the zones never matter).
 	if _, err := tx.Exec(`UPDATE jobs SET ultima_atividade = ?, ultima_atividade_unix = ?
 		WHERE maquina = ? AND chave = ? AND (ultima_atividade_unix IS NULL OR ultima_atividade_unix < ?)`,
-		ev.TS, evTS.Unix(), rec.Maquina, jobID, evTS.Unix()); err != nil {
+		evTSOut, evTS.Unix(), rec.Maquina, jobID, evTS.Unix()); err != nil {
 		return false, err
 	}
 	// A parseable refs.pr fills a null pr.
@@ -453,6 +458,14 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 	case jobapi.TypeBlocked:
 		err = setWait(tx, rec.Maquina, jobID, 1, "blocked")
 	case jobapi.TypeUnblocked:
+		// The wait always clears; a blocked terminal (blockedSaida) moves
+		// back to running, a done terminal never reopens.
+		if row != nil && row.terminal == 1 && blockedSaida(row.saida) {
+			if _, err = tx.Exec(`UPDATE jobs SET terminal = 0, saida = NULL WHERE maquina = ? AND chave = ?`,
+				rec.Maquina, jobID); err != nil {
+				return false, err
+			}
+		}
 		err = setWait(tx, rec.Maquina, jobID, 0, "")
 	case jobapi.TypeTerminal:
 		saida := parseSaida(ev.Refs)
@@ -460,7 +473,7 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 			saida, rec.Maquina, jobID); err != nil {
 			return false, err
 		}
-		if saida != nil && (*saida == 7 || *saida == 11 || *saida == 14) {
+		if blockedSaida(saida) {
 			err = setWait(tx, rec.Maquina, jobID, 1, "blocked")
 		} else {
 			err = setWait(tx, rec.Maquina, jobID, 0, "")
@@ -591,6 +604,14 @@ func parseSaida(refs map[string]any) *int {
 		}
 	}
 	return nil
+}
+
+// blockedSaida reports whether a terminal exit keeps the job alive and
+// waiting: 7 needs a person and 11/14 are quota or provider errors, all
+// `blocked` in the contract, waiting for `job amend`. The SQL that
+// carries the same set (jobConflicts) is named after this helper.
+func blockedSaida(saida *int) bool {
+	return saida != nil && (*saida == 7 || *saida == 11 || *saida == 14)
 }
 
 // maxUltima sets the last activity forward only, by unix seconds, and

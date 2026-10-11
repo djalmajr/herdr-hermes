@@ -217,13 +217,15 @@ func (s *Store) holdConflicts(tx *sql.Tx, n checkNorm) ([]Conflict, error) {
 	return holds, nil
 }
 
-// jobConflicts matches the request's keys against every active job
-// (encerrado = 0 and terminal = 0; obsolete ones included: unknown is not
-// free). One conflict is reported per matched key, so a job matched on
-// several keys yields several.
+// jobConflicts matches the request's keys against every active job.
+// Active is encerrado = 0 and (terminal = 0 or saida IN (7, 11, 14) — the
+// literal set of blockedSaida: a blocked job stays alive waiting for an
+// amendment and keeps its duplicate protection; obsolete ones included:
+// unknown is not free). One conflict is reported per matched key, so a
+// job matched on several keys yields several.
 func (s *Store) jobConflicts(tx *sql.Tx, n checkNorm) ([]Conflict, error) {
 	rows, err := tx.Query(`SELECT maquina, chave, agente, workspace, card, projeto, branch, pr, ref
-		FROM jobs WHERE encerrado = 0 AND terminal = 0`)
+		FROM jobs WHERE encerrado = 0 AND (terminal = 0 OR saida IN (7, 11, 14))`)
 	if err != nil {
 		return nil, err
 	}

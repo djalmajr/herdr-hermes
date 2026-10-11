@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/djalmajr/herdr-hermes/internal/registry"
 )
@@ -483,12 +484,23 @@ func cmdJobs(args []string, env Env) int {
 		return 0
 	}
 	if resp.StatusCode == http.StatusConflict && f.sub == "check" {
-		_, _ = printJSONLine(env, raw)
-		status := jobsBodyStatus(raw)
-		if status == "" {
-			status = "unknown"
+		// An untrusted body is a valid refusal only when it is exactly one
+		// JSON object with one of the allowlisted check statuses; anything
+		// else is a malformed answer, and its text is never echoed.
+		status, ok := checkRefusalStatus(raw)
+		if !ok {
+			return jobsMalformed(env)
 		}
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs check: refused (%s)\n", status)
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, raw); err != nil {
+			return jobsMalformed(env)
+		}
+		if status == registry.CheckHold {
+			_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs check: refused (hold)")
+		} else {
+			_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs check: refused (duplicate)")
+		}
+		_, _ = fmt.Fprintf(env.Stdout, "%s\n", escapeRawControls(compact.Bytes()))
 		return 44
 	}
 	if resp.StatusCode == http.StatusBadRequest {
@@ -517,24 +529,42 @@ func jobsMalformed(env Env) int {
 	return 4
 }
 
-// printJSONLine prints the response body as exactly one line.
-func printJSONLine(env Env, raw []byte) (int, error) {
-	if !bytes.HasSuffix(raw, []byte("\n")) {
-		raw = append(append([]byte(nil), raw...), '\n')
+// checkRefusalStatus reports whether raw is a valid check refusal: exactly
+// one JSON value, a JSON object, whose status is one of the check refusal
+// constants. The decoded status is returned only when allowlisted.
+func checkRefusalStatus(raw []byte) (string, bool) {
+	if !utf8.Valid(raw) {
+		return "", false
 	}
-	return env.Stdout.Write(raw)
-}
-
-// jobsBodyStatus extracts the status field of the response body; empty
-// when the body is not a JSON object.
-func jobsBodyStatus(raw []byte) string {
+	if err := exactlyOneJSON(raw); err != nil {
+		return "", false
+	}
 	var v struct {
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
-		return ""
+		return "", false
 	}
-	return v.Status
+	if v.Status == registry.CheckDuplicate || v.Status == registry.CheckHold {
+		return v.Status, true
+	}
+	return "", false
+}
+
+// escapeRawControls rewrites each raw DEL or C1 control character of a
+// compact JSON value as its \u escape. Valid JSON carries them only
+// inside strings, so the value is unchanged while no raw control
+// character reaches the terminal.
+func escapeRawControls(b []byte) string {
+	var out strings.Builder
+	for _, r := range string(b) {
+		if r >= 0x7f && r <= 0x9f {
+			fmt.Fprintf(&out, `\u%04x`, r)
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
 }
 
 // jobsBodyMotivo extracts the motivo field of the response body; empty

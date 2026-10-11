@@ -47,9 +47,9 @@ func (s *Store) ApplyPoll(p PollResult) error {
 	})
 }
 
-// touchPollNode records the poll: the last poll, the status and, when the
-// poll was valid, the contact and the version (never cleared by an empty
-// one).
+// touchPollNode records the poll: the last poll and the status move on
+// every ok poll; the contact moves forward only, by the unix column, so
+// an older poll never regresses a newer push contact.
 func touchPollNode(tx *sql.Tx, maquina, herdrVersion string, at time.Time) error {
 	atTS := at.Format(outbox.TSLayout)
 	_, err := tx.Exec(`INSERT INTO nodes(maquina, ultimo_poll, poll_status, ultimo_contato, ultimo_contato_unix, herdr_version)
@@ -57,8 +57,8 @@ func touchPollNode(tx *sql.Tx, maquina, herdrVersion string, at time.Time) error
 		ON CONFLICT(maquina) DO UPDATE SET
 			ultimo_poll = excluded.ultimo_poll,
 			poll_status = excluded.poll_status,
-			ultimo_contato = excluded.ultimo_contato,
-			ultimo_contato_unix = excluded.ultimo_contato_unix,
+			ultimo_contato = CASE WHEN ultimo_contato_unix IS NULL OR ultimo_contato_unix < excluded.ultimo_contato_unix THEN excluded.ultimo_contato ELSE ultimo_contato END,
+			ultimo_contato_unix = CASE WHEN ultimo_contato_unix IS NULL OR ultimo_contato_unix < excluded.ultimo_contato_unix THEN excluded.ultimo_contato_unix ELSE ultimo_contato_unix END,
 			herdr_version = CASE WHEN excluded.herdr_version IS NULL THEN herdr_version ELSE excluded.herdr_version END`,
 		maquina, atTS, atTS, at.Unix(), nullStr(herdrVersion))
 	return err
@@ -142,8 +142,13 @@ func applyPollWorkspaces(tx *sql.Tx, p PollResult, at, now time.Time) error {
 				}
 			}
 			if moves {
-				sets = append(sets, "ultima_atividade = ?", "ultima_atividade_unix = ?")
-				args = append(args, atTS, at.Unix())
+				// The last activity moves forward only, by the unix
+				// column, so a poll that started before a newer push
+				// never regresses it.
+				sets = append(sets,
+					"ultima_atividade = CASE WHEN ultima_atividade_unix IS NULL OR ultima_atividade_unix < ? THEN ? ELSE ultima_atividade END",
+					"ultima_atividade_unix = CASE WHEN ultima_atividade_unix IS NULL OR ultima_atividade_unix < ? THEN ? ELSE ultima_atividade_unix END")
+				args = append(args, at.Unix(), atTS, at.Unix(), at.Unix())
 			}
 			args = append(args, p.Maquina, chave)
 			if _, err := tx.Exec(`UPDATE jobs SET `+strings.Join(sets, ", ")+" WHERE maquina = ? AND chave = ?", args...); err != nil {

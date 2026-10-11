@@ -102,6 +102,19 @@ func Open(path string, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Recheck the state after the pre-create, and verify that the file just
+	// opened is still the one at the path; a swap between the check and
+	// the open refuses the open before SQLite touches anything.
+	if err := unsafeStateCheck(path); err != nil {
+		f.Close()
+		return nil, err
+	}
+	fiOpen, errO := f.Stat()
+	fiPath, errP := os.Lstat(path)
+	if errO != nil || errP != nil || !os.SameFile(fiOpen, fiPath) {
+		f.Close()
+		return nil, ErrUnsafeState
+	}
 	f.Close()
 
 	db, err := sql.Open("sqlite", dsnFor(path))
@@ -357,6 +370,9 @@ func unsafeStateCheck(path string) error {
 // entry below it must then be a real directory owned by the current user
 // or root, never a symlink. A missing part of the path ends the walk once
 // its parent passed: Open creates it at 0700 and checks the path again.
+// On top of the lexical walk, the resolved chain behind every alias is
+// checked with the same rules, so a private alias cannot hide an unsafe
+// real ancestor.
 func checkAncestors(dir string) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -382,13 +398,15 @@ func checkAncestors(dir string) error {
 		next := filepath.Join(cur, part)
 		entry, err := os.Lstat(next)
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			// Open creates the missing part at 0700 and checks the path
+			// again; the walk stops once the parent passed.
+			return checkResolvedAncestors(abs)
 		}
 		if err != nil {
 			return err
 		}
 		if shared {
-			if entry.Mode()&os.ModeSymlink != 0 || !ownedBySelfOrRoot(entry) {
+			if err := realOwnedDir(entry); err != nil {
 				return fmt.Errorf("%w: %s in a shared directory is not a directory of the current user", ErrUnsafeState, next)
 			}
 		}
@@ -396,7 +414,7 @@ func checkAncestors(dir string) error {
 	}
 	final, err := os.Stat(cur)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return checkResolvedAncestors(abs)
 	}
 	if err != nil {
 		return err
@@ -405,6 +423,85 @@ func checkAncestors(dir string) error {
 		return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeState, cur)
 	}
 	if final.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%w: %s allows group or other writes", ErrUnsafeState, cur)
+	}
+	return checkResolvedAncestors(abs)
+}
+
+// realOwnedDir reports whether fi is a real directory (never a symlink)
+// owned by the current user or root: the rule of the entry below a sticky
+// shared directory.
+func realOwnedDir(fi os.FileInfo) error {
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsDir() {
+		return fmt.Errorf("%w: not a directory", ErrUnsafeState)
+	}
+	if !ownedBySelfOrRoot(fi) {
+		return fmt.Errorf("%w: not owned by the current user", ErrUnsafeState)
+	}
+	return nil
+}
+
+// checkResolvedAncestors applies the ancestor rules to the resolved chain
+// behind the aliases of dir: the deepest existing prefix is resolved with
+// filepath.EvalSymlinks, and every directory of it, the last included, is
+// checked with the same rules as the lexical walk (owner self or root, no
+// group or other writes unless sticky, a real directory of the current
+// user below a sticky shared directory), so the real location of an alias
+// keeps its safety. The stricter rule of the final lexical directory
+// still applies to the lexical path itself; a missing tail behind the
+// prefix is created at 0700 and rechecked by Open.
+func checkResolvedAncestors(abs string) error {
+	prefix := abs
+	for {
+		if _, err := os.Lstat(prefix); !errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		prefix = filepath.Dir(prefix)
+	}
+	resolved, err := filepath.EvalSymlinks(prefix)
+	if err != nil {
+		return err
+	}
+	vol := filepath.VolumeName(resolved)
+	cur := vol + string(filepath.Separator)
+	for _, part := range strings.Split(strings.TrimPrefix(resolved[len(vol):], string(filepath.Separator)), string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		d, err := os.Lstat(cur)
+		if err != nil {
+			return err
+		}
+		if !ownedBySelfOrRoot(d) {
+			return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeState, cur)
+		}
+		if d.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s is a symlink", ErrUnsafeState, cur)
+		}
+		shared := d.Mode().Perm()&0o022 != 0
+		if shared && d.Mode()&os.ModeSticky == 0 {
+			return fmt.Errorf("%w: %s allows group or other writes", ErrUnsafeState, cur)
+		}
+		next := filepath.Join(cur, part)
+		if shared {
+			fi, err := os.Lstat(next)
+			if err != nil {
+				return err
+			}
+			if err := realOwnedDir(fi); err != nil {
+				return fmt.Errorf("%w: %s in a shared directory is not a directory of the current user", ErrUnsafeState, next)
+			}
+		}
+		cur = next
+	}
+	final, err := os.Lstat(cur)
+	if err != nil {
+		return err
+	}
+	if !ownedBySelfOrRoot(final) {
+		return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeState, cur)
+	}
+	if final.Mode().Perm()&0o022 != 0 && final.Mode()&os.ModeSticky == 0 {
 		return fmt.Errorf("%w: %s allows group or other writes", ErrUnsafeState, cur)
 	}
 	return nil

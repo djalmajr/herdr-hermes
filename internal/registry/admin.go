@@ -80,13 +80,18 @@ func (s *Store) ClearPolicy(escopo, valor string) error {
 }
 
 // SetFolder upserts one folder record, keeping the original criado on an
-// update. Nothing on disk is ever touched.
+// update. The optional job is bounded by the contract job id grammar, so
+// a stored folder cannot defeat the inventory byte bound. Nothing on
+// disk is ever touched.
 func (s *Store) SetFolder(in FolderInput) error {
 	if err := validateMachine(in.Maquina); err != nil {
 		return err
 	}
 	if err := validateFolder(in.Caminho, in.Pedido, in.TamanhoBytes); err != nil {
 		return err
+	}
+	if in.Job != "" && !jobIDPattern.MatchString(in.Job) {
+		return invalidErr("job", "bad format")
 	}
 	return s.tx(func(tx *sql.Tx) error {
 		if err := admitNewFolder(tx, in.Maquina, in.Caminho); err != nil {

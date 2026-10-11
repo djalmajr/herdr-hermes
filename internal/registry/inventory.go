@@ -197,7 +197,13 @@ func invJobs(txn *sql.Tx, f Filter, eventsPerJob int, now time.Time, inv *Invent
 }
 
 // invEsperas lists the pane waits and the waiting jobs, sorted by machine
-// then since.
+// then since. The agent filter applies to both sources by the owning
+// agent, with the same predicate as the jobs list: a pane wait is kept
+// when its workspace resolves to a non-closed job of the filtered agent
+// (the pane's own name is the worker, not the owner) and a wait whose
+// workspace resolves to no job is dropped there; a waiting job is kept
+// when it belongs to the filtered agent. Without the filter the output
+// is unchanged.
 func invEsperas(txn *sql.Tx, f Filter, inv *Inventory) error {
 	type esperaRow struct {
 		w     Wait
@@ -224,13 +230,25 @@ func invEsperas(txn *sql.Tx, f Filter, inv *Inventory) error {
 		}
 		w.Tipo = EsperaPane
 		w.Agente = nullOf(agente)
-		// The pane's job, when its workspace id resolves to one.
+		// The pane's job, when its workspace id resolves to one; under
+		// the agent filter the resolving job must belong to the filtered
+		// agent (never the pane's own name, which is the worker), and a
+		// wait that resolves to no job is dropped there, never a
+		// dangling key.
 		if workspaceID.Valid {
+			q2 := `SELECT chave FROM jobs WHERE maquina = ? AND workspace_id = ? AND encerrado = 0`
+			args2 := []any{w.Maquina, workspaceID.String}
+			if f.Agente != "" {
+				q2 += ` AND agente = ?`
+				args2 = append(args2, f.Agente)
+			}
 			var chave string
-			if err := txn.QueryRow(`SELECT chave FROM jobs WHERE maquina = ? AND workspace_id = ? AND encerrado = 0`,
-				w.Maquina, workspaceID.String).Scan(&chave); err == nil {
+			if err := txn.QueryRow(q2, args2...).Scan(&chave); err == nil {
 				w.Chave = strPtr(chave)
 			}
+		}
+		if f.Agente != "" && w.Chave == nil {
+			continue
 		}
 		out = append(out, esperaRow{w: w, since: desdeUnix})
 	}
@@ -247,6 +265,10 @@ func invEsperas(txn *sql.Tx, f Filter, inv *Inventory) error {
 	if f.Maquina != "" {
 		q += ` AND maquina = ?`
 		args = append(args, f.Maquina)
+	}
+	if f.Agente != "" {
+		q += ` AND agente = ?`
+		args = append(args, f.Agente)
 	}
 	rows, err = txn.Query(q, args...)
 	if err != nil {
