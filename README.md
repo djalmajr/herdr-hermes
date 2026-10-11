@@ -31,7 +31,7 @@ The binary must be on your `PATH`; the optional plugin also needs it on the Herd
 
 ## Commands
 
-Every command prints exactly one JSON line on stdout and its diagnostics on stderr, with these exceptions: `help` and `herdr-hermes` run with no arguments print the plain-text usage on stdout and exit 0; `outbox` prints one JSON line per record and then the trailer line; and the forwarded `job` subcommands copy the stdout of `herdr-soho job` unchanged, which for `job events` is JSON lines and a trailer line. On bad usage the usage text goes to stderr and stdout still carries one JSON error line. The exit codes are `0`, `2`, `3`, `4`, `40`, `41`, `42`, `43`.
+Every command prints exactly one JSON line on stdout and its diagnostics on stderr, with these exceptions: `help` and `herdr-hermes` run with no arguments print the plain-text usage on stdout and exit 0; `outbox` prints one JSON line per record and then the trailer line; and the forwarded `job` subcommands copy the stdout of `herdr-soho job` unchanged, which for `job events` is JSON lines and a trailer line. On bad usage the usage text goes to stderr and stdout still carries one JSON error line. The exit codes are `0`, `2`, `3`, `4`, `40`, `41`, `42`, `43`, `44` (`44` is the `jobs check` pre-dispatch refusal: duplicate work or a hold).
 
 - `job <sub> [args]` — forward a dispatcher-facing job subcommand to `herdr-soho` (`start`, `status`, `wait`, `events`, `collect`, `amend`, `send`, `ack`, `cancel`, `close`, `list`), applying the contract input limits first.
 - `wake` — read one job event on stdin, record it in the outbox and attempt one push (configured as the `herdr-soho` wake hook).
@@ -73,7 +73,7 @@ go test ./...
 go test -race -timeout=30m ./...
 ```
 
-The project is Go only, standard library only; tests are hermetic (no network beyond loopback, injected clocks) and must not hang. The vendored contract in [`docs/upstream/job-contract.md`](docs/upstream/job-contract.md) is copied verbatim and never edited; the drift test in `internal/jobapi` fails when the vendored constants drift from it.
+The project is Go only; well-established, maintained community libraries are used when a dependency is justified, following normal engineering and security best practices. Tests are hermetic (no network beyond loopback, injected clocks) and must not hang. The vendored contract in [`docs/upstream/job-contract.md`](docs/upstream/job-contract.md) is copied verbatim and never edited; the drift test in `internal/jobapi` fails when the vendored constants drift from it.
 
 ## Status
 
