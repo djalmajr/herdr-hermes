@@ -596,7 +596,8 @@ func TestRetentionAtomicRefusalNewMachine(t *testing.T) {
 
 // TestRetentionOptions: 0 means the default 1000 budget; values outside
 // 1..1000 and retentions outside whole days 7..30 make Open fail with an
-// ErrInvalid wrap.
+// ErrInvalid wrap. Each opened store is closed by a cleanup before its
+// TempDir is removed.
 func TestRetentionOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -622,7 +623,14 @@ func TestRetentionOptions(t *testing.T) {
 		{name: "retention not whole days small", opts: Options{EndedRetention: 7*24*time.Hour + time.Second}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Open(pathFor(t), tc.opts)
+			s, err := Open(pathFor(t), tc.opts)
+			if s != nil {
+				t.Cleanup(func() {
+					if err := s.Close(); err != nil {
+						t.Errorf("Close: %v", err)
+					}
+				})
+			}
 			if tc.wantErr {
 				if !errors.Is(err, ErrInvalid) {
 					t.Fatalf("Open = %v, want an ErrInvalid wrap", err)
