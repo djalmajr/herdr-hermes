@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/djalmajr/herdr-hermes/internal/router"
 )
@@ -158,8 +159,15 @@ var agentStatuses = map[string]bool{"idle": true, "working": true, "blocked": tr
 // the id, label and agent_status of each workspace are kept. The id and
 // the label are bounded at MaxPolledStringBytes by boundPolledString:
 // a value longer than the bound is returned cut to the bound with the
-// truncation marker, so the parser's output is always storable.
+// truncation marker, so the parser's output is always storable. A raw
+// answer whose bytes are not valid UTF-8 is refused whole before any
+// JSON decoding, with the error `registry: workspace list is not valid
+// UTF-8`; an escaped unpaired surrogate such as `\ud800` is valid JSON
+// of ASCII bytes and decodes to U+FFFD, not refused.
 func ParseWorkspaceList(raw []byte) ([]PolledWorkspace, error) {
+	if err := requireUTF8(raw, "workspace list"); err != nil {
+		return nil, err
+	}
 	topRaw, err := firstJSONValue(raw, "workspace list")
 	if err != nil {
 		return nil, err
@@ -237,8 +245,15 @@ func ParseWorkspaceList(raw []byte) ([]PolledWorkspace, error) {
 // titles, the terminal ids or the sessions. The pane id and the name
 // are bounded at MaxPolledPaneBytes and the workspace id at
 // MaxPolledStringBytes by boundPolledString, so the parser's output is
-// always storable.
+// always storable. A raw answer whose bytes are not valid UTF-8 is
+// refused whole before any JSON decoding, with the error `registry:
+// agent list is not valid UTF-8`; an escaped unpaired surrogate such as
+// `\ud800` is valid JSON of ASCII bytes and decodes to U+FFFD, not
+// refused.
 func ParseAgentList(raw []byte) ([]PolledPane, error) {
+	if err := requireUTF8(raw, "agent list"); err != nil {
+		return nil, err
+	}
 	topRaw, err := firstJSONValue(raw, "agent list")
 	if err != nil {
 		return nil, err
@@ -336,6 +351,17 @@ func ParseServerVersion(raw []byte) string {
 		return v
 	}
 	return ""
+}
+
+// requireUTF8 refuses the whole raw answer when its bytes are not valid
+// UTF-8 anywhere, before any JSON decoding, so encoding/json cannot
+// turn invalid bytes into U+FFFD and collapse distinct identities into
+// one decoded string.
+func requireUTF8(raw []byte, what string) error {
+	if !utf8.Valid(raw) {
+		return fmt.Errorf("registry: %s is not valid UTF-8", what)
+	}
+	return nil
 }
 
 // firstJSONValue decodes raw as a single JSON value and fails when

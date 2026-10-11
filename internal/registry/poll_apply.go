@@ -38,7 +38,7 @@ func (s *Store) ApplyPoll(p PollResult) error {
 		at := p.At
 		if p.OK {
 			if err := admitNewNode(tx, p.Maquina); err != nil {
-				nodeRefusal = true
+				nodeRefusal = errors.Is(err, ErrInvalid)
 				return err
 			}
 			if err := touchPollNode(tx, p.Maquina, p.HerdrVersion, at); err != nil {
@@ -54,7 +54,7 @@ func (s *Store) ApplyPoll(p PollResult) error {
 		// A failed poll only ages the machine: its jobs go obsolete,
 		// the waits are kept.
 		if err := admitNewNode(tx, p.Maquina); err != nil {
-			nodeRefusal = true
+			nodeRefusal = errors.Is(err, ErrInvalid)
 			return err
 		}
 		atTS := at.Format(outbox.TSLayout)
