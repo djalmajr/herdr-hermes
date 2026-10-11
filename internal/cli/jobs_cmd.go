@@ -480,7 +480,7 @@ func cmdJobs(args []string, env Env) int {
 		if err := json.Compact(&compact, raw); err != nil {
 			return jobsMalformed(env)
 		}
-		_, _ = fmt.Fprintf(env.Stdout, "%s\n", compact.String())
+		_, _ = fmt.Fprintf(env.Stdout, "%s\n", escapeRawControls(compact.Bytes()))
 		return 0
 	}
 	if resp.StatusCode == http.StatusConflict && f.sub == "check" {
@@ -508,7 +508,7 @@ func cmdJobs(args []string, env Env) int {
 		if motivo == "" {
 			motivo = "registry error"
 		}
-		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "2", Motivo: "registry: " + motivo}))
+		_, _ = fmt.Fprintf(env.Stdout, "%s\n", escapeRawControls([]byte(mustJSON(errorLine{Status: "2", Motivo: "registry: " + motivo}))))
 		return 2
 	}
 	if resp.StatusCode == http.StatusNotFound &&
@@ -552,17 +552,26 @@ func checkRefusalStatus(raw []byte) (string, bool) {
 }
 
 // escapeRawControls rewrites each raw DEL or C1 control character of a
-// compact JSON value as its \u escape. Valid JSON carries them only
-// inside strings, so the value is unchanged while no raw control
-// character reaches the terminal.
+// JSON value as its \u escape. The walk is byte-preserving: a valid rune
+// in U+007F..U+009F is written as \u%04x, a byte that does not start a
+// valid UTF-8 sequence is written as U+FFFD — the value encoding/json
+// already decodes it to, so the decoded value is unchanged and no lone
+// 0x80..0x9f byte reaches the terminal — and every other byte sequence
+// is copied verbatim. Valid JSON carries the controls only inside
+// strings, so the escapes are always valid JSON string escapes.
 func escapeRawControls(b []byte) string {
 	var out strings.Builder
-	for _, r := range string(b) {
-		if r >= 0x7f && r <= 0x9f {
-			fmt.Fprintf(&out, `\u%04x`, r)
-			continue
+	for len(b) > 0 {
+		r, size := utf8.DecodeRune(b)
+		switch {
+		case r == utf8.RuneError && size == 1:
+			out.WriteRune(utf8.RuneError)
+		case r >= 0x7f && r <= 0x9f:
+			_, _ = fmt.Fprintf(&out, `\u%04x`, r)
+		default:
+			out.Write(b[:size])
 		}
-		out.WriteRune(r)
+		b = b[size:]
 	}
 	return out.String()
 }
