@@ -71,6 +71,18 @@ const (
 	// at its cap and every kept value at its length bound and fully
 	// escaped, the JSON stays under it. The jobs client reads up to it.
 	MaxInventoryBytes = 256 << 20
+
+	// MaxWaits is the total stored pane waits (the waits table), across
+	// every node. The waits the jobs derive from their events are not
+	// rows of that table; they are bounded by the jobs and sessions
+	// budgets.
+	MaxWaits = 1000
+	// MaxPolledStringBytes bounds every string a poll stores, in UTF-8
+	// bytes, the truncation marker included.
+	MaxPolledStringBytes = 1024
+	// MaxPolledPaneBytes is the stricter bound of the pane id and the
+	// pane name of a pane wait, the truncation marker included.
+	MaxPolledPaneBytes = 256
 )
 
 // Job origins.

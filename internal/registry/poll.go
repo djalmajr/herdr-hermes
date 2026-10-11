@@ -155,7 +155,10 @@ var agentStatuses = map[string]bool{"idle": true, "working": true, "blocked": tr
 // label (missing label is an empty string), a missing or non-string
 // agent_status outside idle|working|blocked|done|unknown, or trailing
 // non-whitespace data is an error. Unknown fields are ignored; only
-// the id, label and agent_status of each workspace are kept.
+// the id, label and agent_status of each workspace are kept. The id and
+// the label are bounded at MaxPolledStringBytes by boundPolledString:
+// a value longer than the bound is returned cut to the bound with the
+// truncation marker, so the parser's output is always storable.
 func ParseWorkspaceList(raw []byte) ([]PolledWorkspace, error) {
 	topRaw, err := firstJSONValue(raw, "workspace list")
 	if err != nil {
@@ -197,6 +200,7 @@ func ParseWorkspaceList(raw []byte) ([]PolledWorkspace, error) {
 		if err != nil {
 			return nil, fmt.Errorf("registry: workspace %d: %w", i, err)
 		}
+		id = boundPolledString(id, MaxPolledStringBytes)
 		if id == "" {
 			return nil, fmt.Errorf("registry: workspace %d: workspace_id is empty", i)
 		}
@@ -210,6 +214,7 @@ func ParseWorkspaceList(raw []byte) ([]PolledWorkspace, error) {
 				return nil, fmt.Errorf("registry: workspace %d: label must be a string", i)
 			}
 		}
+		label = boundPolledString(label, MaxPolledStringBytes)
 		status, err := stringField(elem, "agent_status")
 		if err != nil {
 			return nil, fmt.Errorf("registry: workspace %d: %w", i, err)
@@ -229,7 +234,10 @@ func ParseWorkspaceList(raw []byte) ([]PolledWorkspace, error) {
 // a string or null (missing is an empty string) and a workspace_id that
 // is a string (missing is an empty string). Only the pane id, the
 // workspace id, the name and the status are kept: never the cwd, the
-// titles, the terminal ids or the sessions.
+// titles, the terminal ids or the sessions. The pane id and the name
+// are bounded at MaxPolledPaneBytes and the workspace id at
+// MaxPolledStringBytes by boundPolledString, so the parser's output is
+// always storable.
 func ParseAgentList(raw []byte) ([]PolledPane, error) {
 	topRaw, err := firstJSONValue(raw, "agent list")
 	if err != nil {
@@ -271,6 +279,7 @@ func ParseAgentList(raw []byte) ([]PolledPane, error) {
 		if err != nil {
 			return nil, fmt.Errorf("registry: agent %d: %w", i, err)
 		}
+		paneID = boundPolledString(paneID, MaxPolledPaneBytes)
 		if paneID == "" {
 			return nil, fmt.Errorf("registry: agent %d: pane_id is empty", i)
 		}
@@ -293,6 +302,7 @@ func ParseAgentList(raw []byte) ([]PolledPane, error) {
 				}
 			}
 		}
+		name = boundPolledString(name, MaxPolledPaneBytes)
 		wsID := ""
 		if rawWS, present := elem["workspace_id"]; present {
 			trimmed := bytes.TrimSpace(rawWS)
@@ -303,6 +313,7 @@ func ParseAgentList(raw []byte) ([]PolledPane, error) {
 				return nil, fmt.Errorf("registry: agent %d: workspace_id must be a string", i)
 			}
 		}
+		wsID = boundPolledString(wsID, MaxPolledStringBytes)
 		out = append(out, PolledPane{PaneID: paneID, WorkspaceID: wsID, Name: name, AgentStatus: status})
 	}
 	return out, nil

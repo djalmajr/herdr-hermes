@@ -297,6 +297,130 @@ func TestServeRetentionFlags(t *testing.T) {
 	}
 }
 
+// TestServePollRefusalKeepsOtherMachines: one machine's poll is refused
+// whole (1001 blocked panes past the stored waits bound) while the other
+// machine's snapshot is valid: the valid machine is applied, the refused
+// machine keeps its previous state (its seed workspace row and its old
+// wait, its last poll unchanged), the log line for the refused machine
+// carries the waits refusal, and the loop keeps running (the second
+// round refuses it again) until its context ends.
+//
+// Mutation captured: applying the refused machine's snapshot partially
+// (or stopping the loop on a refusal) drops the seed workspace row or
+// never logs the second round; both fail here.
+func TestServePollRefusalKeepsOtherMachines(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "registry.db")
+	store, err := registry.Open(db, registry.Options{Now: func() time.Time { return serveFixedNow }})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	const refused, valid = "node-r", "node-v"
+	seedTS := serveFixedNow.Format("2006-01-02T15:04:05-07:00")
+	// The previous state of the refused machine: one valid poll with its
+	// workspace row and one blocked pane.
+	if err := store.ApplyPoll(registry.PollResult{Maquina: refused, At: serveFixedNow, OK: true,
+		Workspaces: []registry.PolledWorkspace{{ID: "w0", Label: "hm-example-impl-x0", AgentStatus: "working"}},
+		Panes:      []registry.PolledPane{{PaneID: "p0", WorkspaceID: "w0", Name: "example", AgentStatus: "blocked"}},
+	}); err != nil {
+		t.Fatalf("seed ApplyPoll: %v", err)
+	}
+
+	// The fake herdr: the refused machine answers the agent list with
+	// 1001 blocked panes every round; the valid machine answers one
+	// workspace and no panes.
+	fake := func(ctx context.Context, argv []string) ([]byte, []byte, int, error) {
+		label, rest := "local", argv
+		if len(argv) >= 2 && argv[0] == "--machine" {
+			label, rest = argv[1], argv[2:]
+		}
+		switch {
+		case len(rest) == 2 && rest[0] == "workspace" && rest[1] == "list":
+			if label == valid {
+				return []byte(`{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[{"agent_status":"working","label":"hm-example-impl-x1","number":1,"workspace_id":"w1"}]}}`), nil, 0, nil
+			}
+			return []byte(`{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[]}}`), nil, 0, nil
+		case len(rest) == 2 && rest[0] == "agent" && rest[1] == "list":
+			if label == refused {
+				var b strings.Builder
+				b.WriteString(`{"id":"cli:agent:list","result":{"agents":[`)
+				for i := 0; i < 1001; i++ {
+					if i > 0 {
+						b.WriteByte(',')
+					}
+					fmt.Fprintf(&b, `{"pane_id":"p%04d","agent_status":"blocked","name":"x","workspace_id":"w0"}`, i)
+				}
+				b.WriteString(`]}}`)
+				return []byte(b.String()), nil, 0, nil
+			}
+			return []byte(`{"id":"cli:agent:list","result":{"agents":[]}}`), nil, 0, nil
+		case len(rest) == 2 && rest[0] == "status" && rest[1] == "server":
+			return []byte("status: running\nversion: 0.9.1\nendpoint_compatible: yes\n"), nil, 0, nil
+		}
+		return nil, nil, 3, nil
+	}
+
+	logb := &testLockedBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	poller := registry.Poller{Exec: fake, Timeout: 5 * time.Second, Now: func() time.Time { return serveFixedNow }}
+	done := make(chan struct{})
+	go func() {
+		servePollLoop(ctx, logb, store, []string{refused, valid}, time.Second, poller)
+		close(done)
+	}()
+
+	// Two rounds at the one-second interval: every round the refused
+	// machine logs the waits refusal, so two lines prove the loop kept
+	// running past a refusal.
+	for i := 0; i < 2; i++ {
+		line := logb.nextLine(t, 15*time.Second)
+		if !strings.Contains(line, "poll "+refused+": registry: invalid input: waits limit reached") {
+			t.Fatalf("round %d log line = %q, want the waits refusal for %s", i+1, line, refused)
+		}
+	}
+
+	inv, err := store.Inventory(registry.Filter{})
+	if err != nil {
+		t.Fatalf("Inventory: %v", err)
+	}
+	has := func(maquina, label string) bool {
+		for i := range inv.Jobs {
+			if inv.Jobs[i].Maquina == maquina && inv.Jobs[i].Workspace != nil && *inv.Jobs[i].Workspace == label {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(valid, "hm-example-impl-x1") {
+		t.Errorf("the valid machine was not applied: jobs = %+v", inv.Jobs)
+	}
+	if !has(refused, "hm-example-impl-x0") {
+		t.Errorf("the refused machine lost its seed workspace row: jobs = %+v", inv.Jobs)
+	}
+	if len(inv.Esperas) != 1 || inv.Esperas[0].Maquina != refused || inv.Esperas[0].Pane == nil || *inv.Esperas[0].Pane != "p0" {
+		t.Errorf("esperas = %+v, want the seed wait of the refused machine only", inv.Esperas)
+	}
+	for i := range inv.Nodes {
+		if inv.Nodes[i].Maquina == refused {
+			if inv.Nodes[i].UltimoPoll == nil || *inv.Nodes[i].UltimoPoll != seedTS {
+				t.Errorf("refused node ultimo_poll = %v, want the seed poll time %q", inv.Nodes[i].UltimoPoll, seedTS)
+			}
+			if inv.Nodes[i].PollStatus == nil || *inv.Nodes[i].PollStatus != "ok" {
+				t.Errorf("refused node poll_status = %v, want the seed status ok", inv.Nodes[i].PollStatus)
+			}
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the poll loop did not stop after the context cancel")
+	}
+}
+
 // TestListenerIsLoopback: the post-bind check is true only for loopback
 // TCP listener addresses; a non-TCP address and a nil address fail it.
 //

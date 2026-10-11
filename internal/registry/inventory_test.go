@@ -373,21 +373,38 @@ func TestTwoNodeInventory(t *testing.T) {
 	}
 }
 
-// TestInventoryWorstCaseBound: one row of each pushed or operator table,
-// with every kept value at its length bound and made of characters JSON
-// escapes to six bytes, serialized and multiplied by its table cap, stays
-// under MaxInventoryBytes, the most the jobs client reads. The jobs list
-// holds the active rows of both budget kinds (the poll workspaces are
-// inside the jobs budget). The worst case is reachable, so it models it:
-// MaxJobs jobs-kind rows, each with its full event ring and its wait,
-// plus MaxSessions sessions-kind rows at their field bounds. A sessao row
-// never carries an event ring: a job_event record's key is its job_id,
-// which the contract id rule (no ':' or '#') cannot address with a
-// sessao key, and no other record type or the poll writes events
-// (TestSessionKeysNeverHoldEvents proves every path with hostile
-// inputs), so a uniform worst case would size a state that cannot exist.
+// TestInventoryWorstCaseBound: a math model, not a measurement of a
+// stored database: one measured row of each table, with every kept value
+// at its length bound and made of characters JSON escapes to six bytes,
+// multiplied by the table's cap, stays under MaxInventoryBytes, the most
+// the jobs client reads. The worst strings are at the byte limit: such a
+// value is wider, escaped, than any truncated value (whose 76-byte marker
+// is ASCII), so the model uses at-limit control characters and checks one
+// truncated value is not wider. The jobs list holds the active rows of
+// both budget kinds (the poll workspaces are inside the jobs budget). The
+// modeled state is MaxJobs jobs-kind rows, per row the larger of the
+// event-bearing row (its full event ring plus a workspace_id at
+// MaxPolledStringBytes, taken through ApplyPoll of a job-<id> workspace
+// of the same job) and the worst hm- workspace row (label and id at the
+// bound), each with its wait; MaxSessions sessions-kind rows at their
+// field bounds; MaxWaits pane waits, each with the pane id and the name
+// at MaxPolledPaneBytes and a workspace id resolving to a ws: key at the
+// bound; and MaxNodes nodes, the measured one with its poll_status at
+// MaxPolledStringBytes. A sessao row never carries an event ring: a
+// job_event record's key is its job_id, which the contract id rule (no
+// ':' or '#') cannot address with a sessao key, and no other record type
+// or the poll writes events (TestSessionKeysNeverHoldEvents proves every
+// path with hostile inputs), so a uniform worst case would size a state
+// that cannot exist.
 func TestInventoryWorstCaseBound(t *testing.T) {
 	s := openStore(t)
+	// A value at its byte limit of control characters is the worst
+	// escaped width; a truncated value of the same limit is narrower.
+	atLimit, _ := json.Marshal(strings.Repeat("\x01", MaxPolledStringBytes))
+	truncated, _ := json.Marshal(boundPolledString(strings.Repeat("\x01", 2*MaxPolledStringBytes), MaxPolledStringBytes))
+	if len(truncated) > len(atLimit) {
+		t.Fatalf("a truncated value (%d bytes escaped) is wider than the at-limit value (%d)", len(truncated), len(atLimit))
+	}
 	refs := map[string]any{}
 	for _, k := range EventRefsKeys {
 		refs[k] = strings.Repeat("<", MaxRefValueBytes)
@@ -439,24 +456,60 @@ func TestInventoryWorstCaseBound(t *testing.T) {
 	})) {
 		t.Fatal("worst sessions row: applied = false")
 	}
+	// The poll-side worst rows: the job-<id> workspace of the event-
+	// bearing job takes its workspace_id to the poll bound, the worst
+	// hm- workspace takes its label and id to the bound, the blocked
+	// pane's workspace id resolves to the hm row's ws: key, and the
+	// failed poll leaves the node's poll_status at the bound.
+	idJob := strings.Repeat("\x01", MaxPolledStringBytes)
+	idHm := strings.Repeat("\x02", MaxPolledStringBytes)
+	if err := s.ApplyPoll(PollResult{Maquina: "node-a", At: fixedNow, OK: true,
+		Workspaces: []PolledWorkspace{
+			{ID: idJob, Label: "job-job-1", AgentStatus: "working"},
+			{ID: idHm, Label: "hm-" + strings.Repeat("\x03", MaxPolledStringBytes-3), AgentStatus: "idle"},
+		},
+		Panes: []PolledPane{
+			{PaneID: strings.Repeat("\x01", MaxPolledPaneBytes), Name: strings.Repeat("\x02", MaxPolledPaneBytes), WorkspaceID: idHm, AgentStatus: "blocked"},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyPoll(ok): %v", err)
+	}
+	if err := s.ApplyPoll(PollResult{Maquina: "node-a", At: fixedNow, OK: false, Motivo: strings.Repeat("\x04", MaxPolledStringBytes)}); err != nil {
+		t.Fatalf("ApplyPoll(failed): %v", err)
+	}
 	inv, err := s.Inventory(Filter{})
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
-	if len(inv.Jobs) != 2 || len(inv.Esperas) != 1 || len(inv.Politicas) != 1 || len(inv.Pastas) != 1 || len(inv.Claims) != 1 || len(inv.Nodes) == 0 {
-		t.Fatalf("inventory rows = %d jobs, %d esperas, %d politicas, %d pastas, %d claims, %d nodes; want the job and session rows and one of the rest", len(inv.Jobs), len(inv.Esperas), len(inv.Politicas), len(inv.Pastas), len(inv.Claims), len(inv.Nodes))
+	if len(inv.Jobs) != 3 || len(inv.Esperas) != 2 || len(inv.Politicas) != 1 || len(inv.Pastas) != 1 || len(inv.Claims) != 1 || len(inv.Nodes) == 0 {
+		t.Fatalf("inventory rows = %d jobs, %d esperas, %d politicas, %d pastas, %d claims, %d nodes; want the job, hm and session rows, the job and pane waits, and one of the rest", len(inv.Jobs), len(inv.Esperas), len(inv.Politicas), len(inv.Pastas), len(inv.Claims), len(inv.Nodes))
 	}
 	if n := len(inv.Jobs[0].Eventos); n != DefaultEventsPerJob {
 		t.Fatalf("events kept = %d, want %d", n, DefaultEventsPerJob)
 	}
-	var sessRow *Job
+	var sessRow, hmRow *Job
+	var jobWait, paneWait *Wait
 	for i := range inv.Jobs {
-		if inv.Jobs[i].Origem == OrigemSessao {
+		switch inv.Jobs[i].Origem {
+		case OrigemSessao:
 			sessRow = &inv.Jobs[i]
+		case OrigemWorkspace:
+			hmRow = &inv.Jobs[i]
 		}
 	}
-	if sessRow == nil {
-		t.Fatalf("the worst sessions row is missing from the inventory")
+	for i := range inv.Esperas {
+		switch inv.Esperas[i].Tipo {
+		case EsperaQuestion:
+			jobWait = &inv.Esperas[i]
+		case EsperaPane:
+			paneWait = &inv.Esperas[i]
+		}
+	}
+	if sessRow == nil || hmRow == nil || jobWait == nil || paneWait == nil {
+		t.Fatalf("inventory = %+v, want the session row, the hm row and both waits", inv.Jobs)
+	}
+	if paneWait.Chave == nil || !strings.HasPrefix(*paneWait.Chave, "ws:") {
+		t.Fatalf("pane wait chave = %v, want the resolved ws: key at the bound", paneWait.Chave)
 	}
 	size := func(v any) int {
 		b, err := json.Marshal(v)
@@ -465,15 +518,24 @@ func TestInventoryWorstCaseBound(t *testing.T) {
 		}
 		return len(b) + 1
 	}
+	// Per jobs-kind row the model takes the larger of the event-bearing
+	// row and the worst hm- row, each with its wait; the pane waits run
+	// at MaxWaits; the measured node carries its poll_status at the
+	// bound.
+	jobsRow := size(inv.Jobs[0])
+	if h := size(hmRow); h > jobsRow {
+		jobsRow = h
+	}
 	total := 1024 +
-		MaxJobs*(size(inv.Jobs[0])+size(inv.Esperas[0])) +
-		MaxSessions*(size(sessRow)+size(inv.Esperas[0])) +
+		MaxJobs*(jobsRow+size(*jobWait)) +
+		MaxSessions*(size(sessRow)+size(*jobWait)) +
 		MaxPolicies*size(inv.Politicas[0]) +
 		MaxFolders*size(inv.Pastas[0]) +
 		MaxClaims*size(inv.Claims[0]) +
-		MaxNodes*size(inv.Nodes[0])
+		MaxNodes*size(inv.Nodes[0]) +
+		MaxWaits*size(*paneWait)
 	if total > MaxInventoryBytes {
-		t.Fatalf("worst-case inventory = %d bytes, want at most MaxInventoryBytes (%d)", total, MaxInventoryBytes)
+		t.Fatalf("worst-case inventory model = %d bytes, want at most MaxInventoryBytes (%d)", total, MaxInventoryBytes)
 	}
-	t.Logf("worst-case inventory: %d bytes of %d", total, MaxInventoryBytes)
+	t.Logf("worst-case inventory model: %d bytes of %d (headroom %d)", total, MaxInventoryBytes, MaxInventoryBytes-total)
 }

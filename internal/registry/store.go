@@ -407,6 +407,33 @@ func (s *Store) alertCapacity(kind string, c capacityCounts, skipped int) {
 		kind, c.retained, c.active, c.protected, c.evictable, c.limit)
 }
 
+// alertNodes writes the one nodes capacity alert line through the
+// registry logger. total is the stored nodes rows at the refusal; the
+// line carries only the counts, never a machine label.
+func (s *Store) alertNodes(total, limit int) {
+	logf("registry: capacity: nodes limit reached (stored total %d, limit %d)", total, limit)
+}
+
+// alertWaits writes the one waits capacity alert line through the
+// registry logger. storedTotal is the waits rows at the refusal and
+// snapshotBlocked the blocked panes of the refused snapshot; the line
+// carries only the counts, never a machine label, pane id, name or
+// workspace id.
+func (s *Store) alertWaits(storedTotal, snapshotBlocked, limit int) {
+	logf("registry: capacity: waits limit reached (stored total %d, snapshot blocked %d, limit %d)",
+		storedTotal, snapshotBlocked, limit)
+}
+
+// nodeCount is the stored nodes rows, read outside a transaction for the
+// post-refusal alert line.
+func (s *Store) nodeCount() int {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
 // admitNewClaim refuses a claim that would be the MaxClaims+1-th live
 // one, called after the expired claims are deleted.
 func admitNewClaim(tx *sql.Tx) error {

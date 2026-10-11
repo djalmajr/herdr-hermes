@@ -30,10 +30,9 @@ var errNoRow = sql.ErrNoRows
 
 // Ingest applies one record of the machine's outbox and reports whether
 // the record changed the registry. The retention sweep and the record
-// projection run in one transaction; the record's own writes (the node
-// contact and the projection) run in a savepoint, so a refused record
-// leaves no trace while the sweep commits (it only removes rows past the
-// retention and is always safe).
+// projection run in one transaction that a refused record rolls back
+// whole: the refusal leaves no trace, the sweep included, and the next
+// successful request sweeps the past-retention rows.
 func (s *Store) Ingest(rec outbox.Record) (bool, error) {
 	ts, err := validateRecord(rec)
 	if err != nil {
@@ -61,51 +60,34 @@ func (s *Store) Ingest(rec outbox.Record) (bool, error) {
 			return false, err
 		}
 	}
-	applied := true
-	var refusalErr error
+	var applied bool
 	var capRefusal *capacityErr
 	err = s.tx(func(tx *sql.Tx) error {
 		now := s.now()
-		// The sweep commits even when the record is refused below: it
-		// only removes rows past the retention.
+		// The sweep runs in the same transaction and rolls back with
+		// the rest when the record is refused below.
 		if err := sweepEnded(tx, s.endedRetention, now); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`SAVEPOINT record_writes`); err != nil {
 			return err
 		}
 		var inner error
 		applied, inner = s.ingestRecord(tx, rec, ev, sd, ts, now)
-		if errors.Is(inner, ErrInvalid) {
-			// A refusal: the node contact and the record's own writes
-			// roll back to the savepoint; the sweep before it commits.
-			var capErr *capacityErr
-			if errors.As(inner, &capErr) {
-				capRefusal = capErr
-			}
-			refusalErr = inner
-			applied = false
-			if _, err := tx.Exec(`ROLLBACK TO record_writes`); err != nil {
-				return err
-			}
-			return nil
-		}
 		if inner != nil {
+			if errors.Is(inner, ErrInvalid) {
+				var capErr *capacityErr
+				if errors.As(inner, &capErr) {
+					capRefusal = capErr
+				}
+			}
 			return inner
-		}
-		if _, err := tx.Exec(`RELEASE record_writes`); err != nil {
-			return err
 		}
 		return nil
 	})
 	if err != nil {
-		return false, err
-	}
-	if refusalErr != nil {
+		// A capacity refusal alerts after the transaction, outside it.
 		if capRefusal != nil {
 			s.alertCapacity(capRefusal.kind, capRefusal.counts, 0)
 		}
-		return false, refusalErr
+		return false, err
 	}
 	return applied, nil
 }

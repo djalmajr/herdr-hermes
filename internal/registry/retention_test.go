@@ -476,7 +476,8 @@ func TestRetentionKnownSessionUpdatesAtFullBudget(t *testing.T) {
 
 // TestRetentionKnownPollUpdateAtFullBudget: at a full jobs budget a poll
 // that lists only the known workspace row updates it; the next poll with
-// a new workspace skips it (covered by TestRetentionPollSkip).
+// a new workspace is refused whole (covered by
+// TestRetentionPollWholeRefusal).
 func TestRetentionKnownPollUpdateAtFullBudget(t *testing.T) {
 	s := retStore(t, Options{MaxJobs: 2})
 	mustApplyPoll(t, s, okPoll("node-p", "",
@@ -507,8 +508,9 @@ func TestRetentionKnownPollUpdateAtFullBudget(t *testing.T) {
 }
 
 // TestRetentionAtomicRefusalKnownMachine: a refused record from a known
-// machine moves no contact and leaves every table byte-identical except
-// the ended rows past the retention, which are swept anyway.
+// machine rolls back the whole transaction: the retention sweep
+// included, every table byte-identical, and the known machine's contact
+// unmoved. The 31-day row is swept by the next successful request.
 func TestRetentionAtomicRefusalKnownMachine(t *testing.T) {
 	s := retStore(t, Options{MaxJobs: 2})
 	// The known machine with an older contact.
@@ -533,22 +535,11 @@ func TestRetentionAtomicRefusalKnownMachine(t *testing.T) {
 	retWantRefusal(t, err, "jobs")
 	after := retDump(t, s)
 
-	// The 31-day row and its event are the only rows gone: the sweep
-	// commits although the record was refused.
-	if f := jobFact(t, s, "node-a", "job-past"); f.exists {
-		t.Fatalf("the 31-day row survived the refused Ingest: %+v, want swept", f)
-	}
+	// The whole request rolled back: every table is byte-identical, the
+	// 31-day row and its event included.
 	for table, rows := range before {
-		var want []string
-		for _, row := range rows {
-			if (table == "jobs" && strings.Contains(row, "\x1f"+"node-a\x1f"+"job-past\x1f")) ||
-				(table == "events" && strings.HasPrefix(row, "events\x1fnode-a\x1fjob-past\x1f")) {
-				continue
-			}
-			want = append(want, row)
-		}
-		if !rowsEqual(after[table], want) {
-			t.Errorf("table %s changed by the refused record:\nbefore (minus the swept row): %v\nafter: %v", table, want, after[table])
+		if !rowsEqual(after[table], rows) {
+			t.Errorf("table %s changed by the refused record:\nbefore: %v\nafter: %v", table, rows, after[table])
 		}
 	}
 	// The known machine's contact did not move.
@@ -558,6 +549,19 @@ func TestRetentionAtomicRefusalKnownMachine(t *testing.T) {
 	}
 	if contact != fixedNow.Unix()-3600 {
 		t.Errorf("ultimo_contato_unix = %d, want unchanged (%d)", contact, fixedNow.Unix()-3600)
+	}
+	// The next successful request sweeps the 31-day row: an event of a
+	// tombstoned job is ignored without an error, so the request
+	// succeeds and its sweep commits.
+	applied, err := s.Ingest(retJobEventRec("f1", 1, jobapi.TypeAccepted))
+	if err != nil {
+		t.Fatalf("Ingest of the tombstoned job event: %v", err)
+	}
+	if applied {
+		t.Errorf("tombstoned job event: applied = true, want false")
+	}
+	if f := jobFact(t, s, "node-a", "job-past"); f.exists {
+		t.Errorf("the 31-day row after the next successful request = %+v, want swept", f)
 	}
 }
 
@@ -679,16 +683,18 @@ func TestRetentionDefaultBudgets(t *testing.T) {
 	}
 }
 
-// TestRetentionPollSkip: at a full jobs budget a poll with one known and
-// two new workspaces updates the known row and skips the new ones, with
-// exactly one alert line that carries no workspace or machine label; with
-// an evictable ended row present the poll admits the new workspace.
-func TestRetentionPollSkip(t *testing.T) {
+// TestRetentionPollWholeRefusal: at a full jobs budget a poll that lists
+// new workspaces is refused whole (no partial apply: the known rows keep
+// their stored values), with exactly one alert line that carries no
+// workspace or machine label; with an evictable ended row present the
+// poll admits the new workspace by evicting it.
+func TestRetentionPollWholeRefusal(t *testing.T) {
 	s := retStore(t, Options{MaxJobs: 2})
 	mustApplyPoll(t, s, okPoll("node-a", "",
 		PolledWorkspace{ID: "w1", Label: "hm-first-impl-1", AgentStatus: "working"},
 		PolledWorkspace{ID: "w2", Label: "hm-first-impl-2", AgentStatus: "working"}))
 	lines := setLogf(t)
+	before := retDump(t, s)
 	p := okPoll("node-a", "")
 	p.Workspaces = []PolledWorkspace{
 		{ID: "w1", Label: "hm-first-impl-1", AgentStatus: "idle"},
@@ -696,26 +702,37 @@ func TestRetentionPollSkip(t *testing.T) {
 		{ID: "w3", Label: "hm-first-impl-3", AgentStatus: "working"},
 		{ID: "w4", Label: "hm-first-impl-4", AgentStatus: "working"},
 	}
-	mustApplyPoll(t, s, p)
-	if n := tableCount(t, s, "jobs"); n != 2 {
-		t.Fatalf("jobs rows = %d, want 2 (the new workspaces were skipped)", n)
+	err := s.ApplyPoll(p)
+	retWantRefusal(t, err, "jobs")
+	after := retDump(t, s)
+	for table, rows := range before {
+		if !rowsEqual(after[table], rows) {
+			t.Errorf("table %s changed by the refused poll:\nbefore: %v\nafter: %v", table, rows, after[table])
+		}
 	}
-	if f := jobFact(t, s, "node-a", "ws:w3"); f.exists {
-		t.Errorf("ws:w3 = %+v, want skipped", f)
-	}
+	// Nothing of the poll applied: the known row keeps its stored
+	// status and the new workspaces have no rows.
 	var status sql.NullString
 	if err := s.db.QueryRow(`SELECT herdr_status FROM jobs WHERE maquina = 'node-a' AND chave = 'ws:w1'`).Scan(&status); err != nil {
 		t.Fatalf("herdr_status: %v", err)
 	}
-	if !status.Valid || status.String != "idle" {
-		t.Errorf("the known row = %v, want updated by the same poll", status)
+	if !status.Valid || status.String != "working" {
+		t.Errorf("the known row = %v, want the stored value kept (the poll was refused whole)", status)
 	}
+	if f := jobFact(t, s, "node-a", "ws:w3"); f.exists {
+		t.Errorf("ws:w3 = %+v, want no row (the new workspace was refused)", f)
+	}
+	if n := tableCount(t, s, "jobs"); n != 2 {
+		t.Errorf("jobs rows = %d, want 2 (nothing was admitted)", n)
+	}
+	// One alert line for the whole refusal, with the new workspaces
+	// count and no label.
 	if len(*lines) != 1 {
 		t.Fatalf("alert lines = %d, want exactly one (%v)", len(*lines), *lines)
 	}
 	line := (*lines)[0]
 	if !strings.Contains(line, "jobs limit reached") || !strings.Contains(line, "skipped 2") {
-		t.Errorf("alert line = %q, want the jobs refusal with the skipped count", line)
+		t.Errorf("alert line = %q, want the jobs refusal with the new workspaces count", line)
 	}
 	for _, leak := range []string{"node-a", "hm-first-impl-1", "hm-first-impl-3", "hm-first-impl-4", "w1", "w3", "w4"} {
 		if strings.Contains(line, leak) {
