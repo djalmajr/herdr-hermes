@@ -293,15 +293,22 @@ func TestApplyPollPersonalWorkspace(t *testing.T) {
 	}
 }
 
-// TestApplyPollSweep: a stale tombstone on the polled machine is swept at
-// the start of an ApplyPoll.
+// TestApplyPollSweep: an ended row past the default retention on the
+// polled machine is swept at the start of an ApplyPoll; an ended row past
+// the fence but inside the retention is kept.
 // Mutation captured: a missing ApplyPoll sweep leaves the stale row.
 func TestApplyPollSweep(t *testing.T) {
 	s := openStore(t)
-	_, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-old','job',1,?)`,
-		fixedNow.Unix()-int64((TombstoneTTL/time.Second))-1)
-	if err != nil {
-		t.Fatalf("seed the stale tombstone: %v", err)
+	if _, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-old','job',1,?)`,
+		fixedNow.Unix()-int64((DefaultEndedRetention/time.Second))-1); err != nil {
+		t.Fatalf("seed the stale ended row: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo) VALUES('node-a','job-old',1,'2026-01-01T00:00:00-03:00','note','x')`); err != nil {
+		t.Fatalf("seed the stale event: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-kept','job',1,?)`,
+		fixedNow.Unix()-int64((8*24*time.Hour)/time.Second)); err != nil {
+		t.Fatalf("seed the fence-expired ended row: %v", err)
 	}
 	mustApplyPoll(t, s, okPoll("node-a", ""))
 	var n int
@@ -309,7 +316,17 @@ func TestApplyPollSweep(t *testing.T) {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {
-		t.Errorf("stale tombstones left = %d, want 0", n)
+		t.Errorf("stale ended rows left = %d, want 0", n)
+	}
+	if n := tableCount(t, s, "events"); n != 0 {
+		t.Errorf("stale events left = %d, want 0", n)
+	}
+	var kept int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE chave = 'job-kept' AND encerrado = 1`).Scan(&kept); err != nil {
+		t.Fatalf("count kept: %v", err)
+	}
+	if kept != 1 {
+		t.Errorf("8-day ended rows left = %d, want 1 (kept until the retention)", kept)
 	}
 }
 

@@ -23,10 +23,13 @@ import (
 // BEGIN IMMEDIATE and serialized inside the process; a second process on
 // the same file is excluded the same way and waits out busy_timeout.
 type Store struct {
-	db           *sql.DB
-	now          func() time.Time
-	eventsPerJob int
-	onlineWindow time.Duration
+	db             *sql.DB
+	now            func() time.Time
+	eventsPerJob   int
+	onlineWindow   time.Duration
+	maxJobs        int
+	maxSessions    int
+	endedRetention time.Duration
 }
 
 // ErrUnsafeState: the database or one of its state files is a symlink or
@@ -82,6 +85,25 @@ func Open(path string, opts Options) (*Store, error) {
 	if onlineWindow <= 0 {
 		onlineWindow = DefaultOnlineWindow
 	}
+	maxJobs := opts.MaxJobs
+	if maxJobs == 0 {
+		maxJobs = MaxJobs
+	} else if maxJobs < 1 || maxJobs > MaxJobs {
+		return nil, invalidErr("max_jobs", "must be between 1 and 1000")
+	}
+	maxSessions := opts.MaxSessions
+	if maxSessions == 0 {
+		maxSessions = MaxSessions
+	} else if maxSessions < 1 || maxSessions > MaxSessions {
+		return nil, invalidErr("max_sessions", "must be between 1 and 1000")
+	}
+	endedRetention := opts.EndedRetention
+	if endedRetention == 0 {
+		endedRetention = DefaultEndedRetention
+	}
+	if endedRetention < MinEndedRetention || endedRetention > MaxEndedRetention || endedRetention%(24*time.Hour) != 0 {
+		return nil, invalidErr("ended_retention", "must be a whole number of days between 7 and 30")
+	}
 
 	if err := unsafeStateCheck(path); err != nil {
 		return nil, err
@@ -136,7 +158,7 @@ func Open(path string, opts Options) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, now: now, eventsPerJob: eventsPerJob, onlineWindow: onlineWindow}, nil
+	return &Store{db: db, now: now, eventsPerJob: eventsPerJob, onlineWindow: onlineWindow, maxJobs: maxJobs, maxSessions: maxSessions, endedRetention: endedRetention}, nil
 }
 
 // migrations[v] brings a version v schema to version v+1.
@@ -243,17 +265,146 @@ func admitNewNode(tx *sql.Tx, maquina string) error {
 	return nil
 }
 
-// admitNewLiveJob refuses a live job row that would be the MaxJobs+1-th
-// one. Polls are not capped.
-func admitNewLiveJob(tx *sql.Tx) error {
-	var live int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE encerrado = 0`).Scan(&live); err != nil {
-		return err
+// Budget kinds: a row of jobs belongs to exactly one kind by its origem.
+const (
+	// kindJobs: the pushed jobs (job) and the poll workspaces (workspace).
+	kindJobs = "jobs"
+	// kindSessions: the sessao rows.
+	kindSessions = "sessions"
+)
+
+// kindPred is the SQL predicate of one budget kind over jobs.origem.
+func kindPred(kind string) string {
+	if kind == kindSessions {
+		return `origem = 'sessao'`
 	}
-	if live >= MaxJobs {
-		return invalidErr("jobs", "limit reached")
+	return `origem IN ('job','workspace')`
+}
+
+// kindOf maps a row origem to its budget kind.
+func kindOf(origem string) string {
+	if origem == OrigemSessao {
+		return kindSessions
 	}
-	return nil
+	return kindJobs
+}
+
+// capacityCounts is the retained state of one kind at a refusal; the
+// alert line carries nothing but the kind and these numbers. protected
+// and evictable split the ended rows by the eviction predicate, so
+// retained = active + protected + evictable.
+type capacityCounts struct {
+	retained  int
+	active    int
+	protected int
+	evictable int
+	limit     int
+}
+
+// capacityErr is the capacity refusal: the ErrInvalid wrap "<kind> limit
+// reached" plus the kind's counts at the refusal, so the caller can alert
+// with only the kind and numbers.
+type capacityErr struct {
+	kind   string
+	counts capacityCounts
+	err    error
+}
+
+func (e *capacityErr) Error() string { return e.err.Error() }
+func (e *capacityErr) Unwrap() error { return e.err }
+
+// budgetOf is the configured total budget of a kind.
+func (s *Store) budgetOf(kind string) int {
+	if kind == kindSessions {
+		return s.maxSessions
+	}
+	return s.maxJobs
+}
+
+// admitNewRow admits a new row of kind kind in the running transaction,
+// called after the ended sweep and before the row's insert. When the kind
+// is at its total budget it evicts the oldest evictable ended rows of
+// that kind only (encerrado_unix past the fence), ordered by
+// encerrado_unix, maquina and chave, with their events, as many as the
+// new row needs; when fewer evictable rows exist it evicts nothing and
+// returns the capacity refusal. It never deletes an active row, a row of
+// the other kind or any claims, policies, folders, nodes or waits row.
+func (s *Store) admitNewRow(tx *sql.Tx, kind string, now time.Time) (capacityCounts, error) {
+	pred := kindPred(kind)
+	budget := s.budgetOf(kind)
+	var total int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE ` + pred).Scan(&total); err != nil {
+		return capacityCounts{}, err
+	}
+	if total+1 <= budget {
+		return capacityCounts{}, nil
+	}
+	need := total + 1 - budget
+	fenceCutoff := now.Unix() - int64(TombstoneTTL/time.Second)
+	rows, err := tx.Query(`SELECT maquina, chave FROM jobs WHERE `+pred+`
+		AND encerrado = 1 AND encerrado_unix <= ?
+		ORDER BY encerrado_unix ASC, maquina ASC, chave ASC LIMIT ?`, fenceCutoff, need)
+	if err != nil {
+		return capacityCounts{}, err
+	}
+	type victim struct{ maquina, chave string }
+	var victims []victim
+	for rows.Next() {
+		var v victim
+		if err := rows.Scan(&v.maquina, &v.chave); err != nil {
+			rows.Close()
+			return capacityCounts{}, err
+		}
+		victims = append(victims, v)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return capacityCounts{}, err
+	}
+	rows.Close()
+	if len(victims) < need {
+		var active int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE ` + pred + ` AND encerrado = 0`).Scan(&active); err != nil {
+			return capacityCounts{}, err
+		}
+		// The protected ended rows are the kind's ended rows the eviction
+		// predicate cannot touch (the fence window and the future-dated
+		// rows); the evictable ones are exactly the rows the query above
+		// found, which are fewer than needed here.
+		var protected int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE `+pred+`
+			AND encerrado = 1 AND encerrado_unix > ?`, fenceCutoff).Scan(&protected); err != nil {
+			return capacityCounts{}, err
+		}
+		return capacityCounts{}, &capacityErr{
+			kind:   kind,
+			counts: capacityCounts{retained: total, active: active, protected: protected, evictable: len(victims), limit: budget},
+			err:    invalidErr(kind, "limit reached"),
+		}
+	}
+	for _, v := range victims {
+		if _, err := tx.Exec(`DELETE FROM events WHERE maquina = ? AND chave = ?`, v.maquina, v.chave); err != nil {
+			return capacityCounts{}, err
+		}
+		if _, err := tx.Exec(`DELETE FROM jobs WHERE maquina = ? AND chave = ?`, v.maquina, v.chave); err != nil {
+			return capacityCounts{}, err
+		}
+	}
+	return capacityCounts{}, nil
+}
+
+// alertCapacity writes the one capacity alert line through the registry
+// logger. skipped is the number of skipped workspaces (a poll; zero for a
+// refused record). The line carries only the kind and counts: never a
+// machine label, key, card, branch, project, payload or credential.
+func (s *Store) alertCapacity(kind string, c capacityCounts, skipped int) {
+	if skipped > 0 {
+		logf("registry: capacity: %s limit reached (skipped %d workspaces, retained %d, active %d, protected ended %d, evictable ended %d, limit %d)",
+			kind, skipped, c.retained, c.active, c.protected, c.evictable, c.limit)
+		return
+	}
+	logf("registry: capacity: %s limit reached (retained %d, active %d, protected ended %d, evictable ended %d, limit %d)",
+		kind, c.retained, c.active, c.protected, c.evictable, c.limit)
 }
 
 // admitNewClaim refuses a claim that would be the MaxClaims+1-th live

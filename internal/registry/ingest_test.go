@@ -834,27 +834,86 @@ func TestIngestDecision(t *testing.T) {
 	}
 }
 
-// TestIngestTombstoneSweep: a tombstone older than TombstoneTTL is
-// deleted (with its events) at the start of an Ingest.
+// TestIngestEndedRetention: an ended row past the default retention
+// (30 days) is deleted (with its events) at the start of an Ingest; an
+// ended row past the fence but inside the retention (8 days) is kept,
+// and a retention of 7 days sweeps at 7 days.
 // Mutation captured: a missing sweep (or a >= swapped with >) leaves the
-// stale row.
-func TestIngestTombstoneSweep(t *testing.T) {
+// stale row; a retention shorter than the fence evicts a fence row.
+func TestIngestEndedRetention(t *testing.T) {
 	s := openStore(t)
-	_, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-old','job',1,?)`,
-		fixedNow.Unix()-int64((TombstoneTTL/time.Second))-1)
-	if err != nil {
-		t.Fatalf("seed the stale tombstone: %v", err)
+	var stale = fixedNow.Unix() - int64(DefaultEndedRetention/time.Second) - 1
+	var fenceExpired = fixedNow.Unix() - int64((8*24*time.Hour)/time.Second)
+	if _, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-old','job',1,?)`,
+		stale); err != nil {
+		t.Fatalf("seed the stale ended row: %v", err)
 	}
-	_, err = s.db.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo) VALUES('node-a','job-old',1,'2026-01-01T00:00:00-03:00','note','x')`)
-	if err != nil {
+	if _, err := s.db.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo) VALUES('node-a','job-old',1,'2026-01-01T00:00:00-03:00','note','x')`); err != nil {
 		t.Fatalf("seed the stale event: %v", err)
 	}
+	if _, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-fence','job',1,?)`,
+		fenceExpired); err != nil {
+		t.Fatalf("seed the fence-expired ended row: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo) VALUES('node-a','job-fence',1,'2026-01-01T00:00:00-03:00','note','x')`); err != nil {
+		t.Fatalf("seed the fence event: %v", err)
+	}
 	mustIngest(t, s, recordBase(nil))
-	if n := tableCount(t, s, "jobs") - 1; n != 0 {
-		t.Errorf("stale tombstones left = %d, want 0 (the ingested job is expected)", n)
+	if n := tableCount(t, s, "jobs") - 2; n != 0 {
+		t.Errorf("ended rows left = %d, want 0 (only the 8-day fence-expired row and the ingested job remain)", n)
+	}
+	if f := jobFact(t, s, "node-a", "job-fence"); !f.exists || f.encerrado != 1 {
+		t.Errorf("8-day ended row = %+v, want kept until the retention", f)
+	}
+	if f := jobFact(t, s, "node-a", "job-old"); f.exists {
+		t.Errorf("31-day ended row = %+v, want swept with its event", f)
+	}
+	if n := tableCount(t, s, "events"); n != 2 {
+		t.Errorf("events left = %d, want 2 (the ingested one and the 8-day row's)", n)
+	}
+}
+
+// TestIngestEndedRetentionShort: a retention of 7 days (the fence minimum)
+// sweeps an ended row once it is 7 days old, and keeps a 7-day fence row
+// at the exact boundary (the sweep is a strict <).
+func TestIngestEndedRetentionShort(t *testing.T) {
+	nowFn, set := movableClock()
+	s, err := Open(pathFor(t), Options{Now: nowFn, EndedRetention: 7 * 24 * time.Hour})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if _, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-past','job',1,?)`,
+		fixedNow.Unix()-int64((7*24*time.Hour)/time.Second)-1); err != nil {
+		t.Fatalf("seed the past row: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo) VALUES('node-a','job-past',1,'2026-01-01T00:00:00-03:00','note','x')`); err != nil {
+		t.Fatalf("seed the past event: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO jobs(maquina, chave, origem, encerrado, encerrado_unix) VALUES('node-a','job-at','job',1,?)`,
+		fixedNow.Unix()-int64((7*24*time.Hour)/time.Second)); err != nil {
+		t.Fatalf("seed the boundary row: %v", err)
+	}
+	mustIngest(t, s, recordBase(nil))
+	if f := jobFact(t, s, "node-a", "job-past"); f.exists {
+		t.Errorf("7-day+1s ended row = %+v, want swept at the 7-day retention", f)
 	}
 	if n := tableCount(t, s, "events"); n != 1 {
 		t.Errorf("events left = %d, want 1 (the ingested one)", n)
+	}
+	// The boundary row stays; a later sweep after the clock moves on
+	// removes it.
+	if f := jobFact(t, s, "node-a", "job-at"); !f.exists || f.encerrado != 1 {
+		t.Fatalf("boundary ended row = %+v, want kept at the exact boundary", f)
+	}
+	set(1)
+	mustIngest(t, s, recordBase(func(r *outbox.Record) {
+		r.JobID = ptr("job-later")
+		r.IdempotencyKey = "job-later:1"
+		r.Dados = eventData(1, jobapi.TypeAccepted, "x", nil)
+	}))
+	if f := jobFact(t, s, "node-a", "job-at"); f.exists {
+		t.Errorf("ended row past the retention after the clock moved = %+v, want swept", f)
 	}
 }
 

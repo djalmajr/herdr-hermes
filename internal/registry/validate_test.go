@@ -391,6 +391,10 @@ func ptr[T any](v T) *T { return &v }
 
 // TestAdmissionCaps: every admission cap admits the N-th row and refuses
 // the N+1-th with an ErrInvalid whose text is "<what> limit reached" (R7c).
+// The jobs subtest is the total-budget test: the budget counts every
+// retained row of the kind (active plus ended), a cleanup of an unseen
+// job creates a fence row and consumes the budget, and ended rows past
+// the fence are evicted to make room for a new one.
 func TestAdmissionCaps(t *testing.T) {
 	t.Run("nodes", func(t *testing.T) {
 		s := openStore(t)
@@ -423,7 +427,7 @@ func TestAdmissionCaps(t *testing.T) {
 			r.IdempotencyKey = "j-last:1"
 			r.Dados = eventData(1, jobapi.TypeAccepted, "x", nil)
 		})) {
-			t.Fatal("the 1000th live job: applied = false")
+			t.Fatal("the 1000th job: applied = false")
 		}
 		_, err := s.Ingest(recordBase(func(r *outbox.Record) {
 			r.JobID = ptr("j-more")
@@ -431,10 +435,10 @@ func TestAdmissionCaps(t *testing.T) {
 			r.Dados = eventData(1, jobapi.TypeAccepted, "x", nil)
 		}))
 		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "jobs limit reached") {
-			t.Fatalf("1001th live job: err = %v, want the jobs limit refusal", err)
+			t.Fatalf("1001th job: err = %v, want the jobs limit refusal", err)
 		}
 		// Mutation captured: a dispatch or amend that inserts without the
-		// admission check passes the 1001th live job.
+		// admission check passes the 1001th job.
 		for _, tipo := range []string{outbox.TipoDispatch, outbox.TipoAmend} {
 			_, err := s.Ingest(recordBase(func(r *outbox.Record) {
 				r.Tipo = tipo
@@ -443,21 +447,47 @@ func TestAdmissionCaps(t *testing.T) {
 				r.Dados = json.RawMessage(`{}`)
 			}))
 			if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "jobs limit reached") {
-				t.Fatalf("%s of a 1001th live job: err = %v, want the jobs limit refusal", tipo, err)
+				t.Fatalf("%s of a 1001th job: err = %v, want the jobs limit refusal", tipo, err)
 			}
 		}
-		// Mutation captured: admitting a cleanup of an unseen job like a
-		// live one refuses it at the limit, although it takes no slot.
-		if !mustIngest(t, s, recordBase(func(r *outbox.Record) {
+		// A cleanup of an unseen job creates a fence row and consumes the
+		// jobs budget: at the full budget it is refused like any new row.
+		_, err = s.Ingest(recordBase(func(r *outbox.Record) {
 			r.JobID = ptr("j-gone")
 			r.IdempotencyKey = "j-gone:5"
 			r.Dados = eventData(5, jobapi.TypeCleanup, "x", nil)
+		}))
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "jobs limit reached") {
+			t.Fatalf("cleanup of an unseen job at the full budget: err = %v, want the jobs limit refusal", err)
+		}
+		if n := tableCount(t, s, "jobs"); n != MaxJobs {
+			t.Errorf("jobs rows = %d, want %d (the refusals evicted and created nothing)", n, MaxJobs)
+		}
+		// An ended row past the fence is evicted to make room for a new
+		// job; the eviction keeps the budget total.
+		if _, err := s.db.Exec(`UPDATE jobs SET encerrado = 1, encerrado_unix = ? WHERE maquina = 'node-a' AND chave = 'j0001'`,
+			fixedNow.Unix()-int64((8*24*time.Hour)/time.Second)); err != nil {
+			t.Fatalf("end j0001: %v", err)
+		}
+		if !mustIngest(t, s, recordBase(func(r *outbox.Record) {
+			r.JobID = ptr("j-next")
+			r.IdempotencyKey = "j-next:1"
+			r.Dados = eventData(1, jobapi.TypeAccepted, "x", nil)
 		})) {
-			t.Fatal("cleanup of an unseen job at the limit: applied = false")
+			t.Fatal("new job after an evictable ended row: applied = false")
+		}
+		if n := tableCount(t, s, "jobs"); n != MaxJobs {
+			t.Errorf("jobs rows after the eviction = %d, want %d (one evicted, one inserted)", n, MaxJobs)
+		}
+		if f := jobFact(t, s, "node-a", "j0001"); f.exists {
+			t.Errorf("j0001 = %+v, want evicted", f)
+		}
+		if f := jobFact(t, s, "node-a", "j-next"); !f.exists || f.encerrado != 0 {
+			t.Errorf("j-next = %+v, want the new live row", f)
 		}
 		inv, err := s.Inventory(Filter{})
 		if err != nil || len(inv.Jobs) != MaxJobs {
-			t.Fatalf("inventory = %d jobs (%v), want %d live", len(inv.Jobs), err, MaxJobs)
+			t.Fatalf("inventory = %d jobs (%v), want %d live (the only ended row was evicted)", len(inv.Jobs), err, MaxJobs)
 		}
 	})
 	t.Run("claims", func(t *testing.T) {

@@ -29,8 +29,11 @@ var recordTypes = map[string]bool{
 var errNoRow = sql.ErrNoRows
 
 // Ingest applies one record of the machine's outbox and reports whether
-// the record changed the registry. Every valid record touches the node
-// and runs the tombstone sweep, in one transaction.
+// the record changed the registry. The retention sweep and the record
+// projection run in one transaction; the record's own writes (the node
+// contact and the projection) run in a savepoint, so a refused record
+// leaves no trace while the sweep commits (it only removes rows past the
+// retention and is always safe).
 func (s *Store) Ingest(rec outbox.Record) (bool, error) {
 	ts, err := validateRecord(rec)
 	if err != nil {
@@ -59,27 +62,71 @@ func (s *Store) Ingest(rec outbox.Record) (bool, error) {
 		}
 	}
 	applied := true
+	var refusalErr error
+	var capRefusal *capacityErr
 	err = s.tx(func(tx *sql.Tx) error {
 		now := s.now()
-		if err := touchNode(tx, rec.Maquina, now); err != nil {
+		// The sweep commits even when the record is refused below: it
+		// only removes rows past the retention.
+		if err := sweepEnded(tx, s.endedRetention, now); err != nil {
 			return err
 		}
-		if err := sweepDead(tx, now); err != nil {
+		if _, err := tx.Exec(`SAVEPOINT record_writes`); err != nil {
 			return err
 		}
-		switch rec.Tipo {
-		case outbox.TipoJobEvent:
-			applied, err = ingestJobEvent(tx, s.eventsPerJob, rec, ev, now)
-		case outbox.TipoDispatch, outbox.TipoAmend:
-			applied, err = ingestDispatch(tx, rec, ts)
-		case outbox.TipoSession:
-			applied, err = ingestSession(tx, rec, sd, ts, now)
-		case outbox.TipoDecision:
-			applied, err = ingestDecision(tx, rec, ts)
+		var inner error
+		applied, inner = s.ingestRecord(tx, rec, ev, sd, ts, now)
+		if errors.Is(inner, ErrInvalid) {
+			// A refusal: the node contact and the record's own writes
+			// roll back to the savepoint; the sweep before it commits.
+			var capErr *capacityErr
+			if errors.As(inner, &capErr) {
+				capRefusal = capErr
+			}
+			refusalErr = inner
+			applied = false
+			if _, err := tx.Exec(`ROLLBACK TO record_writes`); err != nil {
+				return err
+			}
+			return nil
 		}
-		return err
+		if inner != nil {
+			return inner
+		}
+		if _, err := tx.Exec(`RELEASE record_writes`); err != nil {
+			return err
+		}
+		return nil
 	})
-	return applied, err
+	if err != nil {
+		return false, err
+	}
+	if refusalErr != nil {
+		if capRefusal != nil {
+			s.alertCapacity(capRefusal.kind, capRefusal.counts, 0)
+		}
+		return false, refusalErr
+	}
+	return applied, nil
+}
+
+// ingestRecord applies one validated record inside the running
+// transaction: the node contact and the record's projection.
+func (s *Store) ingestRecord(tx *sql.Tx, rec outbox.Record, ev jobapi.Event, sd sessionDados, ts, now time.Time) (bool, error) {
+	if err := touchNode(tx, rec.Maquina, now); err != nil {
+		return false, err
+	}
+	switch rec.Tipo {
+	case outbox.TipoJobEvent:
+		return ingestJobEvent(tx, s, s.eventsPerJob, rec, ev, now)
+	case outbox.TipoDispatch, outbox.TipoAmend:
+		return ingestDispatch(tx, s, rec, ts, now)
+	case outbox.TipoSession:
+		return ingestSession(tx, s, rec, sd, ts, now)
+	case outbox.TipoDecision:
+		return ingestDecision(tx, rec, ts)
+	}
+	return false, invalidErr("tipo", "unknown tipo")
 }
 
 // validateRecord checks the record shape of every outbox type and returns
@@ -217,9 +264,12 @@ func touchNode(tx *sql.Tx, maquina string, at time.Time) error {
 	return err
 }
 
-// sweepDead deletes the tombstones older than the TTL, with their events.
-func sweepDead(tx *sql.Tx, now time.Time) error {
-	cutoff := now.Unix() - int64(TombstoneTTL/time.Second)
+// sweepEnded deletes the ended rows past the retention, of every kind,
+// with their events. A row inside the retention stays: a fence within the
+// replay-fence window, and a future-dated row (the clock went backwards),
+// are not past the retention.
+func sweepEnded(tx *sql.Tx, retention time.Duration, now time.Time) error {
+	cutoff := now.Unix() - int64(retention/time.Second)
 	if _, err := tx.Exec(`DELETE FROM events WHERE (maquina, chave) IN
 		(SELECT maquina, chave FROM jobs WHERE encerrado = 1 AND encerrado_unix < ?)`, cutoff); err != nil {
 		return err
@@ -354,7 +404,7 @@ func ringEvents(tx *sql.Tx, maquina, chave string) ([]ringEvent, error) {
 // tombstoned job, a duplicate and a stale replay below a full ring; the
 // refusals are decided before the job row is touched, so a refused record
 // changes no job column.
-func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.Event, now time.Time) (bool, error) {
+func ingestJobEvent(tx *sql.Tx, s *Store, eventsPerJob int, rec outbox.Record, ev jobapi.Event, now time.Time) (bool, error) {
 	jobID := *rec.JobID
 	row, err := jobRowOf(tx, rec.Maquina, jobID)
 	if err != nil {
@@ -392,12 +442,10 @@ func ingestJobEvent(tx *sql.Tx, eventsPerJob int, rec outbox.Record, ev jobapi.E
 	// in the record path.
 	evTSOut := evTS.Format(outbox.TSLayout)
 	if row == nil {
-		// A cleanup of a job never seen before is tombstoned below in
-		// this same transaction, so it takes no live slot.
-		if ev.Tipo != jobapi.TypeCleanup {
-			if err := admitNewLiveJob(tx); err != nil {
-				return false, err
-			}
+		// A cleanup of a job never seen before creates a fence row and
+		// consumes the jobs budget like every new row.
+		if _, err := s.admitNewRow(tx, kindJobs, now); err != nil {
+			return false, err
 		}
 		if _, err := tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, projeto, fonte_push, obsoleto)
 			VALUES(?,?,?, ?,?, 1, 0)`,
@@ -628,7 +676,7 @@ func maxUltima(tx *sql.Tx, maquina, chave string, ts time.Time) error {
 
 // ingestDispatch upserts the job of a dispatch or amend record without
 // interpreting its dados.
-func ingestDispatch(tx *sql.Tx, rec outbox.Record, ts time.Time) (bool, error) {
+func ingestDispatch(tx *sql.Tx, s *Store, rec outbox.Record, ts, now time.Time) (bool, error) {
 	jobID := *rec.JobID
 	row, err := jobRowOf(tx, rec.Maquina, jobID)
 	if err != nil {
@@ -639,7 +687,7 @@ func ingestDispatch(tx *sql.Tx, rec outbox.Record, ts time.Time) (bool, error) {
 		return true, nil
 	}
 	if row == nil {
-		if err := admitNewLiveJob(tx); err != nil {
+		if _, err := s.admitNewRow(tx, kindJobs, now); err != nil {
 			return false, err
 		}
 		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, projeto, fonte_push, obsoleto, ultima_atividade, ultima_atividade_unix)
@@ -660,7 +708,7 @@ func ingestDispatch(tx *sql.Tx, rec outbox.Record, ts time.Time) (bool, error) {
 // omits (or carries invalid) keeps the stored value. A jobless end for a
 // target that does not exist yet creates the row already tombstoned.
 // Every job it creates or updates gets the push provenance.
-func ingestSession(tx *sql.Tx, rec outbox.Record, sd sessionDados, ts, now time.Time) (bool, error) {
+func ingestSession(tx *sql.Tx, s *Store, rec outbox.Record, sd sessionDados, ts, now time.Time) (bool, error) {
 	projeto := sd.Projeto
 	if projeto == "" {
 		projeto = rec.Projeto
@@ -699,10 +747,10 @@ func ingestSession(tx *sql.Tx, rec outbox.Record, sd sessionDados, ts, now time.
 			v := now.Unix()
 			encerradoUnix = &v
 		}
-		if encerrado == 0 {
-			if err := admitNewLiveJob(tx); err != nil {
-				return false, err
-			}
+		// A live row and the end-first fence row both consume the kind's
+		// total budget.
+		if _, err := s.admitNewRow(tx, kindOf(origem), now); err != nil {
+			return false, err
 		}
 		_, err = tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, card, branch, pr, projeto, fonte_push, sessao_ts_unix, sessao_seq, encerrado, encerrado_unix, ultima_atividade, ultima_atividade_unix)
 			VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)`,
@@ -718,10 +766,9 @@ func ingestSession(tx *sql.Tx, rec outbox.Record, sd sessionDados, ts, now time.
 			return true, err
 		}
 		// A newer start or update opens a new session on the same
-		// project and branch; nothing of the closed one carries over.
-		if err := admitNewLiveJob(tx); err != nil {
-			return false, err
-		}
+		// project and branch; nothing of the closed one carries over. It
+		// reuses the row, so it adds no row and is never refused for
+		// capacity.
 		if _, err = tx.Exec(`UPDATE jobs SET encerrado = 0, encerrado_unix = NULL, card = NULL, pr = NULL WHERE maquina = ? AND chave = ?`,
 			rec.Maquina, chave); err != nil {
 			return false, err

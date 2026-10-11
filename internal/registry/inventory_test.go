@@ -376,8 +376,16 @@ func TestTwoNodeInventory(t *testing.T) {
 // TestInventoryWorstCaseBound: one row of each pushed or operator table,
 // with every kept value at its length bound and made of characters JSON
 // escapes to six bytes, serialized and multiplied by its table cap, stays
-// under MaxInventoryBytes, the most the jobs client reads. Poll rows come
-// from the operator's own Herdr and are not part of the bound.
+// under MaxInventoryBytes, the most the jobs client reads. The jobs list
+// holds the active rows of both budget kinds (the poll workspaces are
+// inside the jobs budget). The worst case is reachable, so it models it:
+// MaxJobs jobs-kind rows, each with its full event ring and its wait,
+// plus MaxSessions sessions-kind rows at their field bounds. A sessao row
+// never carries an event ring: a job_event record's key is its job_id,
+// which the contract id rule (no ':' or '#') cannot address with a
+// sessao key, and no other record type or the poll writes events
+// (TestSessionKeysNeverHoldEvents proves every path with hostile
+// inputs), so a uniform worst case would size a state that cannot exist.
 func TestInventoryWorstCaseBound(t *testing.T) {
 	s := openStore(t)
 	refs := map[string]any{}
@@ -417,15 +425,38 @@ func TestInventoryWorstCaseBound(t *testing.T) {
 	if _, err := s.Check(CheckRequest{Agente: strings.Repeat("a", 64), Maquina: "node-b", Card: "A" + strings.Repeat("b", 15) + "-123456789", Projeto: strings.Repeat("c", 100) + "/" + strings.Repeat("d", 100), Branch: strings.Repeat("e", 200), PR: "123456789", Workspace: "w" + strings.Repeat("x", 63)}); err != nil {
 		t.Fatalf("Check: %v", err)
 	}
+	// The worst sessions-kind row: a sessao row with every text field at
+	// its bound and no events (impossible for a sessao row, measured at
+	// its own fields only).
+	sessProjeto := strings.Repeat("a", 100) + "/" + strings.Repeat("b", 100)
+	sessBranch := strings.Repeat("e", 200)
+	if !mustIngest(t, s, recordBase(func(r *outbox.Record) {
+		r.Tipo = outbox.TipoSession
+		r.TS = "2026-10-10T11:30:00-03:00"
+		r.IdempotencyKey = "node-a:sess-worst"
+		r.Projeto = sessProjeto
+		r.Dados = json.RawMessage(`{"acao":"start","projeto":"` + sessProjeto + `","branch":"` + sessBranch + `","card":"Abcdefghijklmno-123456789","pr":"123456789"}`)
+	})) {
+		t.Fatal("worst sessions row: applied = false")
+	}
 	inv, err := s.Inventory(Filter{})
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
-	if len(inv.Jobs) != 1 || len(inv.Esperas) != 1 || len(inv.Politicas) != 1 || len(inv.Pastas) != 1 || len(inv.Claims) != 1 || len(inv.Nodes) == 0 {
-		t.Fatalf("inventory rows = %d jobs, %d esperas, %d politicas, %d pastas, %d claims, %d nodes; want one of each", len(inv.Jobs), len(inv.Esperas), len(inv.Politicas), len(inv.Pastas), len(inv.Claims), len(inv.Nodes))
+	if len(inv.Jobs) != 2 || len(inv.Esperas) != 1 || len(inv.Politicas) != 1 || len(inv.Pastas) != 1 || len(inv.Claims) != 1 || len(inv.Nodes) == 0 {
+		t.Fatalf("inventory rows = %d jobs, %d esperas, %d politicas, %d pastas, %d claims, %d nodes; want the job and session rows and one of the rest", len(inv.Jobs), len(inv.Esperas), len(inv.Politicas), len(inv.Pastas), len(inv.Claims), len(inv.Nodes))
 	}
 	if n := len(inv.Jobs[0].Eventos); n != DefaultEventsPerJob {
 		t.Fatalf("events kept = %d, want %d", n, DefaultEventsPerJob)
+	}
+	var sessRow *Job
+	for i := range inv.Jobs {
+		if inv.Jobs[i].Origem == OrigemSessao {
+			sessRow = &inv.Jobs[i]
+		}
+	}
+	if sessRow == nil {
+		t.Fatalf("the worst sessions row is missing from the inventory")
 	}
 	size := func(v any) int {
 		b, err := json.Marshal(v)
@@ -436,6 +467,7 @@ func TestInventoryWorstCaseBound(t *testing.T) {
 	}
 	total := 1024 +
 		MaxJobs*(size(inv.Jobs[0])+size(inv.Esperas[0])) +
+		MaxSessions*(size(sessRow)+size(inv.Esperas[0])) +
 		MaxPolicies*size(inv.Politicas[0]) +
 		MaxFolders*size(inv.Pastas[0]) +
 		MaxClaims*size(inv.Claims[0]) +

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,6 +207,21 @@ func TestServeUsage(t *testing.T) {
 		{"poll below range", []string{"--poll-interval", "9"}, "serve: --poll-interval"},
 		{"poll above range", []string{"--poll-interval", "3601"}, "serve: --poll-interval"},
 		{"poll not integer", []string{"--poll-interval", "x"}, "serve: --poll-interval"},
+		{"max-jobs below range", []string{"--max-jobs", "0"}, "serve: --max-jobs must be an integer between 1 and 1000"},
+		{"max-jobs above range", []string{"--max-jobs", "1001"}, "serve: --max-jobs must be an integer between 1 and 1000"},
+		{"max-jobs not integer", []string{"--max-jobs", "x"}, "serve: --max-jobs must be an integer between 1 and 1000"},
+		{"repeated max-jobs", []string{"--max-jobs", "5", "--max-jobs", "6"}, "usage: serve"},
+		{"max-jobs missing value", []string{"--max-jobs"}, "usage: serve"},
+		{"max-sessions below range", []string{"--max-sessions", "0"}, "serve: --max-sessions must be an integer between 1 and 1000"},
+		{"max-sessions above range", []string{"--max-sessions", "1001"}, "serve: --max-sessions must be an integer between 1 and 1000"},
+		{"max-sessions not integer", []string{"--max-sessions", "x"}, "serve: --max-sessions must be an integer between 1 and 1000"},
+		{"repeated max-sessions", []string{"--max-sessions", "5", "--max-sessions", "6"}, "usage: serve"},
+		{"max-sessions missing value", []string{"--max-sessions"}, "usage: serve"},
+		{"retention below range", []string{"--ended-retention-days", "6"}, "serve: --ended-retention-days must be an integer between 7 and 30"},
+		{"retention above range", []string{"--ended-retention-days", "31"}, "serve: --ended-retention-days must be an integer between 7 and 30"},
+		{"retention not integer", []string{"--ended-retention-days", "x"}, "serve: --ended-retention-days must be an integer between 7 and 30"},
+		{"repeated retention", []string{"--ended-retention-days", "7", "--ended-retention-days", "8"}, "usage: serve"},
+		{"retention missing value", []string{"--ended-retention-days"}, "usage: serve"},
 		{"machines duplicate", []string{"--machines", "a,a"}, "serve: --machines"},
 		{"machines bad label", []string{"--machines", "-x"}, "serve: --machines"},
 		{"machines too many", []string{"--machines", manyList}, "serve: --machines"},
@@ -239,6 +255,46 @@ func TestServeNowrite(t *testing.T) {
 		t.Errorf("stdout = %q", stdout)
 	}
 	assertDirEmpty(t, dir)
+}
+
+// TestServeRetentionFlags: a valid --max-sessions value reaches the store:
+// with a budget of one session, the first end-first session push through
+// the served API applies and the second is refused with the one-line 400
+// invalid.
+func TestServeRetentionFlags(t *testing.T) {
+	dbDir := t.TempDir()
+	db := filepath.Join(dbDir, "registry.db")
+	cfgDir := t.TempDir()
+	base, exitCh, cancel, _, _ := startServe(t, cfgDir, db, "--machines", "", "--max-sessions", "1")
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-exitCh:
+		case <-time.After(15 * time.Second):
+		}
+	})
+	rec := func(seq int, branch string) string {
+		return fmt.Sprintf(`{"schema":1,"seq":%d,"ts":"2026-10-10T11:%02d:00-03:00","tipo":"session","maquina":"node-a","projeto":"org/x","idempotency_key":"node-a:%d","dados":{"acao":"end","projeto":"org/x","branch":"%s"}}`, seq, seq, seq, branch)
+	}
+	post := func(body string) (int, string) {
+		t.Helper()
+		resp, err := http.Post(base+"/v1/ingest", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /v1/ingest: %v", err)
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read the answer: %v", err)
+		}
+		return resp.StatusCode, string(data)
+	}
+	if code, body := post(rec(1, "feat/a")); code != 200 || body != `{"status":"ok","aplicado":true}`+"\n" {
+		t.Fatalf("first end-first session = %d %q, want 200 ok/applied", code, body)
+	}
+	if code, body := post(rec(2, "feat/b")); code != 400 || body != `{"status":"invalid","motivo":"sessions limit reached"}`+"\n" {
+		t.Fatalf("second end-first session = %d %q, want the one-line 400 refusal", code, body)
+	}
 }
 
 // TestListenerIsLoopback: the post-bind check is true only for loopback

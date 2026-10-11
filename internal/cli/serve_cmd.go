@@ -57,18 +57,24 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 // serveFlags is the parsed form of the serve arguments: each flag in the
 // space form, at most once.
 type serveFlags struct {
-	listen      string
-	listenSet   bool
-	db          string
-	dbSet       bool
-	machines    string
-	machinesSet bool
-	pollS       string
-	pollSSet    bool
+	listen         string
+	listenSet      bool
+	db             string
+	dbSet          bool
+	machines       string
+	machinesSet    bool
+	pollS          string
+	pollSSet       bool
+	maxJobs        string
+	maxJobsSet     bool
+	maxSessions    string
+	maxSessionsSet bool
+	retentionDays  string
+	retentionSet   bool
 }
 
-// parseServeFlags accepts only the four flags, in the space form, each at
-// most once, followed by a value; anything else is malformed.
+// parseServeFlags accepts only the flags, in the space form, each at most
+// once, followed by a value; anything else is malformed.
 func parseServeFlags(args []string) (serveFlags, bool) {
 	var f serveFlags
 	for i := 0; i < len(args); i++ {
@@ -96,6 +102,24 @@ func parseServeFlags(args []string) (serveFlags, bool) {
 				return f, false
 			}
 			f.pollS, f.pollSSet = args[i+1], true
+			i++
+		case "--max-jobs":
+			if f.maxJobsSet || i+1 >= len(args) {
+				return f, false
+			}
+			f.maxJobs, f.maxJobsSet = args[i+1], true
+			i++
+		case "--max-sessions":
+			if f.maxSessionsSet || i+1 >= len(args) {
+				return f, false
+			}
+			f.maxSessions, f.maxSessionsSet = args[i+1], true
+			i++
+		case "--ended-retention-days":
+			if f.retentionSet || i+1 >= len(args) {
+				return f, false
+			}
+			f.retentionDays, f.retentionSet = args[i+1], true
 			i++
 		default:
 			return f, false
@@ -135,7 +159,7 @@ func parseMachineList(value string) ([]string, bool) {
 func cmdServe(args []string, env Env) int {
 	f, ok := parseServeFlags(args)
 	if !ok {
-		badUsage(env, "usage: serve [--listen <host:port>] [--db <path>] [--machines <label,...>] [--poll-interval <seconds>]")
+		badUsage(env, "usage: serve [--listen <host:port>] [--db <path>] [--machines <label,...>] [--poll-interval <seconds>] [--max-jobs <n>] [--max-sessions <n>] [--ended-retention-days <n>]")
 		return 2
 	}
 	cfg, err := config.Load(env.ConfigDir)
@@ -177,8 +201,33 @@ func cmdServe(args []string, env Env) int {
 		}
 		pollS = n
 	}
+	opts := registry.Options{Now: env.Now}
+	if f.maxJobsSet {
+		n, err := strconv.Atoi(f.maxJobs)
+		if err != nil || n < 1 || n > 1000 {
+			fail(env, 2, "serve: --max-jobs must be an integer between 1 and 1000")
+			return 2
+		}
+		opts.MaxJobs = n
+	}
+	if f.maxSessionsSet {
+		n, err := strconv.Atoi(f.maxSessions)
+		if err != nil || n < 1 || n > 1000 {
+			fail(env, 2, "serve: --max-sessions must be an integer between 1 and 1000")
+			return 2
+		}
+		opts.MaxSessions = n
+	}
+	if f.retentionSet {
+		n, err := strconv.Atoi(f.retentionDays)
+		if err != nil || n < 7 || n > 30 {
+			fail(env, 2, "serve: --ended-retention-days must be an integer between 7 and 30")
+			return 2
+		}
+		opts.EndedRetention = time.Duration(n) * 24 * time.Hour
+	}
 
-	store, err := registry.Open(db, registry.Options{Now: env.Now})
+	store, err := registry.Open(db, opts)
 	if err != nil {
 		_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: serve:", err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "serve: registry database unavailable"}))

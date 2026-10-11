@@ -36,15 +36,33 @@ const (
 	DefaultClaimTTL = time.Hour
 	MinClaimTTL     = time.Minute
 	MaxClaimTTL     = 24 * time.Hour
-	// TombstoneTTL is how long a closed job or session is remembered so a
-	// late or replayed record cannot bring it back.
+	// TombstoneTTL is the replay-fence window: an ended row whose
+	// encerrado_unix is within it, or in the future (the clock went
+	// backwards), is a protected fence and is never deleted, swept or
+	// evicted, so a late or replayed record cannot bring the job or
+	// session back.
 	TombstoneTTL = 7 * 24 * time.Hour
 	// MaxResumo is the cut of an event resumo, in code points.
 	MaxResumo = 280
 
+	// Ended-row retention: an ended row is kept for the retention and
+	// swept with its events once it is older.
+	// DefaultEndedRetention is the default retention.
+	DefaultEndedRetention = 30 * 24 * time.Hour
+	// MinEndedRetention is the shortest retention: the fence, so a fence
+	// replay is never swept out from under the retention.
+	MinEndedRetention = TombstoneTTL
+	// MaxEndedRetention is the longest retention.
+	MaxEndedRetention = 30 * 24 * time.Hour
+
 	// Admission caps: what the registry admits before it refuses.
-	MaxNodes    = 64
-	MaxJobs     = 1000
+	MaxNodes = 64
+	// MaxJobs is the total retained rows of the jobs kind (active plus
+	// ended): the jobs budget default and ceiling.
+	MaxJobs = 1000
+	// MaxSessions is the total retained rows of the sessions kind (active
+	// plus ended): the sessions budget default and ceiling.
+	MaxSessions = 1000
 	MaxClaims   = 1000
 	MaxPolicies = 1000
 	MaxFolders  = 1000
@@ -133,6 +151,20 @@ type Options struct {
 	EventsPerJob int
 	// OnlineWindow; DefaultOnlineWindow when zero or negative.
 	OnlineWindow time.Duration
+	// MaxJobs is the total retained rows of the jobs kind (active plus
+	// ended), a positive integer 1..MaxJobs; MaxJobs when zero. A value
+	// outside the range makes Open fail with an ErrInvalid wrap.
+	MaxJobs int
+	// MaxSessions is the total retained rows of the sessions kind (active
+	// plus ended), a positive integer 1..MaxSessions; MaxSessions when
+	// zero. A value outside the range makes Open fail with an ErrInvalid
+	// wrap.
+	MaxSessions int
+	// EndedRetention is how long an ended row is retained before the
+	// sweep removes it: whole days, 7..30; DefaultEndedRetention when
+	// zero. A value outside the range, or not a whole number of days,
+	// makes Open fail with an ErrInvalid wrap.
+	EndedRetention time.Duration
 }
 
 // Event is one stored job event. Refs keeps only the allowlisted keys

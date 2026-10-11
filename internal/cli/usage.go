@@ -13,7 +13,8 @@ commands:
                                     cancel, close, list)
   route [--machine <label>]         choose the machine for a new job (dispatcher side, read-only)
   serve [--listen <host:port>] [--db <path>] [--machines <label,...>]
-                        [--poll-interval <seconds>]
+                        [--poll-interval <seconds>] [--max-jobs <n>]
+                        [--max-sessions <n>] [--ended-retention-days <n>]
                                     run the registry service on a loopback address:
                                     inventory push, poll and read/write HTTP API
   jobs [--maquina <label>] [--agente <a>] [--server <url>]

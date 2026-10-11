@@ -18,8 +18,8 @@ func (s *Store) ApplyPoll(p PollResult) error {
 	}
 	return s.tx(func(tx *sql.Tx) error {
 		now := s.now()
-		// The dead rows leave before the poll lands.
-		if err := sweepDead(tx, now); err != nil {
+		// The ended rows past the retention leave before the poll lands.
+		if err := sweepEnded(tx, s.endedRetention, now); err != nil {
 			return err
 		}
 		at := p.At
@@ -28,7 +28,7 @@ func (s *Store) ApplyPoll(p PollResult) error {
 			if err := touchPollNode(tx, p.Maquina, p.HerdrVersion, at); err != nil {
 				return err
 			}
-			if err := applyPollWorkspaces(tx, p, at, now); err != nil {
+			if err := applyPollWorkspaces(tx, s, p, at, now); err != nil {
 				return err
 			}
 			return replaceWaits(tx, p, at)
@@ -79,10 +79,16 @@ func workspaceChave(label, id string) (key, origem string, ok bool) {
 
 // applyPollWorkspaces upserts one job row per seen workspace, re-derives
 // the owner of an hm row from its current label, binds the matching
-// claims and clears the rows that disappeared.
-func applyPollWorkspaces(tx *sql.Tx, p PollResult, at, now time.Time) error {
+// claims and clears the rows that disappeared. A new workspace that the
+// jobs budget cannot admit is skipped (the poll is a snapshot, not a
+// consumed input): every other change of the same poll still applies and
+// the next poll tries it again, with at most one alert line per kind per
+// poll.
+func applyPollWorkspaces(tx *sql.Tx, s *Store, p PollResult, at, now time.Time) error {
 	atTS := at.Format(outbox.TSLayout)
 	seen := make(map[string]bool, len(p.Workspaces))
+	skipped := map[string]int{kindJobs: 0, kindSessions: 0}
+	var lastCounts map[string]capacityCounts
 	for _, ws := range p.Workspaces {
 		chave, origem, ok := workspaceChave(ws.Label, ws.ID)
 		if !ok {
@@ -96,6 +102,22 @@ func applyPollWorkspaces(tx *sql.Tx, p PollResult, at, now time.Time) error {
 		if row != nil && row.encerrado == 1 {
 			// A tombstoned id is skipped.
 			continue
+		}
+		if row == nil {
+			if _, err := s.admitNewRow(tx, kindOf(origem), now); err != nil {
+				var capErr *capacityErr
+				if !errors.As(err, &capErr) {
+					return err
+				}
+				// The new workspace is skipped; the next poll tries it
+				// again.
+				skipped[capErr.kind]++
+				if lastCounts == nil {
+					lastCounts = map[string]capacityCounts{}
+				}
+				lastCounts[capErr.kind] = capErr.counts
+				continue
+			}
 		}
 		seen[chave] = true
 		// The last activity moves when the row is new, the agent is
@@ -157,6 +179,17 @@ func applyPollWorkspaces(tx *sql.Tx, p PollResult, at, now time.Time) error {
 		}
 		if err := bindClaim(tx, p.Maquina, chave, ws.Label, now); err != nil {
 			return err
+		}
+	}
+	// One alert line per kind per poll, with the number of skipped
+	// workspaces; the line carries only the kind and counts.
+	for _, kind := range []string{kindJobs, kindSessions} {
+		if n := skipped[kind]; n > 0 {
+			var c capacityCounts
+			if lastCounts != nil {
+				c = lastCounts[kind]
+			}
+			s.alertCapacity(kind, c, n)
 		}
 	}
 	// The rows the poll no longer sees.
