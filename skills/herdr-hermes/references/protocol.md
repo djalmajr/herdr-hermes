@@ -64,7 +64,7 @@ The probe is read-only and uses only the public Herdr CLI (`herdr machine list -
 | 42 | dispatcher unreachable or retries exhausted; records stay pending |
 | 43 | `herdr-soho` lacks the `ephemeral_job` or `job_events` capability (`doctor`, `sync`) |
 
-Forwarded `job` subcommands return the `herdr-soho` exit code unchanged; codes 40–43 are never produced by a forwarded command.
+Forwarded `job` subcommands return the `herdr-soho` exit code unchanged; codes 40–44 are never produced by a forwarded command.
 
 ## Key
 
