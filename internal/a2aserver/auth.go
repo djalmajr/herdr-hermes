@@ -2,6 +2,7 @@ package a2aserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -145,6 +146,12 @@ func actionForMethod(method string) (a2acore.Action, bool) {
 func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContext, req *a2asrv.Request) (context.Context, any, error) {
 	subject, err := i.auth.Authenticate(ctx, credentialFrom(ctx))
 	if err != nil {
+		// An identity provider that is not configured, failed or answered
+		// something invalid is honest unavailability (HTTP 500), not a
+		// credential problem; the error text is never forwarded.
+		if errors.Is(err, a2acore.ErrIdentityUnavailable) {
+			return ctx, nil, a2a.NewError(a2a.ErrServerError, "a2a: identity provider unavailable")
+		}
 		return ctx, nil, a2a.NewError(a2a.ErrUnauthenticated, "a2a: unauthenticated")
 	}
 	callCtx.User = a2asrv.NewAuthenticatedUser(subject.ID, map[string]any{subjectAttr: subject})
@@ -170,9 +177,10 @@ func (i *authInterceptor) After(_ context.Context, _ *a2asrv.CallContext, _ *a2a
 // LocalOperator is the existing-policy adapter of the loopback local
 // operator: it accepts only a request whose peer is a loopback IP and
 // that carries no Authorization header, and authenticates it as the
-// subject "local" with every action and every project. Anything else,
-// including a loopback request that carries an unverified credential,
-// is refused: an unverified credential is never silently ignored.
+// subject a2acore.LocalSubjectID with every action and every project.
+// Anything else, including a loopback request that carries an
+// unverified credential, is refused: an unverified credential is never
+// silently ignored.
 type LocalOperator struct{}
 
 // Authenticate implements a2acore.Authenticator.
@@ -188,8 +196,34 @@ func (LocalOperator) Authenticate(_ context.Context, c a2acore.Credential) (a2ac
 		return a2acore.Subject{}, fmt.Errorf("%w: a credential is not accepted on the loopback", a2acore.ErrUnauthenticated)
 	}
 	return a2acore.Subject{
-		ID:       "local",
+		ID:       a2acore.LocalSubjectID,
 		Projects: []string{a2acore.AnyProject},
 		Actions:  slices.Clone(a2acore.AllActions),
 	}, nil
+}
+
+// LocalOrBearer keeps the two policies apart: a request with no
+// Authorization header goes to Local (the loopback local operator), a
+// request with one goes to Bearer (the injected provider). Neither falls
+// through to the other: a refused credential is never retried as the
+// local operator and a missing one never reaches the provider. A nil
+// Bearer is a2acore.ErrIdentityUnavailable (fail closed, no provider is
+// configured) and a nil Local is a2acore.ErrUnauthenticated.
+type LocalOrBearer struct {
+	Local  a2acore.Authenticator
+	Bearer a2acore.Authenticator
+}
+
+// Authenticate implements a2acore.Authenticator.
+func (a LocalOrBearer) Authenticate(ctx context.Context, c a2acore.Credential) (a2acore.Subject, error) {
+	if c.Authorization == "" {
+		if a.Local == nil {
+			return a2acore.Subject{}, fmt.Errorf("%w: no local operator policy", a2acore.ErrUnauthenticated)
+		}
+		return a.Local.Authenticate(ctx, c)
+	}
+	if a.Bearer == nil {
+		return a2acore.Subject{}, fmt.Errorf("%w: identity provider not configured", a2acore.ErrIdentityUnavailable)
+	}
+	return a.Bearer.Authenticate(ctx, c)
 }

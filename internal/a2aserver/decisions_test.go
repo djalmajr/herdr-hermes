@@ -402,6 +402,13 @@ func TestRefusedContinuationOfWorkingTaskParks(t *testing.T) {
 	// The task is created at epoch 2 and parked on s1.
 	task := sendTask(t, c1, SendInput{Project: "org/repo", Session: "s-1", Epoch: 2, Seq: 1, MessageID: "m-1", Text: "first"})
 	waitLive(t, s1, 1)
+	// The answer of a ReturnImmediately send is cut from the Submitted
+	// task: the WORKING status event is stored by the still running
+	// execution after it. The task counts as parked only once that
+	// event is durable on the shared file, as a restart would find it;
+	// a continuation that loads the task earlier loses the SDK version
+	// check against that write (see continuation_race_test.go).
+	waitStoredState(t, store2, string(task.ID), a2acore.StateWorking)
 
 	// The second server on the reopened store has no parked execution.
 	s2, err := New(Config{

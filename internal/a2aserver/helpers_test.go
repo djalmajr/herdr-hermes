@@ -157,6 +157,29 @@ func waitLive(t *testing.T, s *Server, want int) {
 	t.Fatalf("live executions = %d, want %d", s.LiveExecutions(), want)
 }
 
+// waitStoredState polls the durable task row through the given store
+// handle until its neutral state is want (10 s deadline): it observes
+// what a second process reading the same file would find.
+func waitStoredState(t *testing.T, store *a2astore.Store, taskID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	last := ""
+	for time.Now().Before(deadline) {
+		tv, err := store.TaskView(ctxT(t), taskID)
+		if err != nil {
+			t.Fatalf("task view: %v", err)
+		}
+		if tv != nil {
+			last = tv.State
+			if last == want {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("stored task %s state = %q, want %q", taskID, last, want)
+}
+
 // waitTaskState polls one task through the client until its state is
 // want (10 s deadline).
 func waitTaskState(t *testing.T, c *Client, taskID string, want a2a.TaskState) *a2a.Task {

@@ -75,6 +75,12 @@ var (
 	// a2aDecisionInterval is the decision loop interval of the serve;
 	// the tests replace it.
 	a2aDecisionInterval = time.Second
+	// a2aIdentityProvider is the injected existing identity source that
+	// verifies a bearer credential. No identity source is configured in
+	// this release and no flag, environment variable or file configures
+	// one, so it is nil and a request that carries a credential fails
+	// closed; the tests inject a fixture.
+	a2aIdentityProvider a2acore.IdentityProvider
 )
 
 // a2aNeutralStates are the neutral task states a filter may name.
@@ -270,6 +276,26 @@ func (r a2aNotifyRoutes) GuardianRef() (string, error) {
 	return reg.Coordinator, nil
 }
 
+// OwnedProjects implements a2acore.ProjectRoutes: the projects whose
+// registered owner is ref, in no particular order, re-read on every
+// call. An empty ref owns nothing.
+func (r a2aNotifyRoutes) OwnedProjects(ref string) ([]string, error) {
+	if ref == "" {
+		return nil, nil
+	}
+	reg, err := notify.Open(r.ob, r.now).LoadRegistry()
+	if err != nil {
+		return nil, err
+	}
+	var projects []string
+	for project, owner := range reg.Owners {
+		if owner == ref {
+			projects = append(projects, project)
+		}
+	}
+	return projects, nil
+}
+
 // a2aDeliverLoop runs one immediate notice delivery round, then a round
 // every interval, until the context ends; rounds never overlap. A round
 // aborted by the shutdown releases its unsent claims, so the closing
@@ -365,14 +391,26 @@ func cmdA2AServe(args []string, env Env) int {
 		fail(env, 2, "a2a serve: "+err.Error())
 		return 2
 	}
+	// Two distinct policies: a request without an Authorization header
+	// is the loopback local operator; a request with one goes to the
+	// injected identity provider (nil here, so it fails closed), whose
+	// grants are derived from the same routes, re-read on every call.
+	routes := a2aNotifyRoutes{ob: ro, now: env.Now}
+	var bearer a2acore.Authenticator
+	if a2aIdentityProvider != nil {
+		bearer = a2acore.BearerAuthenticator{
+			Identity: a2aIdentityProvider,
+			Grants:   a2acore.RoutingGrants{Routes: routes},
+		}
+	}
 	srv, err := a2aserver.New(a2aserver.Config{
 		Store: store,
-		Auth:  a2aserver.LocalOperator{},
+		Auth:  a2aserver.LocalOrBearer{Local: a2aserver.LocalOperator{}, Bearer: bearer},
 		// The local operator trusts a loopback peer: a request whose
 		// Host or Origin is not loopback (a browser page, DNS
 		// rebinding) is refused before it reaches it.
 		LoopbackOnly: true,
-		Routes:       a2aNotifyRoutes{ob: ro, now: env.Now},
+		Routes:       routes,
 		BaseURL:      "http://" + ln.Addr().String(),
 		Version:      version,
 		Now:          env.Now,

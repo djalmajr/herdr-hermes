@@ -26,7 +26,7 @@ jobs:
       GOMAXPROCS: 2
       CGO_ENABLED: 1
       CHECK_REPO: ${{ github.repository }}
-      CHECK_SHA: ${{ github.sha }}
+      CHECK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Check out the exact commit
         shell: pwsh
