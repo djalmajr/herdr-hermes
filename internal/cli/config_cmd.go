@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
+	"github.com/djalmajr/nau/internal/config"
 )
 
 // cmdConfig implements `config get <key>`, `config set <key> <value>` and
@@ -69,7 +69,7 @@ func cmdConfig(args []string, env Env) int {
 				value = stored
 			}
 			if args[1] == "route_disabled" || args[1] == "route_machines" {
-				warning = unmatchedDisabledWarning(cfg)
+				warning = unmatchedDisabledWarning(env, cfg)
 			}
 		}
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", keyValuePairJSON(args[1], value))
@@ -98,11 +98,11 @@ func keyValuePairJSON(key, value string) string {
 // trailing newline) for a stored configuration whose route_disabled labels
 // are not all in route_machines, or "" when there is nothing to warn about.
 // It exists so the route command can print the same line.
-func unmatchedDisabledWarning(cfg config.Config) string {
+func unmatchedDisabledWarning(env Env, cfg config.Config) string {
 	unmatched := cfg.UnmatchedDisabled()
 	if len(unmatched) == 0 {
 		return ""
 	}
-	return "herdr-hermes: config: warning: route_disabled labels not in route_machines exclude nothing: " +
+	return env.program() + ": config: warning: route_disabled labels not in route_machines exclude nothing: " +
 		strings.Join(unmatched, ",") + "\n"
 }

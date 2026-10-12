@@ -18,8 +18,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // retSeedFences seeds n ended rows of one kind, all inside the 7-day

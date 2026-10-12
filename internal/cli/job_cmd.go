@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/soho"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/soho"
 )
 
 // jobPublicSubs are the dispatcher-facing subcommands forwarded to
@@ -194,7 +194,7 @@ func cmdJob(args []string, env Env) int {
 			// runnable) prints the same unavailable line; the cause
 			// stays in the stderr diagnostic. The child never ran, so
 			// there is no delivery to await.
-			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: %v\n", rerr)
+			_, _ = fmt.Fprintf(env.Stderr, "%s: %v\n", env.program(), rerr)
 			_, _ = fmt.Fprintf(env.Stdout, `{"status":"unavailable","motivo":"herdr-soho not found"}`+"\n")
 			return jobapi.ExitUnavailable
 		}
@@ -209,7 +209,7 @@ func cmdJob(args []string, env Env) int {
 			// they are written synchronously on this goroutine once the
 			// delivery is done.
 			awaitDelivery()
-			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: herdr-soho job %s killed after %s\n", sub, de.Bound)
+			_, _ = fmt.Fprintf(env.Stderr, "%s: herdr-soho job %s killed after %s\n", env.program(), sub, de.Bound)
 			if stdoutBuf.Len() == 0 {
 				_, _ = fmt.Fprintf(env.Stdout, `{"status":"timeout","motivo":"herdr-soho job %s did not finish within %s"}`+"\n", sub, de.Bound)
 			}
@@ -217,7 +217,7 @@ func cmdJob(args []string, env Env) int {
 		}
 		awaitDelivery()
 		motivo := "herdr-soho job " + sub + ": " + rerr.Error()
-		_, _ = io.WriteString(env.Stderr, "herdr-hermes: "+motivo+"\n")
+		_, _ = io.WriteString(env.Stderr, env.program()+": "+motivo+"\n")
 		_, _ = io.WriteString(env.Stdout, mustJSON(errorLine{Status: itoa(2), Motivo: motivo})+"\n")
 		return 2
 	}
@@ -234,7 +234,7 @@ func cmdJob(args []string, env Env) int {
 	// too (the friction line, when not under NOWRITE, was already
 	// written immediately inside Run).
 	if pendingDiag != "" {
-		_, _ = io.WriteString(env.Stderr, "herdr-hermes: "+pendingDiag+"\n")
+		_, _ = io.WriteString(env.Stderr, env.program()+": "+pendingDiag+"\n")
 	}
 	return exit
 }

@@ -8,20 +8,46 @@ import (
 	"time"
 )
 
+// ProgramNau and ProgramHerdrHermes are the two program names the CLI
+// runs under: ProgramNau is the primary name and ProgramHerdrHermes the
+// deprecated name of the same program (same commands, same state, same
+// exit codes). The names drive only the usage text and the stderr
+// diagnostic prefix; every state and wire surface keeps its own literal
+// identifiers.
+const (
+	ProgramNau         = "nau"
+	ProgramHerdrHermes = "herdr-hermes"
+)
+
 // Env carries every dependency a command needs from the process. Tests
 // replace each field; ConfigDir is the herdr-hermes directory itself (in
 // production <user config dir>/herdr-hermes), never its parent.
 type Env struct {
 	Stdin          io.Reader
 	Stdout, Stderr io.Writer
-	Getenv         func(string) string
-	// Environ returns the exact environment of the herdr-hermes process;
+	// Program is the name the entry point runs under (ProgramNau or
+	// ProgramHerdrHermes); it drives the usage text and the stderr
+	// diagnostic prefix. Empty (tests that build Env by hand) defaults
+	// to ProgramNau.
+	Program string
+	Getenv  func(string) string
+	// Environ returns the exact environment of the nau process;
 	// forwarded subprocesses get this environment and nothing else. The
 	// API key is never in it because it is never put there.
 	Environ   func() []string
 	ConfigDir string
 	Now       func() time.Time
 	Sleep     func(context.Context, time.Duration) error
+}
+
+// program returns the program name for the usage text and the stderr
+// diagnostic prefix: the Program field when set, ProgramNau when it is
+// empty.
+func (env Env) program() string {
+	if env.Program != "" {
+		return env.Program
+	}
+	return ProgramNau
 }
 
 // EnvFromOS builds the production Env. When the user config directory

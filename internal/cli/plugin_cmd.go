@@ -12,10 +12,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/notify"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/plugin"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/notify"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/plugin"
 )
 
 // pluginEventAgentStatus is the Herdr event name of the pane agent
@@ -307,7 +307,7 @@ func pluginBridgeStatus(env Env) int {
 // records) on stderr, then runs the sync and returns the sync exit code.
 func pluginBridgeSync(env Env) int {
 	jobs, pending := pluginBridgeCounts(env)
-	_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: plugin bridge sync: %d open job(s), %d pending record(s)\n", jobs, pending)
+	_, _ = fmt.Fprintf(env.Stderr, "%s: plugin bridge sync: %d open job(s), %d pending record(s)\n", env.program(), jobs, pending)
 	res, code := runSync(context.Background(), env, "", false)
 	printSyncOutcome(env, res, code)
 	return code

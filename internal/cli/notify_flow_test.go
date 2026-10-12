@@ -17,11 +17,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/notify"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/plugin"
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/notify"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/plugin"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // flowWakeEvent is one job event with the fixed test source timestamp.

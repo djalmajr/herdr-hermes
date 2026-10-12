@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/djalmajr/herdr-hermes/internal/registry"
+	"github.com/djalmajr/nau/internal/registry"
 )
 
 const (
@@ -438,7 +438,7 @@ func cmdJobs(args []string, env Env) int {
 	method, target, body := f.buildRequest(base)
 	req, err := http.NewRequest(method, target, bytes.NewReader(body))
 	if err != nil {
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs: %v\n", err)
+		_, _ = fmt.Fprintf(env.Stderr, "%s: jobs: %v\n", env.program(), err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry unreachable"}))
 		return 4
 	}
@@ -454,7 +454,7 @@ func cmdJobs(args []string, env Env) int {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs: %v\n", err)
+		_, _ = fmt.Fprintf(env.Stderr, "%s: jobs: %v\n", env.program(), err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry unreachable"}))
 		return 4
 	}
@@ -463,12 +463,12 @@ func cmdJobs(args []string, env Env) int {
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(jobsRespCap)+1))
 	over := len(raw) > jobsRespCap
 	if err != nil {
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs: %v\n", err)
+		_, _ = fmt.Fprintf(env.Stderr, "%s: jobs: %v\n", env.program(), err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry unreachable"}))
 		return 4
 	}
 	if over {
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs: response body exceeds %d bytes\n", jobsRespCap)
+		_, _ = fmt.Fprintf(env.Stderr, "%s: jobs: response body exceeds %d bytes\n", env.program(), jobsRespCap)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry answered malformed"}))
 		return 4
 	}
@@ -496,9 +496,9 @@ func cmdJobs(args []string, env Env) int {
 			return jobsMalformed(env)
 		}
 		if status == registry.CheckHold {
-			_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs check: refused (hold)")
+			_, _ = fmt.Fprintln(env.Stderr, env.program()+": jobs check: refused (hold)")
 		} else {
-			_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs check: refused (duplicate)")
+			_, _ = fmt.Fprintln(env.Stderr, env.program()+": jobs check: refused (duplicate)")
 		}
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", escapeRawControls(compact.Bytes()))
 		return 44
@@ -516,7 +516,7 @@ func cmdJobs(args []string, env Env) int {
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "not_found", Motivo: "registry: not found"}))
 		return 3
 	}
-	_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: jobs: registry answered %d\n", resp.StatusCode)
+	_, _ = fmt.Fprintf(env.Stderr, "%s: jobs: registry answered %d\n", env.program(), resp.StatusCode)
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry answered " + strconv.Itoa(resp.StatusCode)}))
 	return 4
 }
@@ -524,7 +524,7 @@ func cmdJobs(args []string, env Env) int {
 // jobsMalformed prints the 4 line for a body that is not exactly one JSON
 // value.
 func jobsMalformed(env Env) int {
-	_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: jobs: response body is not one JSON value")
+	_, _ = fmt.Fprintln(env.Stderr, env.program()+": jobs: response body is not one JSON value")
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "registry answered malformed"}))
 	return 4
 }

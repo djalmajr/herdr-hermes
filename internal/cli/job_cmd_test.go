@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // fakeChildEnv is the controlled environment every test passes to the
@@ -943,7 +943,7 @@ func TestJobForwardStartSlowStdoutBookkeeping(t *testing.T) {
 	}
 	// The stderr line is written synchronously after the delivery, so
 	// it is here when Run returned: no waitFor.
-	if n := strings.Count(errb.String(), "herdr-hermes: "+wantDiag); n != 1 {
+	if n := strings.Count(errb.String(), "nau: "+wantDiag); n != 1 {
 		t.Errorf("stderr = %q, want the WaitDelay diagnostic exactly once", errb.String())
 	}
 }
@@ -1246,7 +1246,7 @@ func TestJobForwardNowriteGraceDiagAfterDelivery(t *testing.T) {
 	if n := strings.Count(errb.String(), "did not drain within"); n != 1 {
 		t.Fatalf("stderr = %q, want the grace-period diagnostic exactly once", errb.String())
 	}
-	if !strings.Contains(errb.String(), "herdr-hermes: "+wantDiag) {
+	if !strings.Contains(errb.String(), "nau: "+wantDiag) {
 		t.Fatalf("stderr = %q, want the diagnostic kept", errb.String())
 	}
 	// Under NOWRITE nothing is written to the config dir but the config
@@ -1316,7 +1316,7 @@ func TestJobForwardFreshNodeGraceFriction(t *testing.T) {
 	if strings.Contains(string(data), "child-stdout-marker-7f3a") {
 		t.Errorf("friction.log = %q, must not carry the child's output", data)
 	}
-	if n := strings.Count(stderr, "herdr-hermes: "+wantDiag); n != 1 {
+	if n := strings.Count(stderr, "nau: "+wantDiag); n != 1 {
 		t.Errorf("stderr = %q, want the diagnostic line exactly once", stderr)
 	}
 }

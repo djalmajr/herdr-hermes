@@ -20,6 +20,8 @@ user-invocable: true
 
 Guide for a local orchestrator inside Herdr that works under a remote job dispatcher. The commands run the `herdr-hermes` CLI; every one prints a single JSON line. The dispatcher sees what you report here plus the job events that the `job_wake_cmd` hook records; nothing is sent silently.
 
+Names: `nau` is the new name of this CLI and `herdr-hermes` is the deprecated name that keeps working, with the same commands, JSON output, exit codes and the same state directory.
+
 ## When to use which command
 
 - `session start` — when you start work on a project. Include `--card` and `--branch` when they are known, and `--job` when the session is tied to a dispatcher job:

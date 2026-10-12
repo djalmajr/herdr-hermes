@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 const (
@@ -102,7 +102,7 @@ func buildCLI() (string, error) {
 	out := filepath.Join(dir, "herdr-hermes"+ext)
 	ctx, cancel := context.WithTimeout(context.Background(), buildBound)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, goBin, "build", "-o", out, "github.com/djalmajr/herdr-hermes/cmd/herdr-hermes")
+	cmd := exec.CommandContext(ctx, goBin, "build", "-o", out, "github.com/djalmajr/nau/cmd/herdr-hermes")
 	cmd.WaitDelay = graceWaitDelay
 	if o, err := cmd.CombinedOutput(); err != nil {
 		_ = os.RemoveAll(dir)

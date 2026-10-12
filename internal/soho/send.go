@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/notify"
+	"github.com/djalmajr/nau/internal/notify"
 )
 
 // sendGrace is added to the caller's timeout to form the process bound

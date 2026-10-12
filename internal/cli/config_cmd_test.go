@@ -353,7 +353,7 @@ func TestConfigListInvalidRouterValue(t *testing.T) {
 // exit 0) when the stored route_disabled labels are not in route_machines;
 // no other command or key warns, and a refused set prints no warning.
 func TestConfigSetRouteUnmatchedWarning(t *testing.T) {
-	warn := "herdr-hermes: config: warning: route_disabled labels not in route_machines exclude nothing: "
+	warn := "nau: config: warning: route_disabled labels not in route_machines exclude nothing: "
 
 	t.Run("empty fleet staging", func(t *testing.T) {
 		dir := t.TempDir()

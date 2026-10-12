@@ -22,7 +22,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // defaultTimeout bounds every request when the caller passes timeout <= 0.

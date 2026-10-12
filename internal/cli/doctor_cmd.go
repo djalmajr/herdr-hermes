@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/soho"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/soho"
 )
 
 // doctorOutbox is the outbox block of the doctor line.
@@ -76,7 +76,7 @@ func cmdDoctor(args []string, env Env) int {
 	}
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(line))
 	if !so.EphemeralJob || !so.JobEvents {
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: herdr-soho capabilities missing\n")
+		_, _ = fmt.Fprintf(env.Stderr, "%s: herdr-soho capabilities missing\n", env.program())
 		return 43
 	}
 	return 0
@@ -108,9 +108,9 @@ func doctorOutboxCounts(env Env) doctorOutbox {
 
 // wakeHookConfigured runs `herdr-soho config` with HERDR_SOHO_NOWRITE=1 in
 // the child environment and classifies the job_wake_cmd value: "true" when
-// it starts with "herdr-hermes wake", "false" when the output is
-// parseable but shows no such hook, "unknown" on a non-zero exit or
-// unparseable output.
+// it starts with "nau wake" or "herdr-hermes wake", "false" when the
+// output is parseable but shows no such hook, "unknown" on a non-zero
+// exit or unparseable output.
 func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string {
 	environ := childEnviron(env)
 	// The child gets HERDR_SOHO_NOWRITE=1; any inherited value is replaced
@@ -143,11 +143,11 @@ func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string
 
 // parseWakeHook classifies the `herdr-soho config` output. A line whose
 // first whitespace-separated field is job_wake_cmd decides the result:
-// true when its value starts with "herdr-hermes wake", false otherwise.
+// true when its value starts with "nau wake" or "herdr-hermes wake" (the
+// two program names, with the same prefix semantics), false otherwise.
 // Output with no such line is false when it is parseable as key-value
 // lines and unknown otherwise.
 func parseWakeHook(output string) string {
-	const prefix = "herdr-hermes wake"
 	parseable := false
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
@@ -157,7 +157,7 @@ func parseWakeHook(output string) string {
 		parseable = true
 		if fields[0] == "job_wake_cmd" {
 			value := strings.TrimSpace(line[len(fields[0]):])
-			if strings.HasPrefix(value, prefix) {
+			if strings.HasPrefix(value, ProgramNau+" wake") || strings.HasPrefix(value, ProgramHerdrHermes+" wake") {
 				return "true"
 			}
 			return "false"

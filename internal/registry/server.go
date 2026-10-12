@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // logf is the handler's logger: one line per internal error, never a

@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/registry"
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/registry"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 const (
@@ -229,14 +229,14 @@ func cmdServe(args []string, env Env) int {
 
 	store, err := registry.Open(db, opts)
 	if err != nil {
-		_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: serve:", err)
+		_, _ = fmt.Fprintln(env.Stderr, env.program()+": serve:", err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "serve: registry database unavailable"}))
 		return 4
 	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		_ = store.Close()
-		_, _ = fmt.Fprintln(env.Stderr, "herdr-hermes: serve:", err)
+		_, _ = fmt.Fprintln(env.Stderr, env.program()+": serve:", err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "serve: cannot listen on " + listen}))
 		return 4
 	}
@@ -254,7 +254,7 @@ func cmdServe(args []string, env Env) int {
 	// one protected writer.
 	stderrW := &lockedWriter{w: env.Stderr}
 	registry.SetLogger(func(format string, args ...any) {
-		_, _ = fmt.Fprintf(stderrW, "herdr-hermes: serve: "+format+"\n", args...)
+		_, _ = fmt.Fprintf(stderrW, env.program()+": serve: "+format+"\n", args...)
 	})
 
 	ctx, cancel := serveContext()
@@ -272,7 +272,7 @@ func cmdServe(args []string, env Env) int {
 		polling.Add(1)
 		go func() {
 			defer polling.Done()
-			servePollLoop(pollCtx, stderrW, store, machines, time.Duration(pollS)*time.Second, poller)
+			servePollLoop(pollCtx, stderrW, env.program(), store, machines, time.Duration(pollS)*time.Second, poller)
 		}()
 	}
 
@@ -305,13 +305,13 @@ func cmdServe(args []string, env Env) int {
 	case err := <-errCh:
 		// Serve returns only on a listener failure before any shutdown;
 		// stdout already carries the serving line, so only stderr says why.
-		_, _ = fmt.Fprintf(stderrW, "herdr-hermes: serve: %v\n", err)
+		_, _ = fmt.Fprintf(stderrW, "%s: serve: %v\n", env.program(), err)
 		code = 4
 	}
 	stopPoll()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), serveServeTimeout)
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		_, _ = fmt.Fprintf(stderrW, "herdr-hermes: serve: shutdown: %v\n", err)
+		_, _ = fmt.Fprintf(stderrW, "%s: serve: shutdown: %v\n", env.program(), err)
 	}
 	shutdownCancel()
 	polling.Wait()
@@ -334,7 +334,7 @@ func listenerIsLoopback(addr net.Addr) bool {
 // until the context ends; rounds never overlap. A round aborted by the
 // shutdown is not applied, so the closing signal never marks the
 // inventory obsolete.
-func servePollLoop(ctx context.Context, logW io.Writer, store *registry.Store, machines []string, interval time.Duration, poller registry.Poller) {
+func servePollLoop(ctx context.Context, logW io.Writer, prog string, store *registry.Store, machines []string, interval time.Duration, poller registry.Poller) {
 	for {
 		results := poller.PollAll(ctx, machines)
 		if ctx.Err() != nil {
@@ -342,7 +342,7 @@ func servePollLoop(ctx context.Context, logW io.Writer, store *registry.Store, m
 		}
 		for _, r := range results {
 			if err := store.ApplyPoll(r); err != nil {
-				_, _ = fmt.Fprintf(logW, "herdr-hermes: serve: poll %s: %v\n", r.Maquina, err)
+				_, _ = fmt.Fprintf(logW, "%s: serve: poll %s: %v\n", prog, r.Maquina, err)
 			}
 		}
 		select {

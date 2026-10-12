@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // routeServerNotRunningStderr is the shape of the stderr a real herdr
@@ -47,7 +47,7 @@ func TestRouteDiagServerNotRunningFallback(t *testing.T) {
 	if stdout != wantOut {
 		t.Errorf("stdout = %q, want %q", stdout, wantOut)
 	}
-	wantErr := "herdr-hermes: route: local unavailable: probe_failed: server_not_running (herdr exit 1): no Herdr server is running at the configured socket; start herdr or check the socket path\n"
+	wantErr := "nau: route: local unavailable: probe_failed: server_not_running (herdr exit 1): no Herdr server is running at the configured socket; start herdr or check the socket path\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -77,7 +77,7 @@ func TestRouteDiagSocketPathTooLong(t *testing.T) {
 	if res.Machine != "win-a" || res.Motivo != "least_load" || res.Orchestrators != 3 {
 		t.Errorf("result = %+v, want win-a least_load 3", res)
 	}
-	wantErr := "herdr-hermes: route: local unavailable: probe_failed: socket_path_too_long (herdr exit 1): the Herdr socket path is longer than the operating system allows\n"
+	wantErr := "nau: route: local unavailable: probe_failed: socket_path_too_long (herdr exit 1): the Herdr socket path is longer than the operating system allows\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -109,8 +109,8 @@ func TestRouteDiagHostileStderr(t *testing.T) {
 	if strings.Count(stdout, "\n") != 1 || !strings.HasSuffix(stdout, "\n") {
 		t.Errorf("stdout is not exactly one line: %q", stdout)
 	}
-	wantErr := "herdr-hermes: route: local unavailable: probe_failed (herdr exit 9): herdr reported no recognized cause\n" +
-		"herdr-hermes: route: no eligible machine is available\n"
+	wantErr := "nau: route: local unavailable: probe_failed (herdr exit 9): herdr reported no recognized cause\n" +
+		"nau: route: no eligible machine is available\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -140,7 +140,7 @@ func TestRouteDiagCatalogConnectionRefused(t *testing.T) {
 	if stdout != wantOut {
 		t.Errorf("stdout = %q, want %q", stdout, wantOut)
 	}
-	wantErr := "herdr-hermes: route: win-a unavailable: catalog_unavailable: connection_refused (herdr exit 255): the remote machine refused the connection\n"
+	wantErr := "nau: route: win-a unavailable: catalog_unavailable: connection_refused (herdr exit 255): the remote machine refused the connection\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -168,7 +168,7 @@ func TestRouteDiagUnsupported(t *testing.T) {
 	if res := parseRouteResult(t, stdout); res.Machine != "local" {
 		t.Errorf("machine = %q, want local", res.Machine)
 	}
-	wantErr := "herdr-hermes: route: ghost unsupported: unknown_machine: not a saved Herdr machine (herdr machine list) and not local\n"
+	wantErr := "nau: route: ghost unsupported: unknown_machine: not a saved Herdr machine (herdr machine list) and not local\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -217,7 +217,7 @@ func TestRouteDiagCutJSONNoCause(t *testing.T) {
 	if stdout != wantOut {
 		t.Errorf("stdout = %q, want %q", stdout, wantOut)
 	}
-	wantErr := "herdr-hermes: route: local unavailable: probe_failed (herdr exit 1): herdr reported no recognized cause\n"
+	wantErr := "nau: route: local unavailable: probe_failed (herdr exit 1): herdr reported no recognized cause\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -258,7 +258,7 @@ func TestRouteDiagValidPrefixInvalidSuffixNoCause(t *testing.T) {
 	if stdout != wantOut {
 		t.Errorf("stdout = %q, want %q", stdout, wantOut)
 	}
-	wantErr := "herdr-hermes: route: local unavailable: probe_failed (herdr exit 1): herdr reported no recognized cause\n"
+	wantErr := "nau: route: local unavailable: probe_failed (herdr exit 1): herdr reported no recognized cause\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -285,8 +285,8 @@ func TestRouteDiagTimeout(t *testing.T) {
 	if exit != 4 {
 		t.Fatalf("route exit = %d, want 4 (stdout %q, stderr %q)", exit, stdout, stderr)
 	}
-	wantErr := "herdr-hermes: route: local unavailable: probe_timeout: the probe did not finish within route_probe_timeout_s\n" +
-		"herdr-hermes: route: no eligible machine is available\n"
+	wantErr := "nau: route: local unavailable: probe_timeout: the probe did not finish within route_probe_timeout_s\n" +
+		"nau: route: no eligible machine is available\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}
@@ -310,13 +310,13 @@ func TestRouteDisabledUnmatchedWarning(t *testing.T) {
 			name:     "unmatched",
 			disabled: "ghost-box",
 			wantOut:  `{"maquina":"win-a","motivo":"least_load","orquestradores":1,"candidatos":[{"maquina":"local","estado":"available","orquestradores":2},{"maquina":"win-a","estado":"available","orquestradores":1}]}`,
-			wantErr:  "herdr-hermes: route: warning: route_disabled labels not in route_machines exclude nothing: ghost-box\n",
+			wantErr:  "nau: route: warning: route_disabled labels not in route_machines exclude nothing: ghost-box\n",
 		},
 		{
 			name:     "partly unmatched",
 			disabled: "typo,win-a",
 			wantOut:  `{"maquina":"local","motivo":"least_load","orquestradores":2,"candidatos":[{"maquina":"local","estado":"available","orquestradores":2},{"maquina":"win-a","estado":"disabled","motivo":"disabled_by_config"}]}`,
-			wantErr:  "herdr-hermes: route: warning: route_disabled labels not in route_machines exclude nothing: typo\n",
+			wantErr:  "nau: route: warning: route_disabled labels not in route_machines exclude nothing: typo\n",
 		},
 		{
 			name:     "matching",

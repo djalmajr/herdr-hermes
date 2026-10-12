@@ -116,7 +116,7 @@ func TestAssetsDenylistFires(t *testing.T) {
 	if u := foreignURL("see https://example.com/docs"); u == "" {
 		t.Error("foreign URL check did not fire on https://example.com/docs")
 	}
-	if u := foreignURL("https://github.com/djalmajr/herdr-hermes and https://herdr.dev/docs/plugins/"); u != "" {
+	if u := foreignURL("https://github.com/djalmajr/nau and https://herdr.dev/docs/plugins/"); u != "" {
 		t.Errorf("allowed hosts must not fire: %q", u)
 	}
 }

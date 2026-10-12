@@ -67,6 +67,13 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $formatting.Count -ne 0) { throw "gofmt failed: $formatting" }
           go vet ./...
           if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
+      - name: Build both identities
+        shell: pwsh
+        run: |
+          go build -o "$env:RUNNER_TEMP/nau" ./cmd/nau
+          if ($LASTEXITCODE -ne 0) { throw "go build ./cmd/nau failed" }
+          go build -o "$env:RUNNER_TEMP/herdr-hermes" ./cmd/herdr-hermes
+          if ($LASTEXITCODE -ne 0) { throw "go build ./cmd/herdr-hermes failed" }
       - name: Native tests
         shell: pwsh
         run: |

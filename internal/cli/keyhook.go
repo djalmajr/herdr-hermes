@@ -3,7 +3,7 @@ package cli
 import (
 	"path/filepath"
 
-	"github.com/djalmajr/herdr-hermes/internal/cred"
+	"github.com/djalmajr/nau/internal/cred"
 )
 
 // keyConfigured reports whether a dispatcher API key is stored on this

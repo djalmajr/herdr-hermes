@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/djalmajr/herdr-hermes/internal/registry"
+	"github.com/djalmajr/nau/internal/registry"
 )
 
 // controlsCanary stands in for every environment name and entry in the
@@ -207,7 +207,7 @@ func TestJobsOutputControls(t *testing.T) {
 			t.Errorf("stdout = %q, want %q", out, want)
 		}
 		assertOneLineControlFree(t, out, errb)
-		if string(errb) != "herdr-hermes: jobs check: refused (duplicate)\n" {
+		if string(errb) != "nau: jobs check: refused (duplicate)\n" {
 			t.Errorf("stderr = %q, want the fixed duplicate refusal line", errb)
 		}
 		if c.auth != "" {
@@ -220,7 +220,7 @@ func TestJobsOutputControls(t *testing.T) {
 		body := `{"status":"duplicate","conflitos":[]}`
 		code, out, errb, c, _ := runAgainst(t, http.StatusConflict, []byte(body), false, []string{"release", "--claim", "c-1"})
 		wantOut := `{"status":"unavailable","motivo":"registry answered 409"}` + "\n"
-		wantErr := "herdr-hermes: jobs: registry answered 409\n"
+		wantErr := "nau: jobs: registry answered 409\n"
 		if code != 4 {
 			t.Fatalf("exit = %d, want 4 (stdout %q stderr %q)", code, out, errb)
 		}
@@ -247,7 +247,7 @@ func TestJobsOutputControls(t *testing.T) {
 				t.Errorf("stdout = %q, want %q", out, malformedOut)
 			}
 			assertOneLineControlFree(t, out, errb)
-			if string(errb) != "herdr-hermes: jobs: response body is not one JSON value\n" {
+			if string(errb) != "nau: jobs: response body is not one JSON value\n" {
 				t.Errorf("stderr = %q, want the fixed malformed line", errb)
 			}
 			if c.auth != "" {
@@ -263,7 +263,7 @@ func TestJobsOutputControls(t *testing.T) {
 				t.Errorf("stdout = %q, want %q", out, malformedOut)
 			}
 			assertOneLineControlFree(t, out, errb)
-			if string(errb) != "herdr-hermes: jobs: response body is not one JSON value\n" {
+			if string(errb) != "nau: jobs: response body is not one JSON value\n" {
 				t.Errorf("stderr = %q, want the fixed malformed line", errb)
 			}
 			if c.auth != "" {
@@ -282,7 +282,7 @@ func TestJobsOutputControls(t *testing.T) {
 				t.Errorf("stdout = %q, want %q", out, malformedOut)
 			}
 			assertOneLineControlFree(t, out, errb)
-			if string(errb) != "herdr-hermes: jobs: response body exceeds 8 bytes\n" {
+			if string(errb) != "nau: jobs: response body exceeds 8 bytes\n" {
 				t.Errorf("stderr = %q, want the fixed oversized line", errb)
 			}
 			if c.auth != "" {
@@ -298,7 +298,7 @@ func TestJobsOutputControls(t *testing.T) {
 				t.Errorf("stdout = %q, want the fixed 302 line", out)
 			}
 			assertOneLineControlFree(t, out, errb)
-			if string(errb) != "herdr-hermes: jobs: registry answered 302\n" {
+			if string(errb) != "nau: jobs: registry answered 302\n" {
 				t.Errorf("stderr = %q, want the fixed 302 line", errb)
 			}
 			if c.auth != "" {

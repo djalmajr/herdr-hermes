@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/nau/internal/jobapi"
 )
 
 // ProjectJobEvent projects one stored job_event. ok=false (and a nil

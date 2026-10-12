@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // fakeExec is an in-memory Exec that records every argv call (and the

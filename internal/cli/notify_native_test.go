@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/nau/internal/jobapi"
 
-	"github.com/djalmajr/herdr-hermes/internal/notify"
-	"github.com/djalmajr/herdr-hermes/internal/plugin"
+	"github.com/djalmajr/nau/internal/notify"
+	"github.com/djalmajr/nau/internal/plugin"
 )
 
 // runPluginWorkspace runs `plugin event` with one workspace event under the

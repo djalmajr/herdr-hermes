@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // runCLIStdin runs Run over a hermetic env with a custom stdin and an
@@ -219,7 +219,7 @@ func TestWake(t *testing.T) {
 		if exit != 2 {
 			t.Errorf("%s: exit = %d, want 2 (stdout %q)", tc.name, exit, stdout)
 		}
-		if !strings.Contains(stderr, "herdr-hermes") || !strings.Contains(stdout, `"status":"2"`) {
+		if !strings.Contains(stderr, "nau") || !strings.Contains(stdout, `"status":"2"`) {
 			t.Errorf("%s: stderr %q stdout %q", tc.name, stderr, stdout)
 		}
 		if n := len(outboxLines(t, dir)); n != before {

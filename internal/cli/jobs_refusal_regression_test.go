@@ -40,7 +40,7 @@ func TestDJA229CheckRefusalOutput(t *testing.T) {
 	args := []string{"jobs", "check", "--agente", "build", "--card", "ABC-1"}
 	wantURL := "http://127.0.0.1:7429/v1/check"
 	malformedStdout := `{"status":"unavailable","motivo":"registry answered malformed"}` + "\n"
-	malformedStderr := "herdr-hermes: jobs: response body is not one JSON value\n"
+	malformedStderr := "nau: jobs: response body is not one JSON value\n"
 	run := func(body string) (int, string, string) {
 		t.Helper()
 		old := http.DefaultTransport
@@ -60,7 +60,7 @@ func TestDJA229CheckRefusalOutput(t *testing.T) {
 		if out != body+"\n" {
 			t.Errorf("stdout = %q, want the body byte-identical plus one newline", out)
 		}
-		if err != "herdr-hermes: jobs check: refused (duplicate)\n" {
+		if err != "nau: jobs check: refused (duplicate)\n" {
 			t.Errorf("stderr = %q, want the fixed duplicate refusal line", err)
 		}
 	})
@@ -74,7 +74,7 @@ func TestDJA229CheckRefusalOutput(t *testing.T) {
 		if out != body+"\n" {
 			t.Errorf("stdout = %q, want the body byte-identical plus one newline", out)
 		}
-		if err != "herdr-hermes: jobs check: refused (hold)\n" {
+		if err != "nau: jobs check: refused (hold)\n" {
 			t.Errorf("stderr = %q, want the fixed hold refusal line", err)
 		}
 	})
@@ -92,7 +92,7 @@ func TestDJA229CheckRefusalOutput(t *testing.T) {
 		if strings.ContainsRune(out, '\x7f') || strings.ContainsRune(out, '\u009b') {
 			t.Error("a raw control character reached stdout")
 		}
-		if err != "herdr-hermes: jobs check: refused (duplicate)\n" {
+		if err != "nau: jobs check: refused (duplicate)\n" {
 			t.Errorf("stderr = %q, want the fixed duplicate refusal line", err)
 		}
 	})

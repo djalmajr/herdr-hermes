@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/soho"
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/soho"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // installFake installs the fake herdr-soho in a temp dir and returns the

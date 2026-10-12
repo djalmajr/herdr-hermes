@@ -2,12 +2,15 @@
 
 One-time setup on a machine that will act as a `herdr-hermes` node. Every step is local; nothing is sent until a push or a pull happens.
 
+Names: `nau` is the new name of this CLI and `herdr-hermes` is the deprecated name that keeps working, with the same commands, JSON output, exit codes and the same state directory.
+
 ## Install
 
-With Go 1.25 or newer:
+With Go 1.25 or newer, from a checkout of the module `github.com/djalmajr/nau`:
 
 ```text
-go install github.com/djalmajr/herdr-hermes/cmd/herdr-hermes@latest
+go build -o <dir>/nau ./cmd/nau
+go build -o <dir>/herdr-hermes ./cmd/herdr-hermes
 ```
 
 Make sure the installed binary is on your `PATH` (and, for the optional plugin, on the Herdr server's `PATH`).

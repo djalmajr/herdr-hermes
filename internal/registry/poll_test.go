@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // pollTestClock is the fixed instant the poll tests inject, in a

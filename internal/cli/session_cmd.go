@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // stateCut is the contract cap on resumo, motivo and estado: 280 code
@@ -96,7 +96,7 @@ func cmdSession(args []string, env Env) int {
 		return 2
 	}
 	if cfg.MachineLabel == "" {
-		fail(env, 2, "machine_label is empty: set it with `herdr-hermes config set machine_label <label>`")
+		fail(env, 2, "machine_label is empty: set it with `"+env.program()+" config set machine_label <label>`")
 		return 2
 	}
 	flags.estado = cutRunes(flags.estado, stateCut)

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // cmdOutbox implements the pull channel: outbox [--since <seq>] [--wait

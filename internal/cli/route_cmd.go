@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // cmdRoute implements the read-only dispatcher-side machine router:
-// `herdr-hermes route [--machine <label>]`. It validates its arguments
+// `nau route [--machine <label>]`. It validates its arguments
 // first: a malformed invocation exits 2 with its own fixed motivo and the
 // route-scoped diagnostic on stderr (the route help text for -h/--help,
 // the one-line diagnostic plus the route usage otherwise), before the
@@ -51,7 +51,7 @@ func cmdRoute(args []string, env Env) int {
 	// as an error, so an exclusion staged ahead of a fleet change stays
 	// valid.
 	if unmatched := cfg.UnmatchedDisabled(); len(unmatched) > 0 {
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: route: warning: route_disabled labels not in route_machines exclude nothing: %s\n", strings.Join(unmatched, ","))
+		_, _ = fmt.Fprintf(env.Stderr, "%s: route: warning: route_disabled labels not in route_machines exclude nothing: %s\n", env.program(), strings.Join(unmatched, ","))
 	}
 	fleet := router.Fleet{
 		Machines:         machines,
@@ -66,7 +66,7 @@ func cmdRoute(args []string, env Env) int {
 	// stderr or stdout.
 	for _, c := range cands {
 		if d := c.Diagnostic(); d != "" {
-			_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: route: %s\n", d)
+			_, _ = fmt.Fprintf(env.Stderr, "%s: route: %s\n", env.program(), d)
 		}
 	}
 	res, err := router.Select(cands, requested)
@@ -80,7 +80,7 @@ func cmdRoute(args []string, env Env) int {
 		fail(env, 2, "route: requested machine is not configured")
 		return 2
 	case errors.Is(err, router.ErrNoneAvailable):
-		_, _ = io.WriteString(env.Stderr, "herdr-hermes: route: no eligible machine is available\n")
+		_, _ = io.WriteString(env.Stderr, env.program()+": route: no eligible machine is available\n")
 		line := struct {
 			Status     string             `json:"status"`
 			Motivo     string             `json:"motivo"`
@@ -94,12 +94,19 @@ func cmdRoute(args []string, env Env) int {
 	}
 }
 
-// routeUsage is the route-scoped usage printed on stderr for every route
-// usage problem except a help request.
-const routeUsage = "usage: herdr-hermes route [--machine <label>]\nrun 'herdr-hermes route --help' for the route options\n"
+// routeUsageTemplate is the route-scoped usage printed on stderr for
+// every route usage problem except a help request; %s is the program name.
+const routeUsageTemplate = "usage: %s route [--machine <label>]\nrun '%s route --help' for the route options\n"
 
-// routeHelp is the route-scoped help printed on stderr for -h/--help.
-const routeHelp = `usage: herdr-hermes route [--machine <label>]
+// routeUsage renders the route-scoped usage for the program name of env.
+func routeUsage(env Env) string {
+	prog := env.program()
+	return fmt.Sprintf(routeUsageTemplate, prog, prog)
+}
+
+// routeHelpTemplate is the route-scoped help printed on stderr for
+// -h/--help; %s is the program name.
+const routeHelpTemplate = `usage: %s route [--machine <label>]
 
 Choose the machine for a new job (dispatcher side, read-only). Prints one
 JSON line on stdout; diagnostics go to stderr.
@@ -108,7 +115,7 @@ options:
   --machine <label>   prefer this configured machine; the label is a separate
                       argument (the --machine=<label> form is not accepted)
 
-configuration (herdr-hermes config set <key> <value>):
+configuration (%s config set <key> <value>):
   route_machines, route_disabled, route_orchestrator_name,
   route_probe_timeout_s, herdr_bin
 
@@ -118,6 +125,12 @@ exit codes:
       the requested machine is not configured
   4   no eligible machine is available
 `
+
+// routeHelp renders the route-scoped help for the program name of env.
+func routeHelp(env Env) string {
+	prog := env.program()
+	return fmt.Sprintf(routeHelpTemplate, prog, prog)
+}
 
 // The route problem details: fixed text that never carries the offending
 // argument's value.
@@ -142,10 +155,10 @@ const (
 // value is never echoed.
 func routeProblem(env Env, detail string) int {
 	if detail == routeProblemHelp {
-		_, _ = io.WriteString(env.Stderr, routeHelp)
+		_, _ = io.WriteString(env.Stderr, routeHelp(env))
 	} else {
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: route: %s\n", detail)
-		_, _ = io.WriteString(env.Stderr, routeUsage)
+		_, _ = fmt.Fprintf(env.Stderr, "%s: route: %s\n", env.program(), detail)
+		_, _ = io.WriteString(env.Stderr, routeUsage(env))
 	}
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "2", Motivo: "route: " + detail + "; usage: route [--machine <label>]"}))
 	return 2

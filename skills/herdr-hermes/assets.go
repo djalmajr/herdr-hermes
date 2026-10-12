@@ -1,4 +1,4 @@
-// Package skill contains the agent skill bundled with herdr-hermes.
+// Package skill contains the agent skill bundled with nau.
 package skill
 
 import (
