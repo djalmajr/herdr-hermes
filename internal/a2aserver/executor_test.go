@@ -36,7 +36,9 @@ func TestNewTaskSubmittedThenWorking(t *testing.T) {
 		t.Errorf("task metadata = %v, want project and job", task.Metadata)
 	}
 
-	// Then the stored task is working and the execution is parked.
+	// Then the stored task is working and the execution is parked. The
+	// submitted-to-working write is asynchronous, so wait for it first.
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateWorking)
 	got, err := c.Get(ctxT(t), string(task.ID))
 	if err != nil {
 		t.Fatalf("get: %v", err)

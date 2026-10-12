@@ -162,21 +162,31 @@ func (i *authInterceptor) streamingRefusedBySDK() bool {
 // project grant. It carries no task id, owner, project or store text.
 var errTaskNotVisible = fmt.Errorf("executor setup failed: failed to load exec ctx: task loading failed: %w", a2a.ErrTaskNotFound)
 
+// errCancelNotVisible is what a cancel of a task id the caller cannot
+// see gets: the SDK's own text for a cancel of a task that does not
+// exist (a wrapped a2a.ErrTaskNotFound, HTTP 404), the same value for a
+// missing id, a task outside the caller's owner or project grant and an
+// interceptor without a task store. It carries no task id, owner,
+// project or store text and is not errTaskNotVisible, which is the text
+// of a send.
+var errCancelNotVisible = fmt.Errorf("failed to cancel: cancelation failed: canceler setup failed: failed to load a task: %w", a2a.ErrTaskNotFound)
+
 // requireVisibleTask loads id through the scoped task store on the
 // request context (owner mask and the stored-project predicate of the
 // freshly authenticated subject): an invisible or missing task is
-// errTaskNotVisible and a store failure is a fixed-text server error.
-// A nil store fails closed as not found.
-func (i *authInterceptor) requireVisibleTask(ctx context.Context, id a2a.TaskID) error {
+// notVisible (the text the SDK gives the same method for a missing id)
+// and a store failure is a fixed-text server error. A nil store fails
+// closed as notVisible.
+func (i *authInterceptor) requireVisibleTask(ctx context.Context, id a2a.TaskID, notVisible error) error {
 	if i.tasks.store == nil {
-		return errTaskNotVisible
+		return notVisible
 	}
 	_, err := i.tasks.Get(ctx, id)
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, a2a.ErrTaskNotFound):
-		return errTaskNotVisible
+		return notVisible
 	}
 	return a2a.NewError(a2a.ErrServerError, "a2a: task lookup failed")
 }
@@ -223,6 +233,16 @@ func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContex
 	ctx = withProjectScope(ctx, func(project string) bool {
 		return project != "" && i.authz.Authorize(subject, action, project) == nil
 	})
+	if p, ok := req.Payload.(*a2a.CancelTaskRequest); ok && callCtx.Method() == "CancelTask" && p != nil && p.ID != "" {
+		// A cancel is looked up before the SDK sees it: the execution
+		// manager keys a cancelation in progress by task id alone, so a
+		// second caller joins it without a scoped read and would get
+		// the first caller's result (or its failure). An empty id is
+		// not looked up: the SDK refuses it as invalid params.
+		if err := i.requireVisibleTask(ctx, p.ID, errCancelNotVisible); err != nil {
+			return ctx, nil, err
+		}
+	}
 	if p, ok := req.Payload.(*a2a.SendMessageRequest); ok {
 		// A continuation is looked up before the SDK sees it: the
 		// execution manager refuses a task with a parked execution
@@ -234,7 +254,7 @@ func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContex
 		lookup := callCtx.Method() == "SendMessage" ||
 			(callCtx.Method() == "SendStreamingMessage" && !i.streamingRefusedBySDK())
 		if lookup && p.Message != nil && p.Message.TaskID != "" {
-			if err := i.requireVisibleTask(ctx, p.Message.TaskID); err != nil {
+			if err := i.requireVisibleTask(ctx, p.Message.TaskID, errTaskNotVisible); err != nil {
 				return ctx, nil, err
 			}
 		}
