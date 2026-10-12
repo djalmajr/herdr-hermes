@@ -112,7 +112,7 @@ func New(cfg Config) (*Server, error) {
 		a2asrv.WithTaskStore(scopedTaskStore{store: cfg.Store}),
 		a2asrv.WithPushNotifications(cfg.Store.PushConfigs(), cfg.PushSender),
 		a2asrv.WithCapabilityChecks(&s.card.Capabilities),
-		a2asrv.WithCallInterceptors(newAuthInterceptor(cfg)),
+		a2asrv.WithCallInterceptors(newAuthInterceptor(cfg).withCapabilities(&s.card.Capabilities)),
 		a2asrv.WithLogger(cfg.Logger),
 	)
 	return s, nil

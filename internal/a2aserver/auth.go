@@ -115,15 +115,70 @@ func loopbackOrigin(o string) bool {
 // context, replaces the credential value with an empty one for the rest
 // of the call, authorizes the method and forces ReturnImmediately on
 // message sends (a task waits for a person, a blocking HTTP call must
-// not hold for days).
+// not hold for days). A message send that carries a task id is first
+// checked against the scoped task store: the SDK execution manager
+// answers a task whose execution is parked before it reads the store,
+// so without this check the answer for a task the caller cannot see
+// would differ from the answer for a task that does not exist. The
+// streaming send is checked only when the SDK would let it reach the
+// execution manager: while streaming is off the SDK refuses it with
+// the same unsupported-operation answer for every task id before any
+// store or manager access, so there is nothing to mask and the answer
+// stays as it is.
 type authInterceptor struct {
 	auth  a2acore.Authenticator
 	authz a2acore.Authorizer
+	tasks scopedTaskStore
+	caps  *a2a.AgentCapabilities
 }
 
 // newAuthInterceptor builds the interceptor of one server.
 func newAuthInterceptor(cfg Config) *authInterceptor {
-	return &authInterceptor{auth: cfg.Auth, authz: cfg.Authz}
+	return &authInterceptor{auth: cfg.Auth, authz: cfg.Authz, tasks: scopedTaskStore{store: cfg.Store}}
+}
+
+// withCapabilities sets the capabilities the server advertises, the
+// same pointer given to a2asrv.WithCapabilityChecks, and returns the
+// interceptor. Without them (nil) the interceptor assumes the SDK does
+// not refuse a streaming send, which is the SDK's own reading of nil
+// capabilities.
+func (i *authInterceptor) withCapabilities(caps *a2a.AgentCapabilities) *authInterceptor {
+	i.caps = caps
+	return i
+}
+
+// streamingRefusedBySDK mirrors the SDK check that answers a streaming
+// send with a2a.ErrUnsupportedOperation before it reads the task store
+// or enters the execution manager: capabilities are set and streaming
+// is off.
+func (i *authInterceptor) streamingRefusedBySDK() bool {
+	return i.caps != nil && !i.caps.Streaming
+}
+
+// errTaskNotVisible is what a continuation on a task id the caller
+// cannot see gets: the SDK's own text for a continuation on a task that
+// does not exist (a wrapped a2a.ErrTaskNotFound, HTTP 404), the same
+// value for a missing id and for a task outside the caller's owner or
+// project grant. It carries no task id, owner, project or store text.
+var errTaskNotVisible = fmt.Errorf("executor setup failed: failed to load exec ctx: task loading failed: %w", a2a.ErrTaskNotFound)
+
+// requireVisibleTask loads id through the scoped task store on the
+// request context (owner mask and the stored-project predicate of the
+// freshly authenticated subject): an invisible or missing task is
+// errTaskNotVisible and a store failure is a fixed-text server error.
+// A nil store fails closed as not found.
+func (i *authInterceptor) requireVisibleTask(ctx context.Context, id a2a.TaskID) error {
+	if i.tasks.store == nil {
+		return errTaskNotVisible
+	}
+	_, err := i.tasks.Get(ctx, id)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, a2a.ErrTaskNotFound):
+		return errTaskNotVisible
+	}
+	return a2a.NewError(a2a.ErrServerError, "a2a: task lookup failed")
 }
 
 // actionForMethod maps one SDK method to the action it authorizes. The
@@ -169,6 +224,20 @@ func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContex
 		return project != "" && i.authz.Authorize(subject, action, project) == nil
 	})
 	if p, ok := req.Payload.(*a2a.SendMessageRequest); ok {
+		// A continuation is looked up before the SDK sees it: the
+		// execution manager refuses a task with a parked execution
+		// before any store read. A send without a task id is a new task
+		// and is not looked up. A streaming send is looked up only when
+		// the SDK does not refuse it for the streaming capability first
+		// (it then never reaches the manager and the answer is the same
+		// for every id).
+		lookup := callCtx.Method() == "SendMessage" ||
+			(callCtx.Method() == "SendStreamingMessage" && !i.streamingRefusedBySDK())
+		if lookup && p.Message != nil && p.Message.TaskID != "" {
+			if err := i.requireVisibleTask(ctx, p.Message.TaskID); err != nil {
+				return ctx, nil, err
+			}
+		}
 		if p.Config == nil {
 			p.Config = &a2a.SendMessageConfig{}
 		}
