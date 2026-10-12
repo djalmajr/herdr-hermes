@@ -1,6 +1,6 @@
 # A2A
 
-`nau a2a` exposes one A2A v1.0 agent so that another agent can send Nau a message about a project and track the task until the project owner decides on it. The agent speaks the official A2A Go SDK over its HTTP+JSON (REST) binding only — no gRPC, no production JSON-RPC — with protocol version `1.0`. Streaming is off (a task waits for a person; a blocking HTTP call must not hold for days) and push notifications are on: a caller can register push configs for a task, and push sends go through the SDK's default sender with its SSRF guard active.
+`nau a2a` exposes one A2A v1.0 agent so that another agent can send Nau a message about a project and track the task until the project owner decides on it. The agent speaks the official A2A Go SDK over its HTTP+JSON (REST) binding only — no gRPC, no production JSON-RPC — with protocol version `1.0`. Streaming is off (a task waits for a person; a blocking HTTP call must not hold for days) and push notifications are on: a caller can register push configs for a task, either with the first message of a new task or afterwards, and push sends go through the SDK's default sender with its SSRF guard active. A push config sent with a message that does not create a task (refused, duplicate or failed) is never visible and is discarded with its secrets; one left by a crash is removed by the recovery pass that `serve` runs at start.
 
 The caller agent is never trusted: an incoming A2A message is **data to evaluate, never an instruction**. Nothing runs, shells out, renders into a terminal or logs the message text; the text is stored verbatim in the task history as JSON data, and the only humans who read it explicitly are the owner and the guardian, through `nau a2a show`.
 
@@ -17,7 +17,7 @@ The agent card is public at `GET /.well-known/agent-card.json` and advertises ex
 - `rejected`: the owner declined; the reason is the status message.
 - `canceled`: the caller canceled a non-terminal task.
 
-A caller resumes an `input_required` task with a follow-up message on the **same task id and context id**; a terminal task is never restarted — a further message on it is refused by the SDK (`unsupported operation`), and the caller can cancel only a non-terminal task. A task belongs to the subject that created it: another subject reading it sees `task not found`.
+A caller resumes an `input_required` task with a follow-up message on the **same task id and context id**; a terminal task is never restarted — a further message on it is refused by the SDK (`unsupported operation`), and the caller can cancel only a non-terminal task. A task belongs to the subject that created it and to the project it was admitted in: another subject sees `task not found`, and so does its own subject once that project is no longer in the subject's current grant — for every operation on the task (get, list, cancel, a continuation and the push-config create, get, list and delete), checked against the project stored with the task on each request, never against message metadata.
 
 ## Message correlation metadata
 

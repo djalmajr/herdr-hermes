@@ -264,8 +264,15 @@ func (e *executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 // execution (not a cancelation) the SDK calls it after the final event
 // was processed and stored, and the parked entry of the task goes away
 // with it.
-func (e *executor) Cleanup(_ context.Context, execCtx *a2asrv.ExecutorContext, _ a2a.SendMessageResult, _ error) {
+func (e *executor) Cleanup(ctx context.Context, execCtx *a2asrv.ExecutorContext, _ a2a.SendMessageResult, _ error) {
 	if execCtx.Message != nil {
 		e.unregister(string(execCtx.TaskID))
+		if execCtx.StoredTask == nil {
+			// A new task: the SDK saved its push config before the
+			// admission, so one whose task never committed is discarded
+			// here. The error is ignored: the startup recovery pass
+			// (RecoverHeld) removes what a failed discard leaves.
+			_, _ = e.store.PushConfigs().DiscardUncommitted(ctx, execCtx.TaskID)
+		}
 	}
 }

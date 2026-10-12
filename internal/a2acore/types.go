@@ -487,6 +487,9 @@ type Queue interface {
 
 	// RecoverHeld marks DeliveryObsolete the held deliveries whose task
 	// did not commit within grace of their admission (a crash between
-	// the admission and the task write). It returns how many it marked.
+	// the admission and the task write). In the same transaction it
+	// deletes the pending push configs (rows and secret handles) whose
+	// task has no row and that are older than grace. It returns how many
+	// deliveries it marked.
 	RecoverHeld(ctx context.Context, now time.Time, grace time.Duration) (int, error)
 }

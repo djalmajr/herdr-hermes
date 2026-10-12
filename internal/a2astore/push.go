@@ -29,26 +29,26 @@ func (s *Store) PushConfigs() *PushConfigStore {
 	return &PushConfigStore{s: s}
 }
 
-// Save stores the push config of an existing task (the existence check is
-// internal, not owner-masked). A config without an id gets a generated
-// "pc_<16 hex>" one; the URL is required (a2a.ErrInvalidParams when
-// missing). The Token and the Auth.Credentials are put into the Secret
-// Provider and only their handles are stored; on a replace the previous
-// row's handles are deleted from the provider. The returned config is a
-// copy carrying the original secret values.
+// Save stores one push config of a task. The task does not need a row
+// yet: the SDK saves the push config of a first message before the
+// executor admits it, so a config whose task has no a2a_tasks row is
+// "pending". A pending config is invisible to Get, List and
+// UnavailableCount until the task commits, and is discarded by
+// DiscardUncommitted (the execution cleanup) or by RecoverHeld (the
+// startup recovery) when the task never commits. A config without an id
+// gets a generated "pc_<16 hex>" one; the URL is required
+// (a2a.ErrInvalidParams when missing). The Token and the
+// Auth.Credentials are put into the Secret Provider and only their
+// handles are stored; on a replace the previous row's handles are
+// deleted from the provider. The returned config is a copy carrying the
+// original secret values. Save does no owner check: the SDK masks every
+// existing task before it saves and a new task id is server-generated.
 func (p *PushConfigStore) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.PushConfig) (*a2a.PushConfig, error) {
 	if cfg == nil || cfg.URL == "" {
 		return nil, a2a.ErrInvalidParams
 	}
 	var stored *a2a.PushConfig
 	err := p.s.tx(ctx, func(tx *sql.Tx) error {
-		var n int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM a2a_tasks WHERE task_id = ?`, string(taskID)).Scan(&n); err != nil {
-			return err
-		}
-		if n == 0 {
-			return a2a.ErrTaskNotFound
-		}
 		id := cfg.ID
 		if id == "" {
 			var b [8]byte
@@ -113,8 +113,9 @@ func (p *PushConfigStore) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.
 	return stored, nil
 }
 
-// Get retrieves one push config, resolving its handles through the
-// SecretProvider: a missing row or an unavailable handle is
+// Get retrieves one push config of a committed task, resolving its
+// handles through the SecretProvider: a missing row, a pending config
+// (its task has no a2a_tasks row) or an unavailable handle is
 // push.ErrPushConfigNotFound.
 func (p *PushConfigStore) Get(ctx context.Context, taskID a2a.TaskID, configID string) (*a2a.PushConfig, error) {
 	row, err := p.s.pushRow(ctx, string(taskID), configID)
@@ -124,11 +125,12 @@ func (p *PushConfigStore) Get(ctx context.Context, taskID a2a.TaskID, configID s
 	return p.s.pushConfig(ctx, string(taskID), row)
 }
 
-// List retrieves the push configs of one task, in config-id order,
-// omitting the ones whose handles are unavailable.
+// List retrieves the push configs of one committed task, in config-id
+// order, omitting the ones whose handles are unavailable; the pending
+// configs of a task with no a2a_tasks row are not listed.
 func (p *PushConfigStore) List(ctx context.Context, taskID a2a.TaskID) ([]*a2a.PushConfig, error) {
 	rows, err := p.s.db.Query(`SELECT config_id, url, COALESCE(auth_scheme, ''), COALESCE(token_ref, ''), COALESCE(credentials_ref, '')
-		FROM a2a_push_configs WHERE task_id = ? ORDER BY config_id ASC`, string(taskID))
+		FROM a2a_push_configs WHERE task_id = ? AND task_id IN (SELECT task_id FROM a2a_tasks) ORDER BY config_id ASC`, string(taskID))
 	if err != nil {
 		return nil, err
 	}
@@ -154,12 +156,12 @@ func (p *PushConfigStore) List(ctx context.Context, taskID a2a.TaskID) ([]*a2a.P
 	return configs, nil
 }
 
-// UnavailableCount counts the push configs of one task whose secret
-// handles no longer resolve (for example after a restart of an in-memory
-// provider).
+// UnavailableCount counts the push configs of one committed task whose
+// secret handles no longer resolve (for example after a restart of an
+// in-memory provider); pending configs are not counted.
 func (p *PushConfigStore) UnavailableCount(ctx context.Context, taskID a2a.TaskID) (int, error) {
 	rows, err := p.s.db.Query(`SELECT COALESCE(token_ref, ''), COALESCE(credentials_ref, '')
-		FROM a2a_push_configs WHERE task_id = ?`, string(taskID))
+		FROM a2a_push_configs WHERE task_id = ? AND task_id IN (SELECT task_id FROM a2a_tasks)`, string(taskID))
 	if err != nil {
 		return 0, err
 	}
@@ -250,6 +252,88 @@ func (p *PushConfigStore) DeleteAll(ctx context.Context, taskID a2a.TaskID) erro
 	})
 }
 
+// DiscardUncommitted deletes the pending push configs of taskID (rows and
+// their secret handles) in one transaction and returns how many rows it
+// deleted. When the task has an a2a_tasks row it changes nothing and
+// returns 0, so a committed task's configs are never touched.
+func (p *PushConfigStore) DiscardUncommitted(ctx context.Context, taskID a2a.TaskID) (int, error) {
+	var deleted int
+	err := p.s.tx(ctx, func(tx *sql.Tx) error {
+		var n int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM a2a_tasks WHERE task_id = ?`, string(taskID)).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return nil
+		}
+		rows, err := pendingPushRows(tx, `WHERE task_id = ?`, string(taskID))
+		if err != nil {
+			return err
+		}
+		deleted, err = p.s.deletePushRows(ctx, tx, rows)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// pendingPush is the key, the handles and the creation stamp of one push
+// config row.
+type pendingPush struct {
+	taskID, configID string
+	token, creds     sql.NullString
+	created          string
+}
+
+// pendingPushRows loads the push config rows selected by where (a clause
+// over a2a_push_configs); the caller restricts it to rows whose task has
+// no a2a_tasks row.
+func pendingPushRows(tx *sql.Tx, where string, args ...any) ([]pendingPush, error) {
+	rows, err := tx.Query(`SELECT task_id, config_id, token_ref, credentials_ref, created FROM a2a_push_configs `+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	var out []pendingPush
+	for rows.Next() {
+		var r pendingPush
+		if err := rows.Scan(&r.taskID, &r.configID, &r.token, &r.creds, &r.created); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// deletePushRows deletes the rows, then their token and credentials
+// handles from the SecretProvider, and returns how many rows it deleted.
+func (s *Store) deletePushRows(ctx context.Context, tx *sql.Tx, rows []pendingPush) (int, error) {
+	for _, r := range rows {
+		if _, err := tx.Exec(`DELETE FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`, r.taskID, r.configID); err != nil {
+			return 0, err
+		}
+	}
+	for _, r := range rows {
+		if r.token.Valid {
+			if err := s.secrets.Delete(ctx, r.token.String); err != nil {
+				return 0, err
+			}
+		}
+		if r.creds.Valid {
+			if err := s.secrets.Delete(ctx, r.creds.String); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return len(rows), nil
+}
+
 // pushRow is one a2a_push_configs row with its nullable columns resolved.
 type pushRow struct {
 	configID   string
@@ -264,7 +348,8 @@ type pushRow struct {
 func (s *Store) pushRow(ctx context.Context, taskID, configID string) (pushRow, error) {
 	var row pushRow
 	err := s.db.QueryRow(`SELECT config_id, url, COALESCE(auth_scheme, ''), COALESCE(token_ref, ''), COALESCE(credentials_ref, '')
-		FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`, taskID, configID).
+		FROM a2a_push_configs WHERE task_id = ? AND config_id = ?
+		AND task_id IN (SELECT task_id FROM a2a_tasks)`, taskID, configID).
 		Scan(&row.configID, &row.url, &row.authScheme, &row.tokenRef, &row.credsRef)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pushRow{}, push.ErrPushConfigNotFound

@@ -176,15 +176,25 @@ func (s *Store) terminalSideEffects(tx *sql.Tx, taskID string) error {
 // Get retrieves the caller's task as a deep copy: another subject's task
 // and a missing one are a2a.ErrTaskNotFound.
 func (s *Store) Get(ctx context.Context, id a2a.TaskID) (*taskstore.StoredTask, error) {
+	return s.GetVisible(ctx, id, nil)
+}
+
+// GetVisible is Get restricted to the projects visible accepts: the
+// project is the stored immutable a2a_tasks.project column, never the
+// task JSON metadata. Owner masking comes first and is unchanged; a row
+// whose project is not visible is the same a2a.ErrTaskNotFound as a
+// missing or another subject's task. A nil visible is no project
+// filter.
+func (s *Store) GetVisible(ctx context.Context, id a2a.TaskID, visible func(project string) bool) (*taskstore.StoredTask, error) {
 	owner, err := s.owner(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var storedOwner string
+	var storedOwner, project string
 	var version int
 	var body []byte
-	err = s.db.QueryRow(`SELECT owner, version, task_json FROM a2a_tasks WHERE task_id = ?`, string(id)).
-		Scan(&storedOwner, &version, &body)
+	err = s.db.QueryRow(`SELECT owner, project, version, task_json FROM a2a_tasks WHERE task_id = ?`, string(id)).
+		Scan(&storedOwner, &project, &version, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, a2a.ErrTaskNotFound
 	}
@@ -192,6 +202,9 @@ func (s *Store) Get(ctx context.Context, id a2a.TaskID) (*taskstore.StoredTask, 
 		return nil, err
 	}
 	if storedOwner != owner {
+		return nil, a2a.ErrTaskNotFound
+	}
+	if visible != nil && !visible(project) {
 		return nil, a2a.ErrTaskNotFound
 	}
 	task, err := unmarshalTask(body)
@@ -211,6 +224,16 @@ func (s *Store) Get(ctx context.Context, id a2a.TaskID) (*taskstore.StoredTask, 
 // artifacts are dropped unless IncludeArtifacts. TotalSize is the
 // filtered count.
 func (s *Store) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a.ListTasksResponse, error) {
+	return s.ListVisible(ctx, req, nil)
+}
+
+// ListVisible is List restricted to the projects visible accepts: the
+// project is the stored immutable a2a_tasks.project column, never the
+// task JSON metadata. Rows whose project is not visible are dropped
+// before the StatusTimestampAfter filter, the TotalSize count and the
+// page-token cut, so TotalSize, NextPageToken, history and artifacts
+// never reflect them. A nil visible is no project filter.
+func (s *Store) ListVisible(ctx context.Context, req *a2a.ListTasksRequest, visible func(project string) bool) (*a2a.ListTasksResponse, error) {
 	if req == nil {
 		return nil, a2a.ErrInvalidRequest
 	}
@@ -234,7 +257,7 @@ func (s *Store) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a.ListT
 			return &a2a.ListTasksResponse{Tasks: []*a2a.Task{}, PageSize: pageSize}, nil
 		}
 	}
-	query := `SELECT task_id, task_json, updated_nano FROM a2a_tasks WHERE owner = ?`
+	query := `SELECT task_id, task_json, updated_nano, project FROM a2a_tasks WHERE owner = ?`
 	args := []any{owner}
 	if req.ContextID != "" {
 		query += ` AND context_id = ?`
@@ -256,11 +279,14 @@ func (s *Store) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a.ListT
 	}
 	var filtered []storedRow
 	for rows.Next() {
-		var id string
+		var id, project string
 		var nano int64
 		var body []byte
-		if err := rows.Scan(&id, &body, &nano); err != nil {
+		if err := rows.Scan(&id, &body, &nano, &project); err != nil {
 			return nil, err
+		}
+		if visible != nil && !visible(project) {
+			continue
 		}
 		task, err := unmarshalTask(body)
 		if err != nil {

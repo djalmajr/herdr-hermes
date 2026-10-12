@@ -127,7 +127,9 @@ func newAuthInterceptor(cfg Config) *authInterceptor {
 }
 
 // actionForMethod maps one SDK method to the action it authorizes. The
-// project is always "" here: the executor checks the project of a send.
+// project is always "" here: the project is checked per task through
+// the request scope the interceptor stamps (scopedTaskStore), and the
+// executor checks the project of a send.
 func actionForMethod(method string) (a2acore.Action, bool) {
 	switch method {
 	case "SendMessage", "SendStreamingMessage":
@@ -160,6 +162,12 @@ func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContex
 	if !ok || i.authz.Authorize(subject, action, "") != nil {
 		return ctx, nil, a2a.NewError(a2a.ErrUnauthorized, "a2a: unauthorized")
 	}
+	// The project scope is built from this request's freshly
+	// authenticated subject and is never cached: a task whose stored
+	// project the subject's grant does not cover is task-not-found.
+	ctx = withProjectScope(ctx, func(project string) bool {
+		return project != "" && i.authz.Authorize(subject, action, project) == nil
+	})
 	if p, ok := req.Payload.(*a2a.SendMessageRequest); ok {
 		if p.Config == nil {
 			p.Config = &a2a.SendMessageConfig{}

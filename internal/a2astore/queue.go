@@ -300,7 +300,11 @@ func (s *Store) Release(ctx context.Context, c a2acore.DeliveryClaim) error {
 
 // RecoverHeld marks obsolete the held deliveries whose ingress is older
 // than grace and whose task never committed (a crash between the
-// admission and the task write), and returns how many it marked.
+// admission and the task write), and returns how many it marked. In the
+// same transaction it deletes the pending push configs (rows and their
+// secret handles) whose task has no a2a_tasks row and whose creation
+// stamp is older than now minus grace (a stamp that does not parse counts
+// as older); they are not part of the returned count.
 func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Duration) (int, error) {
 	cutoff := now.Add(-grace).Unix()
 	var marked int
@@ -318,7 +322,20 @@ func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Durat
 			return err
 		}
 		marked = int(affected)
-		return nil
+		pending, err := pendingPushRows(tx, `WHERE task_id NOT IN (SELECT task_id FROM a2a_tasks)`)
+		if err != nil {
+			return err
+		}
+		var stale []pendingPush
+		pushCutoff := now.Add(-grace)
+		for _, r := range pending {
+			created, perr := time.Parse(tsLayout, r.created)
+			if perr != nil || created.Before(pushCutoff) {
+				stale = append(stale, r)
+			}
+		}
+		_, err = s.deletePushRows(ctx, tx, stale)
+		return err
 	})
 	if err != nil {
 		return 0, err

@@ -162,8 +162,15 @@ func TestPushSaveRules(t *testing.T) {
 	if _, err := s.PushConfigs().Save(context.Background(), "t1", &a2a.PushConfig{Token: "t"}); !errors.Is(err, a2a.ErrInvalidParams) {
 		t.Fatalf("Save without URL: %v, want invalid params", err)
 	}
-	if _, err := s.PushConfigs().Save(context.Background(), "nope", &a2a.PushConfig{URL: "http://127.0.0.1:9999/push"}); !errors.Is(err, a2a.ErrTaskNotFound) {
-		t.Fatalf("Save on a missing task: %v, want task not found", err)
+	// A task without a row yet (the SDK saves the push config of a first
+	// message before the admission) is a pending config: Save succeeds,
+	// and Get does not see it until the task commits.
+	pending, err := s.PushConfigs().Save(context.Background(), "nope", &a2a.PushConfig{URL: "http://127.0.0.1:9999/push"})
+	if err != nil {
+		t.Fatalf("Save on a task without a row: %v, want a pending config", err)
+	}
+	if _, err := s.PushConfigs().Get(context.Background(), "nope", pending.ID); !errors.Is(err, push.ErrPushConfigNotFound) {
+		t.Fatalf("Get of a pending config: %v, want push config not found", err)
 	}
 }
 

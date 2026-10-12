@@ -109,7 +109,7 @@ func New(cfg Config) (*Server, error) {
 	s.executor = newExecutor(cfg)
 	s.handler = a2asrv.NewHandler(
 		s.executor,
-		a2asrv.WithTaskStore(cfg.Store),
+		a2asrv.WithTaskStore(scopedTaskStore{store: cfg.Store}),
 		a2asrv.WithPushNotifications(cfg.Store.PushConfigs(), cfg.PushSender),
 		a2asrv.WithCapabilityChecks(&s.card.Capabilities),
 		a2asrv.WithCallInterceptors(newAuthInterceptor(cfg)),

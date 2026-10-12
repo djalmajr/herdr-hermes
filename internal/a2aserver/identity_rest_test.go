@@ -487,25 +487,16 @@ func TestIdentityAuthorizationChangesBetweenRequests(t *testing.T) {
 		task := sendTask(t, c, idfxSend("org/repo-a", "s-1", "m-1"))
 		idfxAsk(t, e, c, string(task.ID), "d-1")
 
-		// The project leaves the subject's routing: the continuation and
-		// a new task in it are refused, the other project still works.
+		// The project leaves the subject's routing: the task is task not
+		// found for the continuation (the SDK loads it first), a new task
+		// in it is refused, the other project still works.
 		e.routes.set("owner-ref-a", "org/repo-b")
-		res, err := c.Send(ctxT(t), SendInput{
+		_, err := c.Send(ctxT(t), SendInput{
 			TaskID: string(task.ID), ContextID: task.ContextID,
 			Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-2", Text: "continuation",
 		})
-		if err != nil {
-			t.Fatalf("refused continuation: %v", err)
-		}
-		got, ok := res.(*a2a.Task)
-		if !ok {
-			t.Fatalf("refused continuation result = %T, want *a2a.Task", res)
-		}
-		if got.Status.State != a2a.TaskStateInputRequired {
-			t.Errorf("refused continuation state = %s, want input required (unchanged)", got.Status.State)
-		}
-		if got.Status.Message == nil || got.Status.Message.Metadata[a2acore.MetaRefusal] != a2acore.RefuseUnauthorizedProject {
-			t.Errorf("refused continuation status message = %+v, want refusal %s", got.Status.Message, a2acore.RefuseUnauthorizedProject)
+		if !errors.Is(err, a2a.ErrTaskNotFound) {
+			t.Fatalf("refused continuation err = %v, want task not found", err)
 		}
 		if _, err := c.Send(ctxT(t), idfxSend("org/repo-a", "s-2", "m-3")); !errors.Is(err, a2a.ErrUnauthorized) {
 			t.Errorf("new task in the removed project err = %v, want unauthorized", err)
@@ -522,14 +513,14 @@ func TestIdentityAuthorizationChangesBetweenRequests(t *testing.T) {
 		// number is accepted again, which also shows that the refused one
 		// did not consume the fence.
 		e.routes.set("owner-ref-a", "org/repo-a", "org/repo-b")
-		res, err = c.Send(ctxT(t), SendInput{
+		res, err := c.Send(ctxT(t), SendInput{
 			TaskID: string(task.ID), ContextID: task.ContextID,
 			Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-5", Text: "continuation",
 		})
 		if err != nil {
 			t.Fatalf("accepted continuation: %v", err)
 		}
-		got, ok = res.(*a2a.Task)
+		got, ok := res.(*a2a.Task)
 		if !ok || got.ID != task.ID || got.Status.State != a2a.TaskStateWorking {
 			t.Errorf("accepted continuation = %T %+v, want the same task working", res, got)
 		}

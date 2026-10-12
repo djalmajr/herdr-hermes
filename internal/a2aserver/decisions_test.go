@@ -214,6 +214,10 @@ func TestOutOfBandDecisionPush(t *testing.T) {
 
 	task := sendTask(t, c, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
 	waitLive(t, s1, 1)
+	// The send answers at Submitted (ReturnImmediately) while the execution
+	// may still be storing Working; the out-of-band apply below needs the
+	// stored Working state, so wait for it as a second process would.
+	waitStoredState(t, store1, string(task.ID), a2acore.StateWorking)
 
 	// The push config carries the canary token and credentials.
 	const tokenCanary = "canary-push-0004"
