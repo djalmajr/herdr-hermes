@@ -57,6 +57,8 @@ var commands = []command{
 	// DJA-229: registry service and its client
 	{"serve", true, true, cmdServe},
 	{"jobs", false, false, cmdJobs},
+	// DJA-283: A2A agent and client (serve and reply gate NOWRITE themselves)
+	{"a2a", false, true, cmdA2A},
 }
 
 // Run executes args[0] as a command and returns its exit code. An unknown

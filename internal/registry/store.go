@@ -225,6 +225,12 @@ func migrate(db *sql.DB) error {
 	return txn.Commit()
 }
 
+// DB returns the open database handle. It exists for the additive A2A
+// tables (internal/a2astore), which live in this canonical database
+// beside the registry tables and never touch them; the registry schema
+// version is not theirs to change.
+func (s *Store) DB() *sql.DB { return s.db }
+
 // Close closes the database.
 func (s *Store) Close() error {
 	return s.db.Close()

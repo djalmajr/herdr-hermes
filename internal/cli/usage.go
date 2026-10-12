@@ -35,6 +35,21 @@ commands:
                                     holds and priorities, retained folders (a record, never
                                     a permission to delete) and node facts
                                     (every jobs form takes [--server <url>])
+  a2a serve [--listen <host:port>] [--db <path>] [--deliver-interval <seconds>]
+                                    run the A2A agent (HTTP+JSON, loopback only): accept
+                                    messages for the project owner and deliver notices
+  a2a card|get|cancel --server <url> [--task <id>]
+                                    A2A client: agent card, task state, cancel a task
+  a2a send --server <url> --session <id> --epoch <n> --seq <n> [--project <org/repo>]
+                        [--job <id>] [--task <id> --context <id>] [--message-id <id>]
+                        (<text>|-)
+                                    A2A client: send a message (new task or continuation)
+  a2a inbox [--db <path>] [--project <org/repo>] [--state <state>]
+  a2a show --task <id> [--db <path>]
+                                    list and read the A2A tasks of this machine (read-only)
+  a2a reply --task <id> --answer|--ask|--decline [--decision-id <id>] [--db <path>]
+                        (<text>|-)
+                                    record the owner decision on a task awaiting it
   wake                              read one job event on stdin, record it in the outbox and
                                     attempt one push
   sync [--job <id>] [--push-only]   sync tracked job events and push pending records
@@ -82,12 +97,14 @@ commands:
 exit codes:
   0   success (forwarded commands: whatever herdr-soho returned)
   2   bad usage, input limit exceeded, unknown config key, internal job
-      subcommand refused, registry usage or field rejected (serve, jobs)
+      subcommand refused, registry usage or field rejected (serve, jobs),
+      A2A request or decision refused (a2a)
   3   unknown job id in %s bookkeeping (sync --job) and unknown
       notification id (notify status --id, notify ack, notify retry), unknown
-      claim, policy or folder (jobs)
+      claim, policy or folder (jobs), unknown A2A task (a2a)
   4   herdr-soho not found or not runnable; no eligible machine available
-      (route); registry unreachable or unavailable (serve, jobs)
+      (route); registry unreachable or unavailable (serve, jobs); A2A
+      server unreachable or database unavailable (a2a)
   40  no API key configured (push required)
   41  API key rejected by the dispatcher (401/403)
   42  dispatcher unreachable or retries exhausted; records stay pending

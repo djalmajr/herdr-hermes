@@ -326,20 +326,20 @@ func TestJobsOutputControls(t *testing.T) {
 		var out, errb bytes.Buffer
 		code := Run([]string{"jobs", "--server", srv.URL, "folder", "add", "--maquina", "node-a", "--caminho", caminho, "--pedido", pedido, "--job", "job-1"}, controlsEnv(&out, &errb))
 		if code != 0 {
-			t.Fatalf("folder add exit = %d (stdout %q stderr %q)", code, out, errb)
+			t.Fatalf("folder add exit = %d (stdout %q stderr %q)", code, out.String(), errb.String())
 		}
 		if errb.String() != "" {
-			t.Errorf("folder add stderr = %q, want empty", errb)
+			t.Errorf("folder add stderr = %q, want empty", errb.String())
 		}
 
 		var out2, errb2 bytes.Buffer
 		code2 := Run([]string{"jobs", "--server", srv.URL}, controlsEnv(&out2, &errb2))
 		if code2 != 0 {
-			t.Fatalf("jobs exit = %d (stdout %q stderr %q)", code2, out2, errb2)
+			t.Fatalf("jobs exit = %d (stdout %q stderr %q)", code2, out2.String(), errb2.String())
 		}
 		assertOneLineControlFree(t, out2.Bytes(), errb2.Bytes())
 		if errb2.String() != "" {
-			t.Errorf("jobs stderr = %q, want empty", errb2)
+			t.Errorf("jobs stderr = %q, want empty", errb2.String())
 		}
 		var inv struct {
 			Pastas []struct {
