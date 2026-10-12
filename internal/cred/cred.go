@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // ErrNotConfigured reports that no key is stored yet.

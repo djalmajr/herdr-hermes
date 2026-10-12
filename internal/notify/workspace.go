@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/nau/internal/jobapi"
 )
 
 // ErrNotWorkspace is returned by ParseWorkspaceEvent when the envelope

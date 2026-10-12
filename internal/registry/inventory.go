@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // Inventory reads the whole current state, as the jobs API returns it.

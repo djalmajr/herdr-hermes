@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // defaultPollTimeout bounds each herdr call when Poller.Timeout is zero

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 func sessionRecord(t *testing.T, dir string, n int) outbox.Record {
@@ -220,7 +220,7 @@ func TestSession(t *testing.T) {
 	}
 	for _, args := range cases {
 		stdout, stderr, exit := runCLIStdin(t, dir, "", nil, args...)
-		if exit != 2 || !strings.Contains(stderr, "herdr-hermes") || !strings.Contains(stdout, `"status":"2"`) {
+		if exit != 2 || !strings.Contains(stderr, "nau") || !strings.Contains(stdout, `"status":"2"`) {
 			t.Errorf("%v: exit %d stderr %q stdout %q", args, exit, stderr, stdout)
 		}
 	}

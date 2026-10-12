@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // cmdPush implements `push`: push the pending outbox records to the

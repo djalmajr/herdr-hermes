@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/soho"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/soho"
 )
 
 // syncTerminalStates are the trailer states that make a job terminal for
@@ -179,7 +179,7 @@ func printSyncOutcome(env Env, res syncResult, code int) {
 	case 3:
 		_, _ = fmt.Fprintf(env.Stdout, `{"status":"not_found"}`+"\n")
 	case 43:
-		_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: %s\n", res.ErrMotivo)
+		_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", env.program(), res.ErrMotivo)
 		_, _ = fmt.Fprintf(env.Stdout, `{"status":"capabilities_missing","motivo":"%s"}`+"\n", sanitizeJSON(res.ErrMotivo))
 	case 2:
 		fail(env, 2, res.ErrMotivo)

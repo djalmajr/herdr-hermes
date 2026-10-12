@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/plugin"
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/plugin"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // runCLI runs Run with a hermetic env over a fresh ConfigDir and returns
@@ -412,7 +412,7 @@ func TestNoConfigDir(t *testing.T) {
 	}
 	// help, version and capabilities do not need the config dir.
 	stdout, _, exit := runCLI(t, "", false, "help")
-	if exit != 0 || !strings.Contains(stdout, "usage: herdr-hermes <command> [args]") {
+	if exit != 0 || !strings.Contains(stdout, "usage: nau <command> [args]") {
 		t.Errorf("help with empty ConfigDir: exit %d", exit)
 	}
 	stdout, _, exit = runCLI(t, "", false, "capabilities", "--json")
@@ -425,7 +425,7 @@ func TestNoConfigDir(t *testing.T) {
 	}
 	// No arguments still prints usage (no config dir needed).
 	stdout, _, exit = runCLI(t, "", false)
-	if exit != 0 || !strings.Contains(stdout, "usage: herdr-hermes <command> [args]") {
+	if exit != 0 || !strings.Contains(stdout, "usage: nau <command> [args]") {
 		t.Errorf("no args with empty ConfigDir: exit %d", exit)
 	}
 }
@@ -461,4 +461,117 @@ func TestOutboxTrailerUnchangedByLastPush(t *testing.T) {
 	if lastLine != `{"outbox":"fim","ultimo_seq":1,"entregue_seq":1}` {
 		t.Errorf("trailer = %q; want {\"outbox\":\"fim\",\"ultimo_seq\":1,\"entregue_seq\":1}", lastLine)
 	}
+}
+
+// TestProgramNameIdentity covers the identity contract at the Env level:
+// the two exported names, the empty-Program default, and how each name
+// renders the usage text (the deprecation line only right after the
+// title of the deprecated name, the texts otherwise identical) and the
+// stderr diagnostic prefix.
+func TestProgramNameIdentity(t *testing.T) {
+	if ProgramNau != "nau" || ProgramHerdrHermes != "herdr-hermes" {
+		t.Fatalf("names = %q/%q, want %q/%q", ProgramNau, ProgramHerdrHermes, "nau", "herdr-hermes")
+	}
+	if got := (Env{}).program(); got != ProgramNau {
+		t.Errorf("empty Env program = %q, want %q (the default)", got, ProgramNau)
+	}
+	if got := (Env{Program: ProgramHerdrHermes}).program(); got != ProgramHerdrHermes {
+		t.Errorf("Env{Program: %q} program = %q, want %q", ProgramHerdrHermes, got, ProgramHerdrHermes)
+	}
+	const title = " - universal messaging and registry core; this build bridges a remote job dispatcher and a Herdr node"
+	const deprecation = "herdr-hermes is the deprecated name of nau: same commands, same state, same exit codes.\n"
+
+	// Default program: no-args prints the primary usage on stdout, exit 0,
+	// empty stderr, no deprecation line.
+	stdout, stderr, exit := runCLI(t, t.TempDir(), false)
+	if exit != 0 {
+		t.Fatalf("no-args exit = %d, want 0, stderr %q", exit, stderr)
+	}
+	if stderr != "" {
+		t.Errorf("no-args stderr = %q, want empty", stderr)
+	}
+	nauUsage := stdout
+	if !strings.HasPrefix(nauUsage, ProgramNau+title+"\n") {
+		t.Errorf("no-args stdout does not lead with the nau title line: %q", firstNLines(nauUsage, 2))
+	}
+	if !strings.Contains(nauUsage, "usage: "+ProgramNau+" <command> [args]\n") {
+		t.Errorf("no-args stdout lacks the nau usage line")
+	}
+	if strings.Contains(nauUsage, "deprecated name of nau") {
+		t.Errorf("no-args stdout carries the deprecation line: %q", firstNLines(nauUsage, 3))
+	}
+
+	// Deprecated program: the same usage under its own name, with the one
+	// deprecation line right after the title.
+	var out, errb bytes.Buffer
+	env := Env{
+		Stdin:     strings.NewReader(""),
+		Stdout:    &out,
+		Stderr:    &errb,
+		Getenv:    getenvFor(false),
+		Program:   ProgramHerdrHermes,
+		ConfigDir: t.TempDir(),
+		Now:       func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Sleep:     sleepCtx,
+	}
+	if exit := Run(nil, env); exit != 0 {
+		t.Fatalf("no-args (herdr-hermes) exit = %d, want 0", exit)
+	}
+	hhUsage := out.String()
+	if errb.String() != "" {
+		t.Errorf("no-args (herdr-hermes) stderr = %q, want empty", errb.String())
+	}
+	if !strings.HasPrefix(hhUsage, ProgramHerdrHermes+title+"\n"+deprecation) {
+		t.Errorf("no-args (herdr-hermes) does not lead with the title and the deprecation line: %q", firstNLines(hhUsage, 3))
+	}
+	if !strings.Contains(hhUsage, "usage: "+ProgramHerdrHermes+" <command> [args]\n") {
+		t.Errorf("no-args (herdr-hermes) lacks its usage line")
+	}
+	// Same text otherwise: dropping the deprecation line and normalizing
+	// the name makes the two usages byte-identical.
+	normalized := strings.ReplaceAll(hhUsage, deprecation, "")
+	normalized = strings.ReplaceAll(normalized, ProgramHerdrHermes, ProgramNau)
+	if normalized != nauUsage {
+		t.Errorf("the two usages differ beyond the name and the deprecation line:\n--- nau ---\n%s--- herdr-hermes normalized ---\n%s", nauUsage, normalized)
+	}
+
+	// The stderr diagnostic prefix follows the program name for the same
+	// failure: default Env prints the nau prefix, the deprecated Env its
+	// own.
+	_, stderr, exit = runCLI(t, t.TempDir(), false, "config", "get", "no_such_key")
+	if exit != 2 {
+		t.Fatalf("config get unknown key exit = %d, want 2, stderr %q", exit, stderr)
+	}
+	if !strings.HasPrefix(stderr, ProgramNau+": ") {
+		t.Errorf("stderr prefix = %q, want %q: ...", firstLineOf(stderr), ProgramNau)
+	}
+	var out2, errb2 bytes.Buffer
+	env2 := env
+	env2.Stdout = &out2
+	env2.Stderr = &errb2
+	env2.ConfigDir = t.TempDir()
+	if exit := Run([]string{"config", "get", "no_such_key"}, env2); exit != 2 {
+		t.Fatalf("config get unknown key (herdr-hermes) exit = %d, want 2", exit)
+	}
+	if !strings.HasPrefix(errb2.String(), ProgramHerdrHermes+": ") {
+		t.Errorf("stderr prefix = %q, want %q: ...", firstLineOf(errb2.String()), ProgramHerdrHermes)
+	}
+}
+
+// firstNLines returns the first n lines of s, joined with a marker, for
+// failure messages.
+func firstNLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// firstLineOf returns the first line of s, for failure messages.
+func firstLineOf(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

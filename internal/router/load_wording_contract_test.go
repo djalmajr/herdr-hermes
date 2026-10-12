@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // lwAgent is one agent entry for lwAgentsJSON. A nil name with nullName

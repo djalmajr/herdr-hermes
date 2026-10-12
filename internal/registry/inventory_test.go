@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // dispatchRec is a dispatch record with a controllable ts.

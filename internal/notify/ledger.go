@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // ErrNotEnabled is returned by Raise when no registry exists yet.

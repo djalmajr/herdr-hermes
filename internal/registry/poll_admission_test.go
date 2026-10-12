@@ -19,9 +19,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // admBlockedPanes builds n blocked panes with the given id prefix.

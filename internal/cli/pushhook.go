@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/push"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/push"
 )
 
 // pushOutcome is the result of the push step shared by the commands that

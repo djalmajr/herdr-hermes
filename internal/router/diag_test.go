@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // TestClassifyFailureRealPayloads: the three observed herdr failure

@@ -16,12 +16,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
-	"github.com/djalmajr/herdr-hermes/internal/notify"
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/plugin"
-	"github.com/djalmajr/herdr-hermes/internal/soho"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/notify"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/plugin"
+	"github.com/djalmajr/nau/internal/soho"
 )
 
 // notifyStdinCap is the agent-status ingest stdin cap: 64 KiB, the same

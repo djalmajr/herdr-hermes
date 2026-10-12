@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/router"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // installFake installs the fake herdr executable in a temp dir and

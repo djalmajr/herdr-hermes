@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // seedOutbox writes n dispatch records into the state directory and returns

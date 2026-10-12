@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/nau/internal/jobapi"
 )
 
 // waitDelay gives a child that ignores the cancel signal a bounded grace

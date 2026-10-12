@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // okPoll builds an OK PollResult at the fixed clock.

@@ -15,7 +15,7 @@ import (
 
 	_ "modernc.org/sqlite" // driver "sqlite"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // Store is one open registry database. All access goes through a single

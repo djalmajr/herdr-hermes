@@ -30,8 +30,9 @@ func docFirstLine(s string) string {
 }
 
 // TestDocsHelpIsPlainText keeps the README output contract for the
-// plain-text exceptions: `help` and running herdr-hermes with no arguments
-// print the usage on stdout and exit 0 instead of a JSON line.
+// plain-text exceptions: `help` and running `nau` (or the deprecated
+// `herdr-hermes`) with no arguments print the usage on stdout and exit 0
+// instead of a JSON line.
 func TestDocsHelpIsPlainText(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -45,8 +46,9 @@ func TestDocsHelpIsPlainText(t *testing.T) {
 			if exit != 0 {
 				t.Fatalf("exit = %d, want 0", exit)
 			}
-			if stdout != usage {
-				t.Fatalf("stdout does not equal the usage text byte for byte (len %d, want %d)", len(stdout), len(usage))
+			wantUsage := usageText(Env{})
+			if stdout != wantUsage {
+				t.Fatalf("stdout does not equal the usage text byte for byte (len %d, want %d)", len(stdout), len(wantUsage))
 			}
 			if strings.Count(stdout, "\n") < 2 {
 				t.Fatalf("stdout has %d newlines, want more than one line", strings.Count(stdout, "\n"))
@@ -83,7 +85,7 @@ func TestDocsHelpBadUsageKeepsJSON(t *testing.T) {
 	if line["status"] != "2" {
 		t.Fatalf("status = %q, want %q", line["status"], "2")
 	}
-	if !strings.Contains(stderr, usage) {
+	if !strings.Contains(stderr, usageText(Env{})) {
 		t.Fatalf("stderr does not contain the usage text")
 	}
 }
@@ -128,7 +130,7 @@ func TestDocsReadmeOutputContract(t *testing.T) {
 		t.Errorf("README still carries the unqualified single-JSON-line promise")
 	}
 	for _, want := range []string{
-		"with these exceptions: `help` and `herdr-hermes` run with no arguments print the plain-text usage on stdout and exit 0",
+		"with these exceptions: `help` and `nau` (or the deprecated `herdr-hermes`) run with no arguments print the plain-text usage on stdout and exit 0",
 		"`outbox` prints one JSON line per record and then the trailer line",
 		"for `job events` is JSON lines and a trailer line",
 		"docs/routing.md#preflight-read-only",

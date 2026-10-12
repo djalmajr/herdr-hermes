@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // ApplyPoll applies the outcome of polling one machine, in one

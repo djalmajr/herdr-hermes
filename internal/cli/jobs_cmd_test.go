@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/registry"
+	"github.com/djalmajr/nau/internal/registry"
 )
 
 // runCLIVars is runCLI with an explicit environment map (for the NOWRITE
@@ -236,7 +236,7 @@ func TestJobsErrors(t *testing.T) {
 		if !strings.Contains(stdout, `"status":"duplicate"`) || !strings.Contains(stdout, `"tipo":"job"`) {
 			t.Errorf("stdout = %q, want the 409 body as one line", stdout)
 		}
-		if !strings.Contains(stderr, "herdr-hermes: jobs check: refused (duplicate)") {
+		if !strings.Contains(stderr, "nau: jobs check: refused (duplicate)") {
 			t.Errorf("stderr = %q, want the refused (duplicate) line", stderr)
 		}
 		requireCapture(t, ch)

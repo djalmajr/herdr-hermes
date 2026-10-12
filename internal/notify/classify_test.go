@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/nau/internal/jobapi"
 )
 
 // fixedNow is the fixed "current time" every projection test injects: a

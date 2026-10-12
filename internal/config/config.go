@@ -13,8 +13,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // Config is the machine configuration with effective values (defaults

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // seedCLIOutbox appends n dispatch records to the store under dir.

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 // djaP3ErrWorkspaceList and djaP3ErrAgentList are the exact refusal

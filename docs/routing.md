@@ -1,14 +1,14 @@
 # Routing
 
-`herdr-hermes route` is the dispatcher-side machine choice. The job contract ([`docs/upstream/job-contract.md`](upstream/job-contract.md)) says that the dispatcher chooses the machine and runs the job subcommands on it through its own remote execution channel, and that `herdr-soho` never routes a job to another machine; `route` is the helper for that choice. It runs on the host the dispatcher uses to reach the fleet, probes the configured machines read-only, picks one and prints it. The choice is advisory: `route` never starts, moves or replays a job, and the dispatcher then runs `herdr-hermes job start …` on the chosen machine through its own remote execution channel (the job forwarding is unchanged). A dispatch-only host that must never run jobs is simply not listed in the fleet.
+`nau route` is the dispatcher-side machine choice. The job contract ([`docs/upstream/job-contract.md`](upstream/job-contract.md)) says that the dispatcher chooses the machine and runs the job subcommands on it through its own remote execution channel, and that `herdr-soho` never routes a job to another machine; `route` is the helper for that choice. It runs on the host the dispatcher uses to reach the fleet, probes the configured machines read-only, picks one and prints it. The choice is advisory: `route` never starts, moves or replays a job, and the dispatcher then runs `nau job start …` on the chosen machine through its own remote execution channel (the job forwarding is unchanged). A dispatch-only host that must never run jobs is simply not listed in the fleet.
 
 ## Command
 
-`herdr-hermes route [--machine <label>]` is read-only: it works under `HERDR_HERMES_NOWRITE=1`, writes nothing, and prints exactly one JSON line on stdout.
+`nau route [--machine <label>]` is read-only: it works under `HERDR_HERMES_NOWRITE=1`, writes nothing, and prints exactly one JSON line on stdout.
 
 ## Configuration
 
-The keys are set with `herdr-hermes config set <key> <value>`:
+The keys are set with `nau config set <key> <value>`:
 
 - `route_machines` — the fleet: comma-separated machine labels in priority order (empty by default; `route` exits 2 until it is set). A label is a saved Herdr machine label (as listed by `herdr machine list`) or the reserved label `local` for the Herdr server of the host that runs `route`; the label form is `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, with no duplicates and at most 32 labels.
 - `route_disabled` — labels to exclude without editing the Herdr machine profiles (same form, empty by default).
@@ -37,13 +37,13 @@ The probe is read-only and uses only the public Herdr CLI, as argv subprocesses 
 
 - An orchestrator is visible to `route` only through its Herdr agent name. Name it with the existing public interfaces: `herdr-soho init`, run from the orchestrator's own pane, names the calling agent after the `herdr-soho` `orchestrator_name` (`orchestrator` by default), or `<base>-<n>` such as `orchestrator-2` when that name is already taken on the same Herdr server; `herdr agent rename <target> <name>` names an agent by hand. An orchestrator started without either stays unnamed and does not count, even while it is working.
 - Workers that `herdr-soho` spawns are named after their lane or role (`build`, `review-2`, `implementer`), so they do not count as long as the base name is not one of those names; do not choose a lane or role name as the base.
-- Custom base name: when the fleet's orchestrators use another `herdr-soho` `orchestrator_name`, set `route_orchestrator_name` on the dispatcher host to the same value (`herdr-hermes config set route_orchestrator_name <name>`). One base name applies to every machine in the fleet, so keep `orchestrator_name` the same on every node. With `route_orchestrator_name=<base>`, the recognized names are `<base>` and `<base>-<n>`: with `route_orchestrator_name=planner`, `planner`, `planner-1` and `planner-3` count and `orchestrator` does not.
+- Custom base name: when the fleet's orchestrators use another `herdr-soho` `orchestrator_name`, set `route_orchestrator_name` on the dispatcher host to the same value (`nau config set route_orchestrator_name <name>`). One base name applies to every machine in the fleet, so keep `orchestrator_name` the same on every node. With `route_orchestrator_name=<base>`, the recognized names are `<base>` and `<base>-<n>`: with `route_orchestrator_name=planner`, `planner`, `planner-1` and `planner-3` count and `orchestrator` does not.
 - Read-only verification:
 
   ```text
   herdr agent list
   herdr --machine <label> agent list
-  herdr-hermes route
+  nau route
   ```
 
   In each agent list, count the agents whose `name` matches the rule in [Orchestrator load](#orchestrator-load), whatever their `agent_status`; that number is the `orquestradores` value `route` reports for that machine in `candidatos`. An orchestrator you expect to count but that is missing from the number is unnamed or misnamed: name it as above.
@@ -52,7 +52,7 @@ The probe is read-only and uses only the public Herdr CLI, as argv subprocesses 
 
 - `route` sees the fleet only through the `herdr` it runs (`herdr_bin`), in the dispatcher's own environment: it passes its environment to `herdr` unchanged and adds nothing. Two pieces of per-user state decide the result:
 - The saved-machine catalog belongs to Herdr and to the operating-system user that saved the machines (`herdr machine add`). `route` reads it only through `herdr machine list --json`, never from a file.
-- The `herdr-hermes` configuration (`route_machines` and the other keys) lives in the configuration directory of the user that runs `herdr-hermes`: `~/Library/Application Support/herdr-hermes/config` on macOS, `%AppData%\herdr-hermes\config` on Windows, and `$XDG_CONFIG_HOME/herdr-hermes/config` (by default `~/.config/herdr-hermes/config`) on Linux.
+- The `nau` configuration (`route_machines` and the other keys) lives in the configuration directory of the user that runs `nau`: `~/Library/Application Support/herdr-hermes/config` on macOS, `%AppData%\herdr-hermes\config` on Windows, and `$XDG_CONFIG_HOME/herdr-hermes/config` (by default `~/.config/herdr-hermes/config`) on Linux.
 - Run the dispatcher as the user that saved the machines, with that user's normal environment: on macOS and Linux the same `HOME`; on Windows the same user profile (`USERPROFILE`, `APPDATA` and `LOCALAPPDATA`). A service account, a scheduler, a sandbox or a wrapper that changes these variables sees another user's catalog and configuration, usually empty ones: an empty configuration makes `route` exit 2 (`route_machines is not configured`) before any probe, and an empty catalog makes every saved label of a configured fleet that is not excluded by `route_disabled` `unsupported` (`unknown_machine`).
 - The `local` label is probed through the host's own Herdr server, which `herdr` reaches on its own or through `HERDR_SOCKET_PATH`; a dispatcher in the wrong environment can therefore still see `local` as `available` while every saved label is `unsupported` (`unknown_machine`).
 - Do not copy or edit the Herdr catalog or the machine profiles to work around this: save the machines as the dispatcher user with `herdr machine add`, or run the dispatcher as the user that already has them.
@@ -61,11 +61,11 @@ The probe is read-only and uses only the public Herdr CLI, as argv subprocesses 
 
 ```text
 herdr machine list --json
-herdr-hermes config get route_machines
-herdr-hermes route
+nau config get route_machines
+nau route
 ```
 
-Run it as the dispatcher user, in the dispatcher's environment (the same service, scheduler or shell). `herdr-hermes config get route_machines` must print the intended fleet; an empty value means no fleet is configured in the configuration this environment reads, and `route` then exits 2 before any probe: set the fleet there, or, if it was set as another user or in another environment, run the dispatcher as that user with that environment. Every saved label in `route_machines` that should be eligible (not listed in `route_disabled`) must appear exactly once in `herdr machine list --json` with `enabled: true`: a label that is missing is `unknown_machine`, a label listed more than once is `ambiguous_machine` and an entry with `enabled: false` is `machine_disabled`. `local` needs no catalog entry and is never resolved through the catalog. An empty list `[]` where you expect saved machines is the sign to check which user and environment the dispatcher runs with. All three commands are read-only and work under `HERDR_HERMES_NOWRITE=1`.
+Run it as the dispatcher user, in the dispatcher's environment (the same service, scheduler or shell). `nau config get route_machines` must print the intended fleet; an empty value means no fleet is configured in the configuration this environment reads, and `route` then exits 2 before any probe: set the fleet there, or, if it was set as another user or in another environment, run the dispatcher as that user with that environment. Every saved label in `route_machines` that should be eligible (not listed in `route_disabled`) must appear exactly once in `herdr machine list --json` with `enabled: true`: a label that is missing is `unknown_machine`, a label listed more than once is `ambiguous_machine` and an entry with `enabled: false` is `machine_disabled`. `local` needs no catalog entry and is never resolved through the catalog. An empty list `[]` where you expect saved machines is the sign to check which user and environment the dispatcher runs with. All three commands are read-only and work under `HERDR_HERMES_NOWRITE=1`.
 
 ### Labels and reason codes
 
@@ -107,8 +107,8 @@ On success (exit 0), `route` prints exactly one JSON line:
 
 ## Dispatcher flow
 
-1. `herdr-hermes route [--machine <label>]` on the dispatcher host.
-2. `herdr-hermes job start …` on the chosen machine, through the dispatcher's own remote execution channel.
+1. `nau route [--machine <label>]` on the dispatcher host.
+2. `nau job start …` on the chosen machine, through the dispatcher's own remote execution channel.
 3. Never re-send the dispatch to another machine after a transport loss or timeout; inspect the chosen machine with `job status --id <id>` instead.
 
 ## Limitations

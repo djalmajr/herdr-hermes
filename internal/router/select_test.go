@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 func countPtr(n int) *int { return &n }

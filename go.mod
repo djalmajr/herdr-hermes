@@ -1,4 +1,4 @@
-module github.com/djalmajr/herdr-hermes
+module github.com/djalmajr/nau
 
 go 1.25.0
 

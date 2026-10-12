@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
+	"github.com/djalmajr/nau/internal/outbox"
 )
 
 // checkNorm is the validated and normalized input of one Check.

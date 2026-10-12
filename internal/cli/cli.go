@@ -1,4 +1,4 @@
-// Package cli implements the herdr-hermes command line: the command table
+// Package cli implements the nau command line: the command table
 // with the HERDR_HERMES_NOWRITE read-only gating, the shared output
 // conventions (one JSON line on stdout, diagnostics on stderr, errors as
 // {"status":"<code>","motivo":"<text>"}), and the slice-1 commands
@@ -77,7 +77,7 @@ func Run(args []string, env Env) int {
 		env.Sleep = sleepCtx
 	}
 	if len(args) == 0 {
-		_, _ = io.WriteString(env.Stdout, usage)
+		_, _ = io.WriteString(env.Stdout, usageText(env))
 		return 0
 	}
 	var cmd *command
@@ -122,14 +122,14 @@ const noConfigDirErrorJSON = `{"status":"no_config_dir","motivo":"user config di
 // badUsage prints the usage text to stderr and the exit-2 error JSON to
 // stdout.
 func badUsage(env Env, motivo string) {
-	_, _ = io.WriteString(env.Stderr, usage)
+	_, _ = io.WriteString(env.Stderr, usageText(env))
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "2", Motivo: motivo}))
 }
 
 // fail prints an error JSON with the given numeric code to stdout and a
 // diagnostic to stderr.
 func fail(env Env, code int, motivo string) {
-	_, _ = fmt.Fprintf(env.Stderr, "herdr-hermes: %s\n", motivo)
+	_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", env.program(), motivo)
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: itoa(code), Motivo: motivo}))
 }
 
@@ -196,6 +196,6 @@ func cmdHelp(args []string, env Env) int {
 		badUsage(env, "usage: help")
 		return 2
 	}
-	_, _ = io.WriteString(env.Stdout, usage)
+	_, _ = io.WriteString(env.Stdout, usageText(env))
 	return 0
 }

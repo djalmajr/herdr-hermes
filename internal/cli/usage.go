@@ -1,11 +1,18 @@
 package cli
 
-// Usage text printed by `help` and on bad usage (to stderr). It lists every
-// command and every exit code of the bridge, including the commands the
-// later slices register.
-const usage = `herdr-hermes - two-way bridge between a remote dispatcher and a Herdr node
+import (
+	"fmt"
+	"strings"
+)
 
-usage: herdr-hermes <command> [args]
+// usageTemplate is the usage text printed by `help`, with no arguments and
+// on bad usage (to stderr). It lists every command and every exit code of
+// the bridge, including the commands the later slices register. The %s
+// slots are the program name: the primary name gets the product title and
+// the deprecated name the same text under its own name.
+const usageTemplate = `%s - universal messaging and registry core; this build bridges a remote job dispatcher and a Herdr node
+
+usage: %s <command> [args]
 
 commands:
   job <sub> [args]                  forward a dispatcher-facing job subcommand to herdr-soho
@@ -76,7 +83,7 @@ exit codes:
   0   success (forwarded commands: whatever herdr-soho returned)
   2   bad usage, input limit exceeded, unknown config key, internal job
       subcommand refused, registry usage or field rejected (serve, jobs)
-  3   unknown job id in herdr-hermes bookkeeping (sync --job) and unknown
+  3   unknown job id in %s bookkeeping (sync --job) and unknown
       notification id (notify status --id, notify ack, notify retry), unknown
       claim, policy or folder (jobs)
   4   herdr-soho not found or not runnable; no eligible machine available
@@ -88,3 +95,18 @@ exit codes:
       (doctor, sync)
   44  the pre-dispatch check refused: duplicate work or a hold (jobs check)
 `
+
+// usageText renders the usage for the program name of env: the primary
+// name gets the template as is, and the deprecated name gets the same
+// text under its own name plus one deprecation line right after the
+// title.
+func usageText(env Env) string {
+	prog := env.program()
+	text := fmt.Sprintf(usageTemplate, prog, prog, prog)
+	if prog == ProgramHerdrHermes {
+		const deprecation = "herdr-hermes is the deprecated name of nau: same commands, same state, same exit codes.\n"
+		i := strings.IndexByte(text, '\n')
+		text = text[:i+1] + deprecation + text[i+1:]
+	}
+	return text
+}

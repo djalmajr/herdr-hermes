@@ -1,4 +1,4 @@
-// Package registry is the current-state registry behind `herdr-hermes serve`
+// Package registry is the current-state registry behind `nau serve`
 // (DJA-229). It keeps, in one SQLite database, only what is true now across
 // the nodes: the active jobs with their owner, card, workspace, branch, pull
 // request, phase, idle time and human waits; the nodes with their versions,

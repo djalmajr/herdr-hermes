@@ -1,6 +1,6 @@
 # Registry
 
-`herdr-hermes serve` is the central mode of the same binary: a live registry of the **current state** of the fleet, kept in one SQLite database and served over HTTP. `herdr-hermes jobs` is its client: one inventory across every node and the mandatory pre-dispatch check. History and decisions are not kept here; the registry only answers what is true now.
+`nau serve` is the central mode of the same binary: a live registry of the **current state** of the fleet, kept in one SQLite database and served over HTTP. `nau jobs` is its client: one inventory across every node and the mandatory pre-dispatch check. History and decisions are not kept here; the registry only answers what is true now.
 
 ## What it records
 
@@ -36,7 +36,7 @@ A workspace named `hm-<agent>-<type>-<ref>` (type `impl`, `review`, `fix` or `pl
 
 ## Pre-dispatch check
 
-Before an agent opens a job, a workspace or a branch, it runs `herdr-hermes jobs check` and opens nothing unless the check exits 0. The check is atomic: in one SQLite immediate transaction it compares the request with the active jobs (not terminal, or terminal with a blocked exit 7, 11 or 14), the unexpired claims and the holds, and either refuses or records a claim, so two concurrent checks for the same work never both pass. A request names its agent and at least one of:
+Before an agent opens a job, a workspace or a branch, it runs `nau jobs check` and opens nothing unless the check exits 0. The check is atomic: in one SQLite immediate transaction it compares the request with the active jobs (not terminal, or terminal with a blocked exit 7, 11 or 14), the unexpired claims and the holds, and either refuses or records a claim, so two concurrent checks for the same work never both pass. A request names its agent and at least one of:
 
 - `--workspace`: the same workspace name, and for an `hm-` name the same agent and ref (an `impl` and a `review` workspace of the same ref overlap, and a ref followed by a collision suffix `-2` to `-9`, as in `hm-example-agent-fix-pr64-2`, is the same ref as `pr64`; a longer last part such as `card238-241` stays a distinct ref);
 - `--card`: the same card (case-insensitive);
@@ -48,15 +48,15 @@ A hold on the agent, the project or the card refuses the request with `status: h
 ## Commands
 
 ```text
-herdr-hermes serve [--listen <host:port>] [--db <path>] [--machines <label,...>] [--poll-interval <seconds>] [--max-jobs <n>] [--max-sessions <n>] [--ended-retention-days <n>]
-herdr-hermes jobs [--maquina <label>] [--agente <agent>] [--server <url>]
-herdr-hermes jobs check --agente <agent> [--card <card>] [--projeto <org/repo>] [--branch <branch>] [--pr <n>] [--workspace <name>] [--maquina <label>] [--ttl <seconds>] [--server <url>]
-herdr-hermes jobs release --claim <id> [--server <url>]
-herdr-hermes jobs policy set --escopo projeto|agente|card --valor <value> [--hold] [--prioridade <n>] [--motivo <text>] [--server <url>]
-herdr-hermes jobs policy clear --escopo projeto|agente|card --valor <value> [--server <url>]
-herdr-hermes jobs folder add --maquina <label> --caminho <path> --pedido <text> [--tamanho <bytes>] [--job <id>] [--server <url>]
-herdr-hermes jobs folder clear --maquina <label> --caminho <path> [--server <url>]
-herdr-hermes jobs node set --maquina <label> [--manutencao on|off] [--motivo <text>] [--soho-version <version>] [--runners <a,b>] [--server <url>]
+nau serve [--listen <host:port>] [--db <path>] [--machines <label,...>] [--poll-interval <seconds>] [--max-jobs <n>] [--max-sessions <n>] [--ended-retention-days <n>]
+nau jobs [--maquina <label>] [--agente <agent>] [--server <url>]
+nau jobs check --agente <agent> [--card <card>] [--projeto <org/repo>] [--branch <branch>] [--pr <n>] [--workspace <name>] [--maquina <label>] [--ttl <seconds>] [--server <url>]
+nau jobs release --claim <id> [--server <url>]
+nau jobs policy set --escopo projeto|agente|card --valor <value> [--hold] [--prioridade <n>] [--motivo <text>] [--server <url>]
+nau jobs policy clear --escopo projeto|agente|card --valor <value> [--server <url>]
+nau jobs folder add --maquina <label> --caminho <path> --pedido <text> [--tamanho <bytes>] [--job <id>] [--server <url>]
+nau jobs folder clear --maquina <label> --caminho <path> [--server <url>]
+nau jobs node set --maquina <label> [--manutencao on|off] [--motivo <text>] [--soho-version <version>] [--runners <a,b>] [--server <url>]
 ```
 
 - `serve` listens on `--listen` (default `127.0.0.1:7429`), which must be a loopback address; a non-loopback address, or a name that does not bind to a loopback address, exits 2. The database defaults to `registry.db` in the state directory. `--max-jobs <n>` and `--max-sessions <n>` (each 1 to 1000, default 1000) bound the total retained rows of the jobs and sessions kinds, and `--ended-retention-days <n>` (7 to 30 whole days, default 30) how long an ended row is kept; a value out of range exits 2. It prints one JSON line when it is listening, `{"status":"serving","listen":"127.0.0.1:7429","maquinas":["local","node-b"],"poll_s":60}`, and serves until it is interrupted. It is a writing command, refused under `HERDR_HERMES_NOWRITE=1`.

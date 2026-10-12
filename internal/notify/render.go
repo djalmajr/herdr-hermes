@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/nau/internal/jobapi"
 )
 
 // notificationIDPattern is the render-side check of a notification id

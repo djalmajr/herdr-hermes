@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // routeCatalogWinA is the `machine list --json` fixture with win-a enabled.
@@ -268,11 +268,11 @@ func TestRouteRequestedNotConfigured(t *testing.T) {
 }
 
 // routeUsageText and routeHelpText are the exact route-scoped texts the
-// command must print on stderr (they pin routeUsage and routeHelp in
-// route_cmd.go to the DJA-240 wording).
-const routeUsageText = "usage: herdr-hermes route [--machine <label>]\nrun 'herdr-hermes route --help' for the route options\n"
+// command must print on stderr under the default program name (they pin
+// routeUsage and routeHelp in route_cmd.go to the DJA-240 wording).
+const routeUsageText = "usage: nau route [--machine <label>]\nrun 'nau route --help' for the route options\n"
 
-const routeHelpText = `usage: herdr-hermes route [--machine <label>]
+const routeHelpText = `usage: nau route [--machine <label>]
 
 Choose the machine for a new job (dispatcher side, read-only). Prints one
 JSON line on stdout; diagnostics go to stderr.
@@ -281,7 +281,7 @@ options:
   --machine <label>   prefer this configured machine; the label is a separate
                       argument (the --machine=<label> form is not accepted)
 
-configuration (herdr-hermes config set <key> <value>):
+configuration (nau config set <key> <value>):
   route_machines, route_disabled, route_orchestrator_name,
   route_probe_timeout_s, herdr_bin
 
@@ -353,7 +353,7 @@ func TestRouteBadUsage(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			wantErr := "herdr-hermes: route: " + tc.detail + "\n" + routeUsageText
+			wantErr := "nau: route: " + tc.detail + "\n" + routeUsageText
 			if tc.detail == "help requested" {
 				wantErr = routeHelpText
 			}
@@ -522,9 +522,9 @@ func TestRouteAllUnavailable(t *testing.T) {
 	}
 	// One diagnostic line per unavailable machine (DJA-238), then the
 	// exit-4 line.
-	wantErr := "herdr-hermes: route: mac-a unavailable: catalog_unavailable (herdr exit 1): herdr reported no recognized cause\n" +
-		"herdr-hermes: route: win-a unavailable: catalog_unavailable (herdr exit 1): herdr reported no recognized cause\n" +
-		"herdr-hermes: route: no eligible machine is available\n"
+	wantErr := "nau: route: mac-a unavailable: catalog_unavailable (herdr exit 1): herdr reported no recognized cause\n" +
+		"nau: route: win-a unavailable: catalog_unavailable (herdr exit 1): herdr reported no recognized cause\n" +
+		"nau: route: no eligible machine is available\n"
 	if stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", stderr, wantErr)
 	}

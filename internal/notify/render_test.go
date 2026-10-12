@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/jobapi"
+	"github.com/djalmajr/nau/internal/jobapi"
 )
 
 // goldenJobEventLine is the exact rendered line for a blocked job event of

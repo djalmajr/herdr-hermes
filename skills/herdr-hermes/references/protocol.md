@@ -57,12 +57,13 @@ The probe is read-only and uses only the public Herdr CLI (`herdr machine list -
 |------|---------|
 | 0 | success (forwarded commands: whatever `herdr-soho` returned) |
 | 2 | bad usage, input limit exceeded, unknown config key, internal job subcommand refused, a writing command under `HERDR_HERMES_NOWRITE=1`, no user config directory (`no_config_dir`), or a `wake` event that could not be made durable |
-| 3 | unknown job id in `herdr-hermes` bookkeeping (`sync --job`) |
+| 3 | unknown job id in `nau` bookkeeping (`sync --job`) |
 | 4 | `herdr-soho` not found, not runnable, or killed by the forwarding deadline, or no eligible machine available (`route`) |
 | 40 | no API key configured (push required) |
 | 41 | API key rejected by the dispatcher (401/403) |
 | 42 | dispatcher unreachable or retries exhausted; records stay pending |
 | 43 | `herdr-soho` lacks the `ephemeral_job` or `job_events` capability (`doctor`, `sync`) |
+| 44 | the pre-dispatch check refused the request: duplicate work or a hold (`jobs check`) |
 
 Forwarded `job` subcommands return the `herdr-soho` exit code unchanged; codes 40–44 are never produced by a forwarded command.
 

@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/config"
-	"github.com/djalmajr/herdr-hermes/internal/registry"
-	"github.com/djalmajr/herdr-hermes/internal/router"
+	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/registry"
+	"github.com/djalmajr/nau/internal/router"
 )
 
 var serveFixedNow = time.Date(2026, 10, 10, 12, 0, 0, 0, time.FixedZone("x", -3*3600))
@@ -367,7 +367,7 @@ func TestServePollRefusalKeepsOtherMachines(t *testing.T) {
 	poller := registry.Poller{Exec: fake, Timeout: 5 * time.Second, Now: func() time.Time { return serveFixedNow }}
 	done := make(chan struct{})
 	go func() {
-		servePollLoop(ctx, logb, store, []string{refused, valid}, time.Second, poller)
+		servePollLoop(ctx, logb, ProgramNau, store, []string{refused, valid}, time.Second, poller)
 		close(done)
 	}()
 
@@ -490,7 +490,7 @@ func TestServeEndToEnd(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &dup); err != nil || dup.Status != registry.CheckDuplicate {
 		t.Fatalf("jobs check duplicate body = %q (err %v)", stdout, err)
 	}
-	if !strings.Contains(stderr, "herdr-hermes: jobs check: refused (duplicate)") {
+	if !strings.Contains(stderr, "nau: jobs check: refused (duplicate)") {
 		t.Errorf("jobs check stderr = %q, want the refused (duplicate) line", stderr)
 	}
 

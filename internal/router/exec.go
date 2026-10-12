@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/djalmajr/herdr-hermes/internal/soho"
+	"github.com/djalmajr/nau/internal/soho"
 )
 
 // defaultProbeBound bounds a probe whose context carries no deadline.

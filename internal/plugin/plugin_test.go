@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/plugin"
+	"github.com/djalmajr/nau/internal/plugin"
 )
 
 func TestParseEvent(t *testing.T) {

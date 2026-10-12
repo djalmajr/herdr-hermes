@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/djalmajr/herdr-hermes/internal/outbox"
-	"github.com/djalmajr/herdr-hermes/internal/testutil/fakesoho"
+	"github.com/djalmajr/nau/internal/outbox"
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 // configTable is the `herdr-soho config` output shape: padded
@@ -198,6 +198,38 @@ func TestDoctorWakeHook(t *testing.T) {
 			}
 			if !found {
 				t.Errorf("child env lacks HERDR_SOHO_NOWRITE=1: %v", configCall.Env)
+			}
+		})
+	}
+}
+
+// TestDoctorWakeHookBothProgramNames: the wake hook check accepts both
+// program names (nau wake and herdr-hermes wake) with the same prefix
+// semantics it had for the old name, and still classifies other values.
+func TestDoctorWakeHookBothProgramNames(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  string
+		want string
+	}{
+		{"nauWake", "job_wake_cmd        nau wake                         file", "true"},
+		{"herdrHermesWake", "job_wake_cmd        herdr-hermes wake                    file", "true"},
+		{"nauDashNotASpace", "job_wake_cmd        nau-wake                         file", "false"},
+		{"otherCmd", "job_wake_cmd        other-cmd wake                   file", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exe, _ := installFakeSoho(t,
+				capsRule(capsJSON, 0),
+				fakesoho.Rule{Argv: []string{"config"}, Stdout: configTable(tc.row), Code: 0},
+			)
+			cfgDir := t.TempDir()
+			setSohoConfig(t, cfgDir, exe, "machine-a")
+			line, _, exit := runDoctor(t, cfgDir, false)
+			if exit != 0 {
+				t.Fatalf("exit = %d, want 0", exit)
+			}
+			if line.WakeHook != tc.want {
+				t.Errorf("wake_hook = %q, want %q", line.WakeHook, tc.want)
 			}
 		})
 	}
