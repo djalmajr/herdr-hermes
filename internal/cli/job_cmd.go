@@ -130,20 +130,27 @@ func cmdJob(args []string, env Env) int {
 	default:
 		bound = jobDefaultBound
 	}
-	// stdin caps: read at most cap+1 bytes; over the cap refuses without
-	// running the subprocess. Other subs pass stdin through.
+	// stdin caps: when the body comes from stdin (or no body is given),
+	// read at most cap+1 bytes; over the cap refuses without running the
+	// subprocess. An explicit file body never touches stdin: the
+	// subprocess gets none (the runner leaves its stdin unset). Other
+	// subs pass stdin through.
 	var stdin io.Reader = env.Stdin
 	if cap, ok := jobStdinCaps[sub]; ok {
-		data, over, err := readCappedOver(env.Stdin, cap)
-		if err != nil {
-			badUsage(env, "job "+sub+": cannot read stdin: "+err.Error())
-			return 2
+		if !jobBodyFromStdin(sub, rest) {
+			stdin = nil
+		} else {
+			data, over, err := readCappedOver(env.Stdin, cap)
+			if err != nil {
+				badUsage(env, "job "+sub+": cannot read stdin: "+err.Error())
+				return 2
+			}
+			if over {
+				badUsage(env, "job "+sub+": stdin exceeds the contract limit")
+				return 2
+			}
+			stdin = bytes.NewReader(data)
 		}
-		if over {
-			badUsage(env, "job "+sub+": stdin exceeds the contract limit")
-			return 2
-		}
-		stdin = bytes.NewReader(data)
 	}
 	cfg, err := config.Load(env.ConfigDir)
 	if err != nil {
@@ -237,6 +244,29 @@ func cmdJob(args []string, env Env) int {
 		_, _ = io.WriteString(env.Stderr, env.program()+": "+pendingDiag+"\n")
 	}
 	return exit
+}
+
+// jobBodyFromStdin reports whether the body of a start, amend or send comes
+// from stdin: true when the source is "-" or when no body is given (the
+// contract marks the body optional and the backend decides what to do
+// without one), false for an explicit file. For start the source is the
+// value of --brief; for amend and send it is the first positional argument,
+// where --id consumes the next argument and any other --flag is skipped.
+func jobBodyFromStdin(sub string, rest []string) bool {
+	if sub == "start" {
+		value, present := flagValue(rest, "--brief")
+		return !present || value == "-"
+	}
+	for i := 0; i < len(rest); i++ {
+		switch {
+		case rest[i] == "--id":
+			i++
+		case strings.HasPrefix(rest[i], "--"):
+		default:
+			return rest[i] == "-"
+		}
+	}
+	return true
 }
 
 // childEnviron returns the exact environment forwarded to subprocesses.
