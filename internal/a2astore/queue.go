@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/djalmajr/nau/internal/a2acore"
@@ -320,14 +321,24 @@ func (s *Store) Release(ctx context.Context, c a2acore.DeliveryClaim) error {
 // RecoverHeld marks obsolete the held deliveries whose ingress is older
 // than grace and whose task never committed (a crash between the
 // admission and the task write), and returns how many it marked. In the
-// same transaction it deletes the pending push configs (rows and their
-// secret handles) whose task has no a2a_tasks row and whose creation
+// same transaction it deletes the rows of the pending push configs
+// whose task has no a2a_tasks row and whose creation
 // stamp is older than now minus grace (a stamp that does not parse counts
-// as older); they are not part of the returned count.
+// as older); they are not part of the returned count. The provider
+// handles of those configs are destroyed only after the transaction
+// committed: on a transaction error it returns 0 and the error and touches
+// no handle, so a later Create of the task still finds a usable config.
+// When the commit succeeded and deleting a handle failed it returns the
+// committed count of marked deliveries together with an error saying the
+// recovery committed and keeping the cause; the failed handle stays in the
+// provider, unreferenced (the row is gone and the store keeps no durable
+// ledger of handles).
 func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Duration) (int, error) {
 	cutoff := now.Add(-grace).Unix()
 	var marked int
+	var handles []string
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		marked, handles = 0, nil
 		res, err := tx.Exec(`UPDATE a2a_deliveries SET state = ?
 			WHERE state = ?
 			AND task_id NOT IN (SELECT task_id FROM a2a_tasks)
@@ -340,7 +351,7 @@ func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Durat
 		if err != nil {
 			return err
 		}
-		marked = int(affected)
+		count := int(affected)
 		pending, err := pendingPushRows(tx, `WHERE task_id NOT IN (SELECT task_id FROM a2a_tasks)`)
 		if err != nil {
 			return err
@@ -353,11 +364,18 @@ func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Durat
 				stale = append(stale, r)
 			}
 		}
-		_, err = s.deletePushRows(ctx, tx, stale)
-		return err
+		_, refs, err := s.deletePushRows(tx, stale)
+		if err != nil {
+			return err
+		}
+		marked, handles = count, refs
+		return nil
 	})
 	if err != nil {
 		return 0, err
+	}
+	if derr := s.PushConfigs().deleteHandles(ctx, handles...); derr != nil {
+		return marked, fmt.Errorf("a2astore: held deliveries recovered; deleting a secret handle of a discarded pending push config failed: %w", derr)
 	}
 	return marked, nil
 }

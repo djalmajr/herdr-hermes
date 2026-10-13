@@ -522,44 +522,47 @@ func TestPushReplaceWithoutSecretsDeletesOldHandles(t *testing.T) {
 	}
 }
 
-// TestPushDeletePartialFailureThenRetry proves the order of Delete and
-// DeleteAll converges: a provider failure after the token handle was
-// deleted returns an error without a secret value and keeps the row (the
-// transaction rolled back); the retry removes the row and every handle.
+// TestPushDeletePartialFailureThenRetry is the declared boundary of
+// Delete and DeleteAll, the same class as the one of Save. The previous
+// expectation (a provider failure rolls the row back and a retry
+// converges) encoded the corruption it was meant to prevent: the provider
+// handles were deleted inside the transaction, so a failure left a
+// committed row whose handles were already gone (Get not found, List 0,
+// UnavailableCount 1). The handles are now deleted only after the commit:
+// a provider failure is a committed delete with a truthful error (the text
+// says the config was deleted and the cause is kept), the row is gone, no
+// canary reaches the error, and exactly the handle whose delete failed
+// stays in the provider. A second call is a no-op returning nil and does
+// NOT clean that handle (the row and its refs are gone and the store keeps
+// no durable ledger of handles), so there is no retry convergence.
 func TestPushDeletePartialFailureThenRetry(t *testing.T) {
-	for _, op := range []struct {
-		name string
-		run  func(*pushEnv) error
-	}{
-		{"Delete", func(e *pushEnv) error { return e.s.PushConfigs().Delete(context.Background(), "t1", "pc1") }},
-		{"DeleteAll", func(e *pushEnv) error { return e.s.PushConfigs().DeleteAll(context.Background(), "t1") }},
-	} {
+	for _, op := range deleteOps {
 		t.Run(op.name, func(t *testing.T) {
 			env := newPushEnv(t, newFaultSecrets(a2acore.NewMemorySecrets()))
 			env.sec.failDeleteOf(env.oldCredsRef)
-			err := op.run(env)
+			err := op.run(context.Background(), env)
 			if !errors.Is(err, errInjectedDelete) {
 				t.Fatalf("%s error is the injected delete failure: %v, want true", op.name, errors.Is(err, errInjectedDelete))
 			}
-			requireNoCanary(t, op.name, err, env.oldToken, env.oldCreds)
-			if n := env.rowCount(t); n != 1 {
-				t.Errorf("rows after the partial failure = %d, want 1 (rolled back)", n)
+			if msg := err.Error(); !strings.Contains(msg, "deleted") || !strings.Contains(msg, "secret handle") {
+				t.Errorf("the error does not say the config was deleted and a secret handle failed")
 			}
+			requireNoCanary(t, op.name, err, env.oldToken, env.oldCreds)
+			env.requireGone(t, "after the partial failure", env.oldToken, env.oldCreds)
 			if env.sec.isLive(env.oldTokenRef) || !env.sec.isLive(env.oldCredsRef) {
-				t.Errorf("the token handle is deleted and the credentials handle is live before the retry: false")
+				t.Errorf("the token handle is deleted and the credentials handle is live: false")
+			}
+			if n := env.sec.live(); n != 1 {
+				t.Errorf("live handles = %d, want exactly 1 (the bounded residual)", n)
 			}
 			env.sec.disarm()
-			if err := op.run(env); err != nil {
-				t.Fatalf("%s retry: %v", op.name, err)
+			if err := op.run(context.Background(), env); err != nil {
+				t.Fatalf("%s again: %v, want a no-op", op.name, err)
 			}
-			if n := env.rowCount(t); n != 0 {
-				t.Errorf("rows after the retry = %d, want 0", n)
-			}
-			if n := env.sec.live(); n != 0 {
-				t.Errorf("live handles after the retry = %d, want 0", n)
-			}
-			if err := assertSecretsAbsent(t, env.path, []string{env.oldToken, env.oldCreds}); err != nil {
-				t.Errorf("a secret value reached the database file")
+			env.requireGone(t, "after the second call", env.oldToken, env.oldCreds)
+			// No retry convergence without a durable ledger of handles.
+			if n := env.sec.live(); n != 1 {
+				t.Errorf("live handles after the second call = %d, want still 1", n)
 			}
 		})
 	}

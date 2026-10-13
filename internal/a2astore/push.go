@@ -219,9 +219,24 @@ func (p *PushConfigStore) UnavailableCount(ctx context.Context, taskID a2a.TaskI
 	return n, nil
 }
 
-// Delete removes one push config and deletes its secret handles.
+// Delete removes one push config and then deletes its secret handles.
+// The order protects the stored config: one transaction reads the row's
+// handles and deletes the row; the provider handles are deleted only
+// after the commit succeeded, so a failed statement, a failed commit or a
+// canceled request leaves the row and its handles intact and usable (no
+// handle is touched). A missing row is a no-op returning nil. After the
+// commit the row and its refs are gone: a failed provider delete is an
+// error (the config is deleted, the error says so and keeps the cause)
+// and the handle whose delete failed stays in the provider, unreferenced,
+// because the store keeps no durable ledger of handles; a retry does not
+// clean it (the second Delete finds no row and is a no-op returning nil).
+// That window is the declared limit of a provider whose Delete can fail
+// (the native in-memory provider never fails it); a canceled request
+// context does not stop the cleanup after the commit.
 func (p *PushConfigStore) Delete(ctx context.Context, taskID a2a.TaskID, configID string) error {
-	return p.s.tx(ctx, func(tx *sql.Tx) error {
+	var refs []string
+	err := p.s.tx(ctx, func(tx *sql.Tx) error {
+		refs = nil
 		var tokenRef, credsRef sql.NullString
 		err := tx.QueryRow(`SELECT token_ref, credentials_ref FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`,
 			string(taskID), configID).Scan(&tokenRef, &credsRef)
@@ -234,37 +249,40 @@ func (p *PushConfigStore) Delete(ctx context.Context, taskID a2a.TaskID, configI
 		if _, err := tx.Exec(`DELETE FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`, string(taskID), configID); err != nil {
 			return err
 		}
-		if tokenRef.Valid {
-			if err := p.s.secrets.Delete(ctx, tokenRef.String); err != nil {
-				return err
-			}
-		}
-		if credsRef.Valid {
-			if err := p.s.secrets.Delete(ctx, credsRef.String); err != nil {
-				return err
-			}
-		}
+		refs = validRefs(tokenRef, credsRef)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if derr := p.deleteHandles(ctx, refs...); derr != nil {
+		return fmt.Errorf("a2astore: push config deleted; deleting a secret handle failed: %w", derr)
+	}
+	return nil
 }
 
-// DeleteAll removes every push config of one task and deletes their
-// secret handles.
+// DeleteAll removes every push config of one task and then deletes their
+// secret handles, in the same order and with the same limit as Delete:
+// the rows go in one transaction, the provider handles only after the
+// commit succeeded, and a failed provider delete after the commit is an
+// error saying the configs were deleted (the failed handle stays in the
+// provider and a retry, finding no row, does not clean it).
 func (p *PushConfigStore) DeleteAll(ctx context.Context, taskID a2a.TaskID) error {
-	return p.s.tx(ctx, func(tx *sql.Tx) error {
+	var refs []string
+	err := p.s.tx(ctx, func(tx *sql.Tx) error {
+		refs = nil
 		rows, err := tx.Query(`SELECT token_ref, credentials_ref FROM a2a_push_configs WHERE task_id = ?`, string(taskID))
 		if err != nil {
 			return err
 		}
-		type handles struct{ token, creds sql.NullString }
-		var stored []handles
+		var stored []string
 		for rows.Next() {
-			var h handles
-			if err := rows.Scan(&h.token, &h.creds); err != nil {
+			var tokenRef, credsRef sql.NullString
+			if err := rows.Scan(&tokenRef, &credsRef); err != nil {
 				rows.Close()
 				return err
 			}
-			stored = append(stored, h)
+			stored = append(stored, validRefs(tokenRef, credsRef)...)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -273,29 +291,45 @@ func (p *PushConfigStore) DeleteAll(ctx context.Context, taskID a2a.TaskID) erro
 		if _, err := tx.Exec(`DELETE FROM a2a_push_configs WHERE task_id = ?`, string(taskID)); err != nil {
 			return err
 		}
-		for _, h := range stored {
-			if h.token.Valid {
-				if err := p.s.secrets.Delete(ctx, h.token.String); err != nil {
-					return err
-				}
-			}
-			if h.creds.Valid {
-				if err := p.s.secrets.Delete(ctx, h.creds.String); err != nil {
-					return err
-				}
-			}
-		}
+		refs = stored
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if derr := p.deleteHandles(ctx, refs...); derr != nil {
+		return fmt.Errorf("a2astore: push configs deleted; deleting a secret handle failed: %w", derr)
+	}
+	return nil
 }
 
-// DiscardUncommitted deletes the pending push configs of taskID (rows and
-// their secret handles) in one transaction and returns how many rows it
-// deleted. When the task has an a2a_tasks row it changes nothing and
-// returns 0, so a committed task's configs are never touched.
+// validRefs is the non-NULL handles of one row, token first.
+func validRefs(handles ...sql.NullString) []string {
+	var out []string
+	for _, h := range handles {
+		if h.Valid {
+			out = append(out, h.String)
+		}
+	}
+	return out
+}
+
+// DiscardUncommitted deletes the pending push configs of taskID (rows
+// first, in one transaction, then their secret handles) and returns how
+// many rows it deleted. When the task has an a2a_tasks row it changes
+// nothing and returns 0, so a committed task's configs are never touched.
+// The handles are destroyed only after the commit succeeded: on a
+// transaction error it returns 0 and the error and touches no handle, so
+// a later Create of the task still finds a usable config. When the
+// commit succeeded and deleting a handle failed it returns the committed
+// row count together with an error saying the configs were discarded and
+// keeping the cause; the failed handle stays in the provider, unreferenced
+// (the row is gone and the store keeps no durable ledger of handles).
 func (p *PushConfigStore) DiscardUncommitted(ctx context.Context, taskID a2a.TaskID) (int, error) {
 	var deleted int
+	var handles []string
 	err := p.s.tx(ctx, func(tx *sql.Tx) error {
+		deleted, handles = 0, nil
 		var n int
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM a2a_tasks WHERE task_id = ?`, string(taskID)).Scan(&n); err != nil {
 			return err
@@ -307,11 +341,18 @@ func (p *PushConfigStore) DiscardUncommitted(ctx context.Context, taskID a2a.Tas
 		if err != nil {
 			return err
 		}
-		deleted, err = p.s.deletePushRows(ctx, tx, rows)
-		return err
+		count, refs, err := p.s.deletePushRows(tx, rows)
+		if err != nil {
+			return err
+		}
+		deleted, handles = count, refs
+		return nil
 	})
 	if err != nil {
 		return 0, err
+	}
+	if derr := p.deleteHandles(ctx, handles...); derr != nil {
+		return deleted, fmt.Errorf("a2astore: pending push configs discarded; deleting a secret handle failed: %w", derr)
 	}
 	return deleted, nil
 }
@@ -348,27 +389,19 @@ func pendingPushRows(tx *sql.Tx, where string, args ...any) ([]pendingPush, erro
 	return out, nil
 }
 
-// deletePushRows deletes the rows, then their token and credentials
-// handles from the SecretProvider, and returns how many rows it deleted.
-func (s *Store) deletePushRows(ctx context.Context, tx *sql.Tx, rows []pendingPush) (int, error) {
+// deletePushRows deletes the rows inside the caller's transaction and
+// returns how many it deleted together with their token and credentials
+// handles. It never calls the SecretProvider: the caller destroys the
+// handles only after the transaction committed.
+func (s *Store) deletePushRows(tx *sql.Tx, rows []pendingPush) (int, []string, error) {
+	var handles []string
 	for _, r := range rows {
 		if _, err := tx.Exec(`DELETE FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`, r.taskID, r.configID); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
+		handles = append(handles, validRefs(r.token, r.creds)...)
 	}
-	for _, r := range rows {
-		if r.token.Valid {
-			if err := s.secrets.Delete(ctx, r.token.String); err != nil {
-				return 0, err
-			}
-		}
-		if r.creds.Valid {
-			if err := s.secrets.Delete(ctx, r.creds.String); err != nil {
-				return 0, err
-			}
-		}
-	}
-	return len(rows), nil
+	return len(rows), handles, nil
 }
 
 // pushRow is one a2a_push_configs row with its nullable columns resolved.
