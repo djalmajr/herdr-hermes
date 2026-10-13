@@ -11,20 +11,36 @@ import (
 )
 
 // repointGrace is how old an admission whose task never committed must
-// be before a retry of the same message re-points it to a new task.
+// be before a retry of the same message re-points it to a new task. It
+// is also how long the admission of a new task keeps a reservation of
+// one open-task slot while its task is not yet committed.
 const repointGrace = 60 * time.Second
+
+// openTasksSQL counts the committed tasks that are not terminal.
+const openTasksSQL = `SELECT COUNT(*) FROM a2a_tasks WHERE state NOT IN (?, ?, ?, ?)`
+
+// reservedTasksSQL counts the live reservations: the distinct tasks of a
+// new-task admission younger than repointGrace (received_unix is above
+// the bound argument) whose a2a_tasks row does not exist yet.
+const reservedTasksSQL = `SELECT COUNT(DISTINCT task_id) FROM a2a_ingress
+	WHERE new_task = 1 AND received_unix > ? AND task_id NOT IN (SELECT task_id FROM a2a_tasks)`
 
 // Admit runs, in one immediate transaction and in this order: the
 // duplicate check on (subject, message id) — a duplicate whose task
 // committed returns that task, one whose task never committed is re-
 // pointed at the new task and its deliveries are reset to held —, the
 // per (subject, session) fence (CheckFence), the limits of a new task
-// (MaxTasksPerContext of the context, then MaxOpenTasks of the store),
-// then the ingress insert (its id is the global admission order), the
-// fence upsert and the planned deliveries (new task: the planned state,
-// a continuation's held ones become pending, due at once, because the
-// message is already committed to the task history). A refusal changes
-// nothing.
+// (MaxTasksPerContext of the context, then MaxOpenTasks of the store:
+// the committed non-terminal tasks plus the live reservations, that is
+// the new-task admissions younger than repointGrace whose task is not
+// committed yet, each task counted once), then the ingress insert (its
+// id is the global admission order), the fence upsert and the planned
+// deliveries (new task: the planned state, a continuation's held ones
+// become pending, due at once, because the message is already committed
+// to the task history). A refusal changes nothing. The reservation
+// closes the window between this admission and the SDK task create,
+// which is another transaction; an expired reservation stops counting,
+// and Create makes the definitive check of the committed tasks.
 func (s *Store) Admit(ctx context.Context, a a2acore.Admission) (a2acore.AdmitResult, error) {
 	var res a2acore.AdmitResult
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -96,12 +112,15 @@ func (s *Store) Admit(ctx context.Context, a a2acore.Admission) (a2acore.AdmitRe
 				res = a2acore.AdmitResult{Refusal: &a2acore.Refusal{Code: a2acore.RefuseLoopLimit, Detail: "the context is at its task limit"}}
 				return nil
 			}
-			var open int
-			if err := tx.QueryRow(`SELECT COUNT(*) FROM a2a_tasks WHERE state NOT IN (?, ?, ?, ?)`,
+			var open, reserved int
+			if err := tx.QueryRow(openTasksSQL,
 				a2acore.StateCompleted, a2acore.StateCanceled, a2acore.StateFailed, a2acore.StateRejected).Scan(&open); err != nil {
 				return err
 			}
-			if open >= s.limits.MaxOpenTasks {
+			if err := tx.QueryRow(reservedTasksSQL, s.now().Unix()-int64(repointGrace/time.Second)).Scan(&reserved); err != nil {
+				return err
+			}
+			if open+reserved >= s.limits.MaxOpenTasks {
 				res = a2acore.AdmitResult{Refusal: &a2acore.Refusal{Code: a2acore.RefuseCapacity, Detail: "the open tasks are at their limit"}}
 				return nil
 			}

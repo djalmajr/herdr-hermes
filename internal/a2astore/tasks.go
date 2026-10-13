@@ -24,7 +24,15 @@ import (
 // from the task metadata when the admission never committed; a task
 // without a resolvable project is a2a.ErrInvalidParams. The held
 // deliveries of the task become pending in the same transaction, so the
-// notice is only ever sent after the task is durable.
+// notice is only ever sent after the task is durable. A task that is not
+// terminal is also the definitive capacity check, in the transaction of
+// the insert: when the committed non-terminal tasks are already at
+// MaxOpenTasks it is a2a.ErrInvalidParams with the fixed text
+// "refused: capacity" (the one of a refused admission), nothing is
+// inserted and the held deliveries stay held. Reservations are not
+// counted here (the task's own would count against itself); the check
+// covers an expired reservation and the re-point of an abandoned
+// admission, neither of which the admission limit sees.
 func (s *Store) Create(ctx context.Context, task *a2a.Task) (taskstore.TaskVersion, error) {
 	owner, err := s.owner(ctx)
 	if err != nil {
@@ -45,6 +53,17 @@ func (s *Store) Create(ctx context.Context, task *a2a.Task) (taskstore.TaskVersi
 		if err != nil {
 			return err
 		}
+		state := NeutralState(task.Status.State)
+		if !a2acore.Terminal(state) {
+			var open int
+			if err := tx.QueryRow(openTasksSQL,
+				a2acore.StateCompleted, a2acore.StateCanceled, a2acore.StateFailed, a2acore.StateRejected).Scan(&open); err != nil {
+				return err
+			}
+			if open >= s.limits.MaxOpenTasks {
+				return a2a.NewError(a2a.ErrInvalidParams, "refused: "+a2acore.RefuseCapacity)
+			}
+		}
 		body, err := json.Marshal(task)
 		if err != nil {
 			return fmt.Errorf("a2astore: task: %w", err)
@@ -54,7 +73,7 @@ func (s *Store) Create(ctx context.Context, task *a2a.Task) (taskstore.TaskVersi
 		if _, err := tx.Exec(`INSERT INTO a2a_tasks(task_id, context_id, owner, project, job, state, version, messages, task_json, created, created_unix, updated, updated_nano)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			string(task.ID), task.ContextID, owner, project, nullStr(job),
-			NeutralState(task.Status.State), 1, len(task.History), string(body),
+			state, 1, len(task.History), string(body),
 			created, createdUnix, created, now.UnixNano()); err != nil {
 			return err
 		}

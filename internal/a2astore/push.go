@@ -39,78 +39,115 @@ func (s *Store) PushConfigs() *PushConfigStore {
 // gets a generated "pc_<16 hex>" one; the URL is required
 // (a2a.ErrInvalidParams when missing). The Token and the
 // Auth.Credentials are put into the Secret Provider and only their
-// handles are stored; on a replace the previous row's handles are
-// deleted from the provider. The returned config is a copy carrying the
+// handles are stored. The returned config is a copy carrying the
 // original secret values. Save does no owner check: the SDK masks every
 // existing task before it saves and a new task id is server-generated.
+//
+// The order protects the committed config: the new handles are put
+// first, outside the transaction (when the credentials Put fails the
+// token handle just put is deleted); then one transaction reads the
+// previous row's handles and upserts the row; when the transaction or
+// its commit fails, only the handles this call just put are deleted
+// (a failed compensation delete is joined to the returned error), so the
+// previous row and its handles stay intact and usable. Only after the
+// commit are the previous row's handles deleted from the provider. A
+// failure of that last cleanup is an error, not a success (the config
+// is stored, the error says so and keeps the cause, and the obsolete
+// handle stays in the provider): the provider has no transactional
+// delete and the store keeps no durable list of obsolete handles, so
+// that window is the declared limit of a provider whose Delete can fail
+// (the native in-memory provider never fails it).
 func (p *PushConfigStore) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.PushConfig) (*a2a.PushConfig, error) {
 	if cfg == nil || cfg.URL == "" {
 		return nil, a2a.ErrInvalidParams
 	}
-	var stored *a2a.PushConfig
-	err := p.s.tx(ctx, func(tx *sql.Tx) error {
-		id := cfg.ID
-		if id == "" {
-			var b [8]byte
-			if _, err := rand.Read(b[:]); err != nil {
-				return fmt.Errorf("a2astore: push config id: %w", err)
-			}
-			id = "pc_" + hex.EncodeToString(b[:])
+	id := cfg.ID
+	if id == "" {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, fmt.Errorf("a2astore: push config id: %w", err)
 		}
-		var oldToken, oldCreds sql.NullString
+		id = "pc_" + hex.EncodeToString(b[:])
+	}
+	// 1. The new handles, outside the transaction.
+	tokenRef, credsRef, scheme := "", "", ""
+	if cfg.Token != "" {
+		handle, err := p.s.secrets.Put(ctx, cfg.Token)
+		if err != nil {
+			return nil, err
+		}
+		tokenRef = handle
+	}
+	if cfg.Auth != nil && cfg.Auth.Credentials != "" {
+		handle, err := p.s.secrets.Put(ctx, cfg.Auth.Credentials)
+		if err != nil {
+			return nil, joinCleanup(err, p.deleteHandles(ctx, tokenRef))
+		}
+		credsRef = handle
+		scheme = cfg.Auth.Scheme
+	}
+	// 2. The previous handles and the upsert, in one transaction.
+	var oldToken, oldCreds sql.NullString
+	err := p.s.tx(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRow(`SELECT token_ref, credentials_ref FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`,
 			string(taskID), id).Scan(&oldToken, &oldCreds)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if err == nil {
-			if oldToken.Valid {
-				if err := p.s.secrets.Delete(ctx, oldToken.String); err != nil {
-					return err
-				}
-			}
-			if oldCreds.Valid {
-				if err := p.s.secrets.Delete(ctx, oldCreds.String); err != nil {
-					return err
-				}
-			}
-		}
-		tokenRef, credsRef := "", ""
-		if cfg.Token != "" {
-			handle, err := p.s.secrets.Put(ctx, cfg.Token)
-			if err != nil {
-				return err
-			}
-			tokenRef = handle
-		}
-		scheme := ""
-		if cfg.Auth != nil && cfg.Auth.Credentials != "" {
-			handle, err := p.s.secrets.Put(ctx, cfg.Auth.Credentials)
-			if err != nil {
-				return err
-			}
-			credsRef = handle
-			scheme = cfg.Auth.Scheme
-		}
 		nowTS, _ := stamp(p.s.now())
-		if _, err := tx.Exec(`INSERT INTO a2a_push_configs(task_id, config_id, url, auth_scheme, token_ref, credentials_ref, created)
+		_, err = tx.Exec(`INSERT INTO a2a_push_configs(task_id, config_id, url, auth_scheme, token_ref, credentials_ref, created)
 			VALUES(?,?,?,?,?,?,?)
 			ON CONFLICT(task_id, config_id) DO UPDATE SET url = excluded.url, auth_scheme = excluded.auth_scheme,
 			token_ref = excluded.token_ref, credentials_ref = excluded.credentials_ref`,
-			string(taskID), id, cfg.URL, nullStr(scheme), nullStr(tokenRef), nullStr(credsRef), nowTS); err != nil {
-			return err
-		}
-		out := &a2a.PushConfig{Tenant: cfg.Tenant, TaskID: taskID, ID: id, URL: cfg.URL, Token: cfg.Token}
-		if cfg.Auth != nil {
-			out.Auth = &a2a.PushAuthInfo{Scheme: cfg.Auth.Scheme, Credentials: cfg.Auth.Credentials}
-		}
-		stored = out
-		return nil
+			string(taskID), id, cfg.URL, nullStr(scheme), nullStr(tokenRef), nullStr(credsRef), nowTS)
+		return err
 	})
 	if err != nil {
-		return nil, err
+		// 3. Nothing committed: only the handles of this call go away.
+		return nil, joinCleanup(err, p.deleteHandles(ctx, tokenRef, credsRef))
 	}
-	return stored, nil
+	// 4. Committed: the previous handles are obsolete.
+	var obsolete []string
+	for _, old := range []sql.NullString{oldToken, oldCreds} {
+		if old.Valid && old.String != tokenRef && old.String != credsRef {
+			obsolete = append(obsolete, old.String)
+		}
+	}
+	if derr := p.deleteHandles(ctx, obsolete...); derr != nil {
+		return nil, fmt.Errorf("a2astore: push config stored; deleting an obsolete secret handle failed: %w", derr)
+	}
+	out := &a2a.PushConfig{Tenant: cfg.Tenant, TaskID: taskID, ID: id, URL: cfg.URL, Token: cfg.Token}
+	if cfg.Auth != nil {
+		out.Auth = &a2a.PushAuthInfo{Scheme: cfg.Auth.Scheme, Credentials: cfg.Auth.Credentials}
+	}
+	return out, nil
+}
+
+// deleteHandles deletes every non-empty handle from the SecretProvider,
+// trying all of them even when one fails, and returns the failures
+// joined (nil when every delete succeeded). It runs after the caller's
+// outcome is decided, so a canceled context does not stop it.
+func (p *PushConfigStore) deleteHandles(ctx context.Context, handles ...string) error {
+	ctx = context.WithoutCancel(ctx)
+	var errs []error
+	for _, h := range handles {
+		if h == "" {
+			continue
+		}
+		if err := p.s.secrets.Delete(ctx, h); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// joinCleanup is err, joined with the failure of its compensation when
+// there is one.
+func joinCleanup(err, cleanup error) error {
+	if cleanup == nil {
+		return err
+	}
+	return errors.Join(err, cleanup)
 }
 
 // Get retrieves one push config of a committed task, resolving its
