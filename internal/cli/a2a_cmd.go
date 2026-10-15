@@ -429,11 +429,11 @@ func cmdA2AServe(args []string, env Env) int {
 	}
 	// The held deliveries of a task that never committed (a crash between
 	// the admission and the task write) become obsolete before serving.
-	// A transaction failure of the recovery still refuses the start;
-	// a failure that came only from the cleanup of the secret handles
-	// (the recovery itself committed) does not: the handles are pending
-	// in the durable cleanup ledger and are retried on the next
-	// recovery, and the serve writes one count-only line on stderr.
+	// A transaction or SQL failure of the recovery still refuses the
+	// start; a failure that came only from the cleanup of the secret
+	// handles (the recovery itself committed) does not: the handles are
+	// pending in the durable cleanup ledger and are retried on the next
+	// recovery.
 	if _, err := store.RecoverHeld(context.Background(), env.Now(), a2aRecoverGrace); err != nil {
 		if !errors.Is(err, a2astore.ErrSecretCleanupPending) {
 			_ = ln.Close()
@@ -442,16 +442,20 @@ func cmdA2AServe(args []string, env Env) int {
 			_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a serve: registry database unavailable"}))
 			return 4
 		}
-		pending, cerr := store.PendingSecretCleanup(context.Background())
-		if cerr != nil {
-			_ = ln.Close()
-			_ = store.Close()
-			_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a serve:", cerr)
-			_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a serve: registry database unavailable"}))
-			return 4
-		}
-		// One count-only diagnostic: no handle, no secret and no
-		// provider message, only the number.
+	}
+	// The pending count is consulted whether or not a fresh cleanup
+	// failed: an old failure alone must not start with an empty stderr.
+	// At most one count-only line: no handle, no secret and no provider
+	// message, only the number.
+	pending, cerr := store.PendingSecretCleanup(context.Background())
+	if cerr != nil {
+		_ = ln.Close()
+		_ = store.Close()
+		_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a serve:", cerr)
+		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a serve: registry database unavailable"}))
+		return 4
+	}
+	if pending > 0 {
 		_, _ = fmt.Fprintf(env.Stderr, "a2a serve: %d secret handle deletions are pending; they are retried on the next recovery\n", pending)
 	}
 

@@ -262,9 +262,12 @@ func scheduleHandleCleanup(tx *sql.Tx, now time.Time, handles ...string) error {
 // up to limit rows (a limit at or below zero uses secretCleanupBatch)
 // ordered by scheduled then handle and asks the SecretProvider to
 // delete each handle with a context that cannot be canceled, like the
-// other post-commit cleanups. A successful delete removes the row; a
-// failed one increments attempts and stores last_attempt. err is the
-// SQL failure when the SQL itself failed, or the provider failures
+// other post-commit cleanups. Before the delete, a handle that still
+// appears in a2a_push_configs (token_ref or credentials_ref) came back
+// into use: it is not deleted from the provider and its row is removed
+// from the ledger, counted as resolved. A successful delete removes the
+// row; a failed one increments attempts and stores last_attempt. err is
+// the SQL failure when the SQL itself failed, or the provider failures
 // wrapped in ErrSecretCleanupPending when any delete failed; nil when
 // the round left nothing pending. A Delete of a handle the provider no
 // longer knows is not an error per the provider contract, so a repeated
@@ -328,6 +331,37 @@ func (s *Store) drainSecretCleanup(ctx context.Context, now time.Time, limit int
 	if len(pend) == 0 {
 		return 0, 0, nil
 	}
+	// Defense in depth against imported or corrupted state: a handle
+	// that still appears in a2a_push_configs (token_ref or
+	// credentials_ref) came back into use, so it is not deleted from the
+	// provider and its ledger row is removed, counted as resolved.
+	refIn := strings.TrimSuffix(strings.Repeat("?,", len(pend)), ",")
+	refArgs := make([]any, 0, 2*len(pend))
+	for _, h := range pend {
+		refArgs = append(refArgs, h, h)
+	}
+	referenced := map[string]bool{}
+	refRows, rerr := s.db.Query(`SELECT token_ref, credentials_ref FROM a2a_push_configs WHERE token_ref IN (`+refIn+`) OR credentials_ref IN (`+refIn+`)`, refArgs...)
+	if rerr != nil {
+		return 0, 0, rerr
+	}
+	for refRows.Next() {
+		var tok, creds sql.NullString
+		if err := refRows.Scan(&tok, &creds); err != nil {
+			refRows.Close()
+			return 0, 0, err
+		}
+		if tok.Valid {
+			referenced[tok.String] = true
+		}
+		if creds.Valid {
+			referenced[creds.String] = true
+		}
+	}
+	refRows.Close()
+	if err := refRows.Err(); err != nil {
+		return 0, 0, err
+	}
 	// The provider calls run outside any SQL transaction, with a
 	// context that cannot be canceled; the results are applied in one
 	// small transaction, so a crash between the two leaves the ledger
@@ -340,6 +374,10 @@ func (s *Store) drainSecretCleanup(ctx context.Context, now time.Time, limit int
 		delErrs []error
 	)
 	for _, h := range pend {
+		if referenced[h] {
+			gone = append(gone, h)
+			continue
+		}
 		if err := s.secrets.Delete(delCtx, h); err == nil {
 			gone = append(gone, h)
 		} else {

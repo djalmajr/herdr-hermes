@@ -334,10 +334,11 @@ func (s *Store) Release(ctx context.Context, c a2acore.DeliveryClaim) error {
 // marked deliveries together with an error saying the recovery committed
 // and keeping the cause wrapped in ErrSecretCleanupPending; the failed
 // handles stay in the ledger and in the provider and are retried by the
-// next recovery. The old pendings of earlier recoveries are drained too;
-// their provider failures never become an error of this recovery, they
-// are counted only (a SQL failure of that drain, not wrapped in the
-// sentinel, still refuses).
+// next recovery. The old pendings of earlier recoveries are drained
+// too, whether or not the fresh drain failed; their provider failures
+// never become an error of this recovery, they are counted only (a SQL
+// failure of that drain is returned joined in the error, not wrapped in
+// the sentinel, and still refuses the start).
 func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Duration) (int, error) {
 	cutoff := now.Add(-grace).Unix()
 	var marked int
@@ -381,18 +382,22 @@ func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Durat
 	}
 	// Committed: the discarded configs' handles are in the cleanup
 	// ledger; the drain restricted to them deletes them from the
-	// provider now. A failure keeps the committed count and returns an
-	// error saying the recovery committed (the sentinel separates it
-	// from a transaction failure, which the caller still refuses).
+	// provider now. A failure keeps the committed count and is kept as
+	// the error of this recovery (the sentinel separates it from a
+	// transaction failure, which the caller still refuses); it never
+	// stops the old drain below.
+	var freshErr error
 	if _, _, derr := s.drainRestricted(ctx, now, secretCleanupBatch, handles...); derr != nil {
-		return marked, fmt.Errorf("a2astore: held deliveries recovered; deleting a secret handle of a discarded pending push config failed: %w", derr)
+		freshErr = fmt.Errorf("a2astore: held deliveries recovered; deleting a secret handle of a discarded pending push config failed: %w", derr)
 	}
-	// No failure of the fresh handles: the old pendings of earlier
-	// recoveries are drained too. A provider failure of one of them
-	// never becomes an error of this recovery: it is counted only and
-	// retried by the next recovery.
+	// The old pendings of earlier recoveries are drained too, whether
+	// or not the fresh handles failed. A provider failure of an old
+	// handle never becomes an error of this recovery: it is counted
+	// only and retried by the next recovery. A SQL failure of that
+	// drain is returned joined in the error, not wrapped in the
+	// sentinel, so a broken database still refuses the start.
 	if _, _, derr := s.DrainSecretCleanup(ctx, now, secretCleanupBatch); derr != nil && !errors.Is(derr, ErrSecretCleanupPending) {
-		return marked, fmt.Errorf("a2astore: held deliveries recovered; draining the old secret cleanup pendings failed: %w", derr)
+		freshErr = errors.Join(freshErr, fmt.Errorf("a2astore: held deliveries recovered; draining the old secret cleanup pendings failed: %w", derr))
 	}
-	return marked, nil
+	return marked, freshErr
 }

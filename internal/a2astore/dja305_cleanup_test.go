@@ -365,13 +365,14 @@ func TestDJA305RecoverHeldFailureSchedulesAndKeepsCount(t *testing.T) {
 	if rows != 0 {
 		t.Fatalf("push config rows = %d, want 0 (committed)", rows)
 	}
-	// the handle is in the ledger with attempts 1 and both stamps at now.
+	// the handle is in the ledger with attempts 2 (the restricted and
+	// the old drain both tried it and failed) and both stamps at now.
 	row := dja305LedgerRow(t, s, handle)
 	if !row.found {
 		t.Fatalf("the handle is not in the cleanup ledger")
 	}
-	if row.attempts != 1 {
-		t.Fatalf("attempts = %d, want 1", row.attempts)
+	if row.attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", row.attempts)
 	}
 	if row.scheduled != clk.ts() || row.lastAttempt != clk.ts() {
 		t.Fatalf("stamps = %q/%q, want %q for both", row.scheduled, row.lastAttempt, clk.ts())
@@ -386,26 +387,68 @@ func TestDJA305RecoverHeldFailureSchedulesAndKeepsCount(t *testing.T) {
 	}
 }
 
+// TestDJA305OldPendingDrainedAfterFreshFailure proves the fix of the
+// first security finding: when the delete of a fresh handle fails, the
+// recovery still drains the old pendings of earlier recoveries; the
+// healthy old handle is gone from the provider and from the table, and
+// the returned error is the fresh one, keeping the sentinel and the
+// provider cause.
+func TestDJA305OldPendingDrainedAfterFreshFailure(t *testing.T) {
+	s, clk, sec, _, fresh := dja305RecoverEnv(t)
+	old := "dja305-old-pending"
+	sec.insert(old, "dja305-old-value")
+	dja305Exec(t, s, `INSERT INTO a2a_secret_cleanup(handle, scheduled) VALUES(?, ?)`, old, testNow.Add(-time.Hour).Format(tsLayout))
+	sec.failDeleteOf(fresh)
+	marked, err := s.RecoverHeld(context.Background(), clk.Now(), 5*time.Minute)
+	if marked != 1 {
+		t.Fatalf("RecoverHeld returned %d with the error, want the committed count 1", marked)
+	}
+	if !errors.Is(err, ErrSecretCleanupPending) {
+		t.Fatalf("the error does not carry the cleanup sentinel: %v", err)
+	}
+	if !errors.Is(err, errDja305Delete) {
+		t.Fatalf("the error lost the provider cause: %v", err)
+	}
+	// the healthy old pending was drained from the provider and the
+	// table even though the fresh delete failed.
+	if sec.isLive(old) {
+		t.Fatalf("the old pending is still live in the provider, want drained")
+	}
+	if row := dja305LedgerRow(t, s, old); row.found {
+		t.Fatalf("the old pending row is still in the table: %+v", row)
+	}
+	// the fresh handle keeps its row (the old drain tried it again and
+	// failed, so attempts is 2) and is still live in the provider.
+	if row := dja305LedgerRow(t, s, fresh); !row.found || row.attempts != 2 {
+		t.Fatalf("the fresh handle row = %+v, want the row with attempts 2", row)
+	}
+	if !sec.isLive(fresh) {
+		t.Fatalf("the fresh handle is gone from the provider, want still live")
+	}
+	requireDja305NoSecretInA2ATables(t, s, "after the mixed recovery", dja305Canary)
+}
+
 // TestDJA305DrainRetryConverges proves acceptance 2 and the [retry]
-// case: two failed deletes bring attempts to 2, the cured drain deletes
-// the handle and empties the table, and a repeated drain does nothing,
-// does not delete twice and does not error.
+// case: a failed recovery (the restricted and the old drain both fail)
+// brings attempts to 2, one more failed drain brings it to 3, the cured
+// drain deletes the handle and empties the table, and a repeated drain
+// does nothing, does not delete twice and does not error.
 func TestDJA305DrainRetryConverges(t *testing.T) {
 	s, clk, sec, _, handle := dja305RecoverEnv(t)
 	sec.failDeleteOf(handle)
 	if _, err := s.RecoverHeld(context.Background(), clk.Now(), 5*time.Minute); !errors.Is(err, ErrSecretCleanupPending) {
 		t.Fatalf("first recovery = %v, want the cleanup sentinel", err)
 	}
-	if row := dja305LedgerRow(t, s, handle); !row.found || row.attempts != 1 {
-		t.Fatalf("after the first failure: %+v, want the row with attempts 1", row)
+	if row := dja305LedgerRow(t, s, handle); !row.found || row.attempts != 2 {
+		t.Fatalf("after the first failure: %+v, want the row with attempts 2 (the restricted and the old drain both tried it)", row)
 	}
-	// a second failure: attempts goes to 2.
+	// a second failure: attempts goes to 3.
 	deleted, failed, derr := s.DrainSecretCleanup(context.Background(), clk.Now(), 100)
 	if deleted != 0 || failed != 1 || !errors.Is(derr, ErrSecretCleanupPending) || !errors.Is(derr, errDja305Delete) {
 		t.Fatalf("second drain = %d/%d, %v, want 0/1 with the sentinel and the cause", deleted, failed, derr)
 	}
-	if row := dja305LedgerRow(t, s, handle); !row.found || row.attempts != 2 {
-		t.Fatalf("after the second failure: %+v, want the row with attempts 2", row)
+	if row := dja305LedgerRow(t, s, handle); !row.found || row.attempts != 3 {
+		t.Fatalf("after the second failure: %+v, want the row with attempts 3", row)
 	}
 	// cured: the drain deletes the handle and empties the table.
 	sec.allowDeleteOf(handle)
@@ -791,6 +834,56 @@ func TestDJA305DrainLimitOrderAndIdempotent(t *testing.T) {
 	}
 	if n, err := s.PendingSecretCleanup(context.Background()); n != 0 || err != nil {
 		t.Fatalf("pending = %d, %v, want 0", n, err)
+	}
+}
+
+// TestDJA305DrainKeepsReferencedHandle proves the depth defense: a
+// ledger handle that still appears in a2a_push_configs (token_ref or
+// credentials_ref) is not deleted from the provider, its ledger row is
+// removed, and it counts as resolved; an unreferenced handle of the
+// same round is still deleted from the provider.
+func TestDJA305DrainKeepsReferencedHandle(t *testing.T) {
+	clk := &clock{t: testNow}
+	sec := newDja305Secrets()
+	env := newPushEnv(t, sec)
+	// the overlap: the still-referenced old token handle is also in the
+	// cleanup ledger, beside an unreferenced handle the provider holds.
+	unref := "dja305-unreferenced"
+	sec.insert(unref, "dja305-unref-value")
+	dja305Exec(t, env.s, `INSERT INTO a2a_secret_cleanup(handle, scheduled) VALUES(?, ?)`, env.oldTokenRef, clk.ts())
+	dja305Exec(t, env.s, `INSERT INTO a2a_secret_cleanup(handle, scheduled) VALUES(?, ?)`, unref, clk.ts())
+	deleted, failed, derr := env.s.DrainSecretCleanup(context.Background(), clk.Now(), 100)
+	if deleted != 2 || failed != 0 || derr != nil {
+		t.Fatalf("drain = %d/%d, %v, want 2/0 and no error (the referenced handle counts as resolved)", deleted, failed, derr)
+	}
+	if !sec.isLive(env.oldTokenRef) {
+		t.Fatalf("the referenced handle is gone from the provider, want still live")
+	}
+	if sec.isLive(unref) {
+		t.Fatalf("the unreferenced handle is still live in the provider, want deleted")
+	}
+	for _, h := range []string{env.oldTokenRef, unref} {
+		if row := dja305LedgerRow(t, env.s, h); row.found {
+			t.Fatalf("the handle %s row is still in the table: %+v", h, row)
+		}
+	}
+	if n := sec.deletedOf(env.oldTokenRef); n != 0 {
+		t.Fatalf("provider deletes of the referenced handle = %d, want 0", n)
+	}
+	// the credentials_ref column is protected the same way.
+	dja305Exec(t, env.s, `INSERT INTO a2a_secret_cleanup(handle, scheduled) VALUES(?, ?)`, env.oldCredsRef, clk.ts())
+	deleted, failed, derr = env.s.DrainSecretCleanup(context.Background(), clk.Now(), 100)
+	if deleted != 1 || failed != 0 || derr != nil {
+		t.Fatalf("second drain = %d/%d, %v, want 1/0 and no error", deleted, failed, derr)
+	}
+	if !sec.isLive(env.oldCredsRef) {
+		t.Fatalf("the referenced credentials handle is gone from the provider, want still live")
+	}
+	if row := dja305LedgerRow(t, env.s, env.oldCredsRef); row.found {
+		t.Fatalf("the credentials handle row is still in the table: %+v", row)
+	}
+	if n := sec.deletedOf(env.oldCredsRef); n != 0 {
+		t.Fatalf("provider deletes of the credentials handle = %d, want 0", n)
 	}
 }
 

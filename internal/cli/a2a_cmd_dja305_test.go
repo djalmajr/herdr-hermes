@@ -235,6 +235,72 @@ func TestDJA305ServeSurvivesCleanupFailure(t *testing.T) {
 	}
 }
 
+// TestDJA305ServeReportsOldPendingAlone proves the fix of the second
+// security finding: with only an old pending whose delete fails (no
+// fresh config to discard at the startup recovery), the serve still
+// starts, writes exactly one count-only line on stderr and answers the
+// card.
+func TestDJA305ServeReportsOldPendingAlone(t *testing.T) {
+	cfgDir := t.TempDir()
+	a2aRegisterNotify(t, cfgDir)
+	sec := newDja305ServeSecrets()
+	h, err := sec.Put(context.Background(), "dja305-serve-old-VALUE")
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	sec.failDeleteOf(h)
+	// the durable state of an earlier failed cleanup: one old pending
+	// row in the cleanup ledger, scheduled an hour before now.
+	db := filepath.Join(outbox.StateDir(cfgDir), "registry.db")
+	s, err := a2astore.OpenFile(db, a2astore.Options{
+		Now:     func() time.Time { return serveFixedNow },
+		Owner:   func(context.Context) (string, error) { return "local", nil },
+		Secrets: sec,
+	})
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	raw, rerr := sql.Open("sqlite", "file:"+filepath.ToSlash(db))
+	if rerr != nil {
+		t.Fatalf("open raw: %v", rerr)
+	}
+	if _, rerr := raw.Exec(`INSERT INTO a2a_secret_cleanup(handle, scheduled) VALUES(?, ?)`,
+		h, serveFixedNow.Add(-time.Hour).Format("2006-01-02T15:04:05-07:00")); rerr != nil {
+		_ = raw.Close()
+		t.Fatalf("insert the old pending: %v", rerr)
+	}
+	if rerr := raw.Close(); rerr != nil {
+		t.Fatalf("close raw: %v", rerr)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	base, exitCh, cancel, _, errb := startA2ADja305Serve(t, cfgDir, sec)
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-exitCh:
+		case <-time.After(15 * time.Second):
+		}
+	})
+	// exactly one count-only line on stderr, even though no fresh
+	// cleanup failed at this startup.
+	const want = "a2a serve: 1 secret handle deletions are pending; they are retried on the next recovery"
+	if got := errb.snapshot(); got != want+"\n" {
+		t.Fatalf("stderr = %q, want exactly the count line %q", got, want)
+	}
+	// and the serve still answers the card.
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(base + "/.well-known/agent-card.json")
+	if err != nil {
+		t.Fatalf("card: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("card status = %d, want 200", resp.StatusCode)
+	}
+}
+
 // TestDJA305ServeTransactionFailureStillExits4 proves acceptance 5:
 // with the recovery transaction failing, the serve still exits 4
 // (fail-closed), the stdout line is the unavailable one, and nothing is
