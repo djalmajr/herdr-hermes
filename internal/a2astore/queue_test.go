@@ -59,6 +59,12 @@ func TestAdmitFresh(t *testing.T) {
 	if states["owner"] != a2acore.DeliveryHeld || states["guardian"] != a2acore.DeliveryNoRoute {
 		t.Fatalf("new-task deliveries = %v, want held and no_route", states)
 	}
+	// The task commits awaiting the caller (input_required): the held
+	// delivery of the first message becomes pending, and the
+	// continuation below passes the awaiting-caller gate.
+	if _, err := s.Create(context.Background(), mkTask("t1", "c1", a2a.TaskStateInputRequired, 1)); err != nil {
+		t.Fatalf("Create t1: %v", err)
+	}
 	// A continuation: held becomes pending, due at once.
 	res, err = s.Admit(context.Background(), admission("alice", "m-2", "t1", "c1", "acme/widgets", "s1", 1, 2, false,
 		[]a2acore.PlannedDelivery{ownerDelivery("m1/ws1:p1")}))
@@ -67,17 +73,21 @@ func TestAdmitFresh(t *testing.T) {
 	}
 	states = deliveryStates(t, s, "t1")
 	// Both admissions planned an owner delivery: the second one is a
-	// different ingress row, so two rows for the role exist.
+	// different ingress row, so two rows for the role exist; the task
+	// commit and the continuation each set their delivery pending,
+	// due at once.
 	var pending, held int
 	if err := s.db.QueryRow(`SELECT SUM(state = ?), SUM(state = ?) FROM a2a_deliveries WHERE task_id = 't1' AND role = 'owner'`,
 		a2acore.DeliveryPending, a2acore.DeliveryHeld).Scan(&pending, &held); err != nil {
 		t.Fatalf("delivery states: %v", err)
 	}
-	if pending != 1 || held != 1 {
-		t.Fatalf("owner deliveries = pending %d held %d, want 1/1", pending, held)
+	if pending != 2 || held != 0 {
+		t.Fatalf("owner deliveries = pending %d held %d, want 2/0", pending, held)
 	}
 	var nextUnix int64
-	if err := s.db.QueryRow(`SELECT next_attempt_unix FROM a2a_deliveries WHERE task_id = 't1' AND role = 'owner' AND state = ?`,
+	if err := s.db.QueryRow(`SELECT d.next_attempt_unix FROM a2a_deliveries d
+		JOIN a2a_ingress i ON i.ingress_id = d.ingress_id
+		WHERE d.task_id = 't1' AND d.role = 'owner' AND i.message_id = 'm-2' AND d.state = ?`,
 		a2acore.DeliveryPending).Scan(&nextUnix); err != nil {
 		t.Fatalf("next_attempt_unix: %v", err)
 	}
@@ -297,6 +307,11 @@ func TestAdmitCapacity(t *testing.T) {
 func TestAdmitIngressIDsIncreasing(t *testing.T) {
 	clk := &clock{t: testNow}
 	s, _ := openTest(t, clk, "alice")
+	// t1 commits awaiting the caller, so the continuation below (m-2)
+	// passes the awaiting-caller gate.
+	if _, err := s.Create(context.Background(), mkTask("t1", "c1", a2a.TaskStateInputRequired, 1)); err != nil {
+		t.Fatalf("Create t1: %v", err)
+	}
 	var ids []int64
 	for i, in := range []a2acore.Admission{
 		admission("alice", "m-1", "t1", "c1", "acme/widgets", "s1", 1, 1, true, nil),

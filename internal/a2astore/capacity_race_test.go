@@ -151,7 +151,9 @@ func TestCapacityContinuationNotCharged(t *testing.T) {
 	s, _ := openStore2(t, clk, "alice", a2acore.Limits{MaxOpenTasks: 1})
 	res, err := admitNew(s, "x")
 	requireAdmitted(t, "Admit X", res, err)
-	if err := createTask(s, "x", a2a.TaskStateSubmitted); err != nil {
+	// The task awaits the caller (input_required), so the continuation
+	// below passes the awaiting-caller gate.
+	if err := createTask(s, "x", a2a.TaskStateInputRequired); err != nil {
 		t.Fatalf("Create X: %v", err)
 	}
 	cont, err := s.Admit(context.Background(), admission("alice", "m-x2", "tx", "cx-x", "acme/widgets", "s-x", 1, 2, false, nil))
@@ -161,14 +163,29 @@ func TestCapacityContinuationNotCharged(t *testing.T) {
 }
 
 // TestCapacityContinuationReservesNothing proves the admission of a
-// continuation never holds a slot, even when its task has no row: a new
-// task is still admitted at the limit afterwards.
+// continuation never holds a slot: with the continuation's task
+// committed and open (one slot of the limit), the reservation count the
+// limit uses stays at zero and a new task is still admitted afterwards.
 func TestCapacityContinuationReservesNothing(t *testing.T) {
 	clk := &clock{t: testNow}
-	s, _ := openStore2(t, clk, "alice", a2acore.Limits{MaxOpenTasks: 1})
+	s, _ := openStore2(t, clk, "alice", a2acore.Limits{MaxOpenTasks: 2})
+	// tg is committed and open: it holds one slot of the limit, so the
+	// new task below fits only if the continuation held none.
+	if err := createTask(s, "g", a2a.TaskStateInputRequired); err != nil {
+		t.Fatalf("Create tg: %v", err)
+	}
 	cont, err := s.Admit(context.Background(), admission("alice", "m-g", "tg", "cx-g", "acme/widgets", "s-g", 1, 1, false, nil))
 	if err != nil || cont.Refusal != nil || cont.IngressID == 0 {
-		t.Fatalf("continuation of a task without a row = %+v, %v, want admitted", cont, err)
+		t.Fatalf("continuation of the open task = %+v, %v, want admitted", cont, err)
+	}
+	var reserved int
+	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT task_id) FROM a2a_ingress
+		WHERE new_task = 1 AND received_unix > ? AND task_id NOT IN (SELECT task_id FROM a2a_tasks)`,
+		clk.t.Unix()-int64(repointGrace/time.Second)).Scan(&reserved); err != nil {
+		t.Fatalf("reservation count: %v", err)
+	}
+	if reserved != 0 {
+		t.Fatalf("reservation count = %d, want 0 (a continuation admission holds no slot)", reserved)
 	}
 	res, err := admitNew(s, "x")
 	requireAdmitted(t, "Admit X after a continuation admission", res, err)

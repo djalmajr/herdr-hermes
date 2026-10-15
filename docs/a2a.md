@@ -17,9 +17,18 @@ The agent card is public at `GET /.well-known/agent-card.json` and advertises ex
 - `rejected`: the owner declined; the reason is the status message.
 - `canceled`: the caller canceled a non-terminal task.
 
-A caller resumes an `input_required` task with a follow-up message on the **same task id and context id**; a terminal task is never restarted — a further message on it is refused by the SDK (`unsupported operation`), and the caller can cancel only a non-terminal task. A task belongs to the subject that created it and to the project it was admitted in: another subject sees `task not found`, and so does its own subject once that project is no longer in the subject's current grant — for every operation on the task (get, list, cancel, a continuation and the push-config create, get, list and delete), checked against the project stored with the task on each request, never against message metadata.
+A caller resumes an `input_required` task with a follow-up message on the **same task id and context id**; a continuation on a `working` task is refused — answered busy (below) while the task's execution is parked, and refused with `not_awaiting_caller` when no execution is parked (after a restart) — and a resend of an already admitted continuation keeps its duplicate answer; a terminal task is never restarted — a further message on it is refused by the SDK (`unsupported operation`), and the caller can cancel only a non-terminal task. A task belongs to the subject that created it and to the project it was admitted in: another subject sees `task not found`, and so does its own subject once that project is no longer in the subject's current grant — for every operation on the task (get, list, cancel, a continuation and the push-config create, get, list and delete), checked against the project stored with the task on each request, never against message metadata. The SDK still appends a refused continuation to the task history as data; it is not admitted (no ingress row, no delivery, the fence does not move).
 
 A message on a task the caller can see that meets another execution or write of the same task — the task is parked awaiting the owner, a cancelation of it is in progress, another process stored a newer version first, or a resend of an already admitted message passed the interceptor's early answer — is answered `a2a: task busy, retry later` with HTTP 500 (status `INTERNAL`, reason `INTERNAL_ERROR`), and `nau a2a send` reports it as `unavailable` (exit 4): when the other execution or write is met before the admission, nothing was admitted, written or fenced, so the same message (same message id, session, epoch and sequence) can be sent again later, and when it wins after the message was admitted, the message is already in the task history and the fence has advanced, so a resend of the same message is not admitted again (no second ingress row and no second delivery) and returns the task in its current state without running the task again, writing it or sending a push. A task the caller cannot see is never answered busy: it is `task not found`. Every cancel of a task the caller cannot see, or of an id that does not exist, is answered with one HTTP 404 body (`TASK_NOT_FOUND`, the message `failed to cancel: cancelation failed: canceler setup failed: failed to load a task: task not found`), whether or not the task's execution is parked.
+
+### Conversation from the source
+
+The source sends the question with `nau a2a send --project …`, and the task stays `working` until the owner or the guardian decides.
+The source reads the state with `nau a2a get --task <id>`, repeating at the interval it chooses: the CLI has no wait of its own and no push.
+In `input_required`, the question back is the task's status message, and the source answers with `nau a2a send --task <id> --context <id>` with the next sequence of its session; a continuation outside `input_required` is refused (`task busy` while the task's execution is parked, `not_awaiting_caller` otherwise).
+In `completed`, the answer is the artifact `answer-<decision id>` with the decision text, and in `rejected`, the reason is the status message.
+The source does not wait in place for the answer: it proceeds with the work that does not depend on it, and only the work that depends on it waits.
+The task stays `working` until a decision; if the source gives up waiting, it cancels the task with `nau a2a cancel` and can ask again in a new task — a continuation on a `working` task is refused.
 
 ## Message correlation metadata
 
@@ -46,6 +55,7 @@ Refusal codes (every refusal is deterministic and carries one of these):
 - `capacity`: the open tasks reached their bound.
 - `terminal`: the task is already terminal.
 - `not_awaiting_owner`: a decision was recorded on a task that is not awaiting the owner.
+- `not_awaiting_caller`: a continuation arrived on a task that is not awaiting the caller (not `input_required`); nothing is admitted.
 - `unknown_task`: no such task (or the task belongs to another subject).
 - `decision_conflict`: a decision id was reused with different content.
 - `invalid_decision`: the decision id, kind, text or actor is not acceptable.

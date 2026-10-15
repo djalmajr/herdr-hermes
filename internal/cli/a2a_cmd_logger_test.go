@@ -434,31 +434,36 @@ func TestA2AServeLogsSuppressedPushOnStderr(t *testing.T) {
 	}
 }
 
-// a2a337CheckFailedPushRecord asserts the stderr of one failed push
-// send: exactly one JSON record — the sender's message at ERROR level
-// with the fixed classification of the failure — and none of the
-// banned values (the URL or the canary) anywhere in the stderr.
-func a2a337CheckFailedPushRecord(t *testing.T, errb *testLockedBuffer, wantClass string, banned ...string) {
+// a2a337CheckFailedPushRecord asserts the stderr of failed push sends:
+// one to maxRecords JSON records, each the sender's message at ERROR
+// level with the fixed classification of the failure, and none of the
+// banned values (the URL or the canary) anywhere in the stderr. A live
+// send may push both its submitted and its working event, so its
+// failures log one or two records depending on timing.
+func a2a337CheckFailedPushRecord(t *testing.T, errb *testLockedBuffer, wantClass string, maxRecords int, banned ...string) {
 	t.Helper()
-	line := errb.nextLine(t, 10*time.Second)
-	var rec map[string]any
-	if err := json.Unmarshal([]byte(line), &rec); err != nil {
-		t.Fatalf("first stderr line %q is not JSON: %v", line, err)
-	}
-	if rec["msg"] != "push sending failed" || rec["level"] != "ERROR" {
-		t.Fatalf("record = %v, want the ERROR record msg %q", rec, "push sending failed")
-	}
-	if rec["error"] != wantClass {
-		t.Fatalf("record error = %v, want the fixed classification %q", rec["error"], wantClass)
-	}
+	errb.nextLine(t, 10*time.Second)
 	stderr := errb.snapshot()
 	for _, banned := range banned {
 		if strings.Contains(stderr, banned) {
 			t.Fatalf("stderr carries %q (the error text must not reach the log): %s", banned, stderr)
 		}
 	}
-	if n := strings.Count(stderr, "\n"); n != 1 {
-		t.Fatalf("stderr has %d line(s), want exactly the one JSON record (%q)", n, stderr)
+	lines := strings.Split(strings.TrimSuffix(stderr, "\n"), "\n")
+	if len(lines) < 1 || len(lines) > maxRecords {
+		t.Fatalf("stderr has %d line(s), want 1 to %d JSON records (%q)", len(lines), maxRecords, stderr)
+	}
+	for _, line := range lines {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("stderr line %q is not JSON: %v", line, err)
+		}
+		if rec["msg"] != "push sending failed" || rec["level"] != "ERROR" {
+			t.Fatalf("record = %v, want the ERROR record msg %q", rec, "push sending failed")
+		}
+		if rec["error"] != wantClass {
+			t.Fatalf("record error = %v, want the fixed classification %q", rec["error"], wantClass)
+		}
 	}
 }
 
@@ -540,7 +545,7 @@ func TestA2AServeInvalidPushURLOutOfBand(t *testing.T) {
 			})
 			// The decision loop applies the decision out of band and
 			// the final push fails at the request creation.
-			a2a337CheckFailedPushRecord(t, errb, "invalid push URL", webhook, a2a337cCanary)
+			a2a337CheckFailedPushRecord(t, errb, "invalid push URL", 1, webhook, a2a337cCanary)
 			stdout := out.snapshot()
 			if n := strings.Count(stdout, "\n"); n != 1 {
 				t.Fatalf("stdout has %d line(s), want exactly the serving line (%q)", n, stdout)
@@ -555,9 +560,10 @@ func TestA2AServeInvalidPushURLOutOfBand(t *testing.T) {
 // TestA2AServeInvalidPushURLLive proves the round-3 live path: a live
 // send carries a push config with the invalid URL (the malformed form
 // with the canary after the quote, and the schemeless form with the
-// canary in the path); the SDK saves the config before the run, the
-// working push fails at the request creation and is logged on stderr
-// with only the fixed classification invalid push URL — never the URL
+// canary in the path); the SDK saves the config before the run, each
+// push of the send (the working one, and the submitted one when the
+// timing lets it out) fails at the request creation and is logged on
+// stderr with only the fixed classification invalid push URL — never the URL
 // or the canary — while the send still answers HTTP 200 (a push
 // failure does not fail the send).
 func TestA2AServeInvalidPushURLLive(t *testing.T) {
@@ -587,7 +593,7 @@ func TestA2AServeInvalidPushURLLive(t *testing.T) {
 			if status := a2a337LiveSend(t, serving.Listen, webhook); status != http.StatusOK {
 				t.Fatalf("message:send answered HTTP %d, want 200 (a push failure does not fail the send)", status)
 			}
-			a2a337CheckFailedPushRecord(t, errb, "invalid push URL", webhook, a2a337cCanary)
+			a2a337CheckFailedPushRecord(t, errb, "invalid push URL", 2, webhook, a2a337cCanary)
 			stdout := out.snapshot()
 			if n := strings.Count(stdout, "\n"); n != 1 {
 				t.Fatalf("stdout has %d line(s), want exactly the serving line (%q)", n, stdout)

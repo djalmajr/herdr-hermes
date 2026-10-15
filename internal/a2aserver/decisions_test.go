@@ -431,9 +431,10 @@ func TestRefusedContinuationOfWorkingTaskParks(t *testing.T) {
 	ts2 := serveServer(t, s2)
 	c2 := dialClient(t, ts2.URL, auth, "caller-1")
 
-	// A stale-epoch continuation to the WORKING task: refused, but the
-	// task stays working, the refusal code is in the status-event
-	// metadata and the execution parks.
+	// A continuation to the WORKING task: refused not_awaiting_caller
+	// (the awaiting-caller gate stands before the fence), but the task
+	// stays working, the refusal code is in the status-event metadata
+	// and the execution parks.
 	res, err := c2.Send(ctxT(t), SendInput{
 		TaskID: string(task.ID), ContextID: task.ContextID,
 		Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-2", Text: "stale",
@@ -448,10 +449,10 @@ func TestRefusedContinuationOfWorkingTaskParks(t *testing.T) {
 	if got.Status.State != a2a.TaskStateWorking {
 		t.Errorf("state = %s, want working", got.Status.State)
 	}
-	if got.Metadata[a2acore.MetaRefusal] != a2acore.RefuseStaleEpoch {
+	if got.Metadata[a2acore.MetaRefusal] != a2acore.RefuseNotAwaitingCaller {
 		t.Errorf("task metadata = %v, want the refusal code", got.Metadata)
 	}
-	if got.Status.Message == nil || got.Status.Message.Parts[0].Text() != "refused: stale_epoch" {
+	if got.Status.Message == nil || got.Status.Message.Parts[0].Text() != "refused: not_awaiting_caller" {
 		t.Errorf("status message = %+v, want the refusal text", got.Status.Message)
 	}
 	if s2.LiveExecutions() != 1 {

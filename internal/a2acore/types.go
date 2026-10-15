@@ -258,6 +258,7 @@ const (
 	RefuseCapacity            = "capacity"             // open tasks at their bound
 	RefuseTerminal            = "terminal"             // the task is terminal
 	RefuseNotAwaitingOwner    = "not_awaiting_owner"   // a decision on a task not in StateWorking
+	RefuseNotAwaitingCaller   = "not_awaiting_caller"  // a continuation on a task not in StateInputRequired
 	RefuseUnknownTask         = "unknown_task"         // no such task (or not the caller's)
 	RefuseDecisionConflict    = "decision_conflict"    // decision id reused with other content
 	RefuseInvalidDecision     = "invalid_decision"     // decision kind, id or text refused
