@@ -3,11 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,8 +18,10 @@ import (
 	"time"
 
 	"github.com/djalmajr/nau/internal/config"
+	"github.com/djalmajr/nau/internal/outbox"
 	"github.com/djalmajr/nau/internal/registry"
 	"github.com/djalmajr/nau/internal/router"
+	_ "modernc.org/sqlite"
 )
 
 var serveFixedNow = time.Date(2026, 10, 10, 12, 0, 0, 0, time.FixedZone("x", -3*3600))
@@ -207,14 +211,12 @@ func TestServeUsage(t *testing.T) {
 		{"poll below range", []string{"--poll-interval", "9"}, "serve: --poll-interval"},
 		{"poll above range", []string{"--poll-interval", "3601"}, "serve: --poll-interval"},
 		{"poll not integer", []string{"--poll-interval", "x"}, "serve: --poll-interval"},
-		{"max-jobs below range", []string{"--max-jobs", "0"}, "serve: --max-jobs must be an integer between 1 and 1000"},
-		{"max-jobs above range", []string{"--max-jobs", "1001"}, "serve: --max-jobs must be an integer between 1 and 1000"},
-		{"max-jobs not integer", []string{"--max-jobs", "x"}, "serve: --max-jobs must be an integer between 1 and 1000"},
+		{"max-jobs not positive", []string{"--max-jobs", "0"}, "serve: --max-jobs must be a positive integer"},
+		{"max-jobs not integer", []string{"--max-jobs", "x"}, "serve: --max-jobs must be a positive integer"},
 		{"repeated max-jobs", []string{"--max-jobs", "5", "--max-jobs", "6"}, "usage: serve"},
 		{"max-jobs missing value", []string{"--max-jobs"}, "usage: serve"},
-		{"max-sessions below range", []string{"--max-sessions", "0"}, "serve: --max-sessions must be an integer between 1 and 1000"},
-		{"max-sessions above range", []string{"--max-sessions", "1001"}, "serve: --max-sessions must be an integer between 1 and 1000"},
-		{"max-sessions not integer", []string{"--max-sessions", "x"}, "serve: --max-sessions must be an integer between 1 and 1000"},
+		{"max-sessions not positive", []string{"--max-sessions", "0"}, "serve: --max-sessions must be a positive integer"},
+		{"max-sessions not integer", []string{"--max-sessions", "x"}, "serve: --max-sessions must be a positive integer"},
 		{"repeated max-sessions", []string{"--max-sessions", "5", "--max-sessions", "6"}, "usage: serve"},
 		{"max-sessions missing value", []string{"--max-sessions"}, "usage: serve"},
 		{"retention below range", []string{"--ended-retention-days", "6"}, "serve: --ended-retention-days must be an integer between 7 and 30"},
@@ -257,15 +259,17 @@ func TestServeNowrite(t *testing.T) {
 	assertDirEmpty(t, dir)
 }
 
-// TestServeRetentionFlags: a valid --max-sessions value reaches the store:
-// with a budget of one session, the first end-first session push through
-// the served API applies and the second is refused with the one-line 400
-// invalid.
-func TestServeRetentionFlags(t *testing.T) {
+// TestServeDeprecatedCountFlags: the deprecated --max-jobs and
+// --max-sessions flags stay accepted for who already passes them: any
+// positive integer is ignored with one deprecation line each on stderr,
+// and the registry has no jobs or sessions count limit, so the
+// end-first sessions that the old budget of one refused are all
+// applied.
+func TestServeDeprecatedCountFlags(t *testing.T) {
 	dbDir := t.TempDir()
 	db := filepath.Join(dbDir, "registry.db")
 	cfgDir := t.TempDir()
-	base, exitCh, cancel, _, _ := startServe(t, cfgDir, db, "--machines", "", "--max-sessions", "1")
+	base, exitCh, cancel, _, errb := startServe(t, cfgDir, db, "--machines", "", "--max-jobs", "5000", "--max-sessions", "5000")
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -273,6 +277,34 @@ func TestServeRetentionFlags(t *testing.T) {
 		case <-time.After(15 * time.Second):
 		}
 	})
+	// One deprecation line per flag, on stderr, with the flag name and
+	// the kind, and the stdout keeps its single serving line.
+	snapshot := func() string {
+		return errb.snapshot()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snap := snapshot()
+		if strings.Contains(snap, "serve: --max-jobs is deprecated and ignored: the registry has no job count limit") &&
+			strings.Contains(snap, "serve: --max-sessions is deprecated and ignored: the registry has no session count limit") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deprecation lines not printed (stderr %q)", snap)
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if n := strings.Count(snapshot(), "--max-jobs is deprecated and ignored"); n != 1 {
+		t.Errorf("max-jobs deprecation lines = %d, want exactly one (%q)", n, snapshot())
+	}
+	if n := strings.Count(snapshot(), "--max-sessions is deprecated and ignored"); n != 1 {
+		t.Errorf("max-sessions deprecation lines = %d, want exactly one (%q)", n, snapshot())
+	}
+
+	// No count cap: the second end-first session, refused at the old
+	// budget of one, is applied like the first.
 	rec := func(seq int, branch string) string {
 		return fmt.Sprintf(`{"schema":1,"seq":%d,"ts":"2026-10-10T11:%02d:00-03:00","tipo":"session","maquina":"node-a","projeto":"org/x","idempotency_key":"node-a:%d","dados":{"acao":"end","projeto":"org/x","branch":"%s"}}`, seq, seq, seq, branch)
 	}
@@ -289,11 +321,10 @@ func TestServeRetentionFlags(t *testing.T) {
 		}
 		return resp.StatusCode, string(data)
 	}
-	if code, body := post(rec(1, "feat/a")); code != 200 || body != `{"status":"ok","aplicado":true}`+"\n" {
-		t.Fatalf("first end-first session = %d %q, want 200 ok/applied", code, body)
-	}
-	if code, body := post(rec(2, "feat/b")); code != 400 || body != `{"status":"invalid","motivo":"sessions limit reached"}`+"\n" {
-		t.Fatalf("second end-first session = %d %q, want the one-line 400 refusal", code, body)
+	for _, branch := range []string{"feat/a", "feat/b"} {
+		if code, body := post(rec(1, branch)); code != 200 || body != `{"status":"ok","aplicado":true}`+"\n" {
+			t.Fatalf("end-first session %s = %d %q, want 200 ok/applied (no count cap)", branch, code, body)
+		}
 	}
 }
 
@@ -443,6 +474,253 @@ func TestListenerIsLoopback(t *testing.T) {
 		if got := listenerIsLoopback(c.addr); got != c.want {
 			t.Errorf("listenerIsLoopback(%v) = %v, want %v", c.addr, got, c.want)
 		}
+	}
+}
+
+// dja275ServeDBConn opens the registry database with a plain connection,
+// for the seed and the fault of the sweep tests (serve has not opened
+// it yet, and the tests are in a package that cannot reach the store's
+// connection).
+func dja275ServeDBConn(t *testing.T, db string) *sql.DB {
+	t.Helper()
+	segments := strings.Split(filepath.ToSlash(db), "/")
+	for i, seg := range segments {
+		segments[i] = url.PathEscape(seg)
+	}
+	conn, err := sql.Open("sqlite", "file:"+strings.Join(segments, "/")+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatalf("open the database: %v", err)
+	}
+	return conn
+}
+
+// dja275ServeSeedDB seeds the sweep fixture rows in the serve database
+// before serve opens it: one ended row past the 30-day retention (with
+// its event), one ended exactly at it, one ended six days ago and one
+// active row.
+func dja275ServeSeedDB(t *testing.T, db string) {
+	t.Helper()
+	// The registry open creates the schema; the rows go in through a
+	// plain connection, as the tests are in a package that cannot
+	// reach the store's connection.
+	seed, err := registry.Open(db, registry.Options{Now: func() time.Time { return serveFixedNow }})
+	if err != nil {
+		t.Fatalf("seed Open: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+	conn := dja275ServeDBConn(t, db)
+	defer conn.Close()
+	now := serveFixedNow.Unix()
+	r := func(chave string, encerrado int, eu int64) {
+		t.Helper()
+		var euv interface{}
+		if encerrado == 1 {
+			euv = eu
+		}
+		if _, err := conn.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, encerrado, encerrado_unix, ultima_atividade, ultima_atividade_unix)
+			VALUES('node-a', ?, 'job', ?, ?, ?, ?, ?)`, chave, chave, encerrado, euv, serveFixedNow.Format(outbox.TSLayout), now); err != nil {
+			t.Fatalf("seed %s: %v", chave, err)
+		}
+		if _, err := conn.Exec(`INSERT INTO events(maquina, chave, seq, ts, tipo, resumo)
+			VALUES('node-a', ?, 1, '2026-01-01T00:00:00-03:00', 'note', 'x')`, chave); err != nil {
+			t.Fatalf("seed the event of %s: %v", chave, err)
+		}
+	}
+	r("j-gone", 1, now-30*24*3600-1)
+	r("j-border", 1, now-30*24*3600)
+	r("j-recent", 1, now-6*24*3600)
+	r("j-active", 0, 0)
+}
+
+// dja275ServeHealthCounts reads the health counts of the served registry.
+func dja275ServeHealthCounts(t *testing.T, base string) (jobs, sessions map[string]int) {
+	t.Helper()
+	resp, err := http.Get(base + "/v1/health")
+	if err != nil {
+		t.Fatalf("GET /v1/health: %v", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read the health answer: %v", err)
+	}
+	var body struct {
+		Status string `json:"status"`
+		Counts struct {
+			Jobs     map[string]int `json:"jobs"`
+			Sessions map[string]int `json:"sessions"`
+		} `json:"counts"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil || body.Status != "ok" {
+		t.Fatalf("health body %q: %v", data, err)
+	}
+	return body.Counts.Jobs, body.Counts.Sessions
+}
+
+// TestServeSweepLoop: with the injected interval, the sweep runs with no
+// new request: it deletes the row ended 30 days and 1 second ago (with
+// its event) and keeps the row ended exactly 30 days ago, the row ended
+// six days ago and the active row; the loop stops with the serve
+// context, and serve returns 0.
+func TestServeSweepLoop(t *testing.T) {
+	dbDir := t.TempDir()
+	db := filepath.Join(dbDir, "registry.db")
+	cfgDir := t.TempDir()
+	dja275ServeSeedDB(t, db)
+	serveSweepInterval = 500 * time.Millisecond
+	var exited bool
+	base, exitCh, cancel, _, _ := startServe(t, cfgDir, db, "--machines", "")
+	t.Cleanup(func() {
+		serveSweepInterval = 24 * time.Hour
+		cancel()
+		if !exited {
+			select {
+			case <-exitCh:
+			case <-time.After(15 * time.Second):
+			}
+		}
+	})
+	// No ingest or poll: the sweep alone moves the state. Poll the
+	// health counts with a bounded deadline until the sweep has run.
+	deadline := time.Now().Add(10 * time.Second)
+	var jobs, sessions map[string]int
+	for {
+		jobs, sessions = dja275ServeHealthCounts(t, base)
+		if jobs["total"] == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sweep never ran: jobs counts = %v (want total 3)", jobs)
+		}
+		select {
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	// j-gone is gone; j-border, j-recent and j-active are kept: total 3,
+	// active 1, ended 2, protected ended 1 (the 6-day row inside the
+	// 7-day fence; the 30-day row is outside it).
+	for k, want := range map[string]int{"total": 3, "active": 1, "ended": 2, "protected_ended": 1} {
+		if jobs[k] != want {
+			t.Errorf("jobs counts[%s] = %d, want %d (full: %v)", k, jobs[k], want, jobs)
+		}
+	}
+	for k, want := range map[string]int{"total": 0, "active": 0, "ended": 0, "protected_ended": 0} {
+		if sessions[k] != want {
+			t.Errorf("sessions counts[%s] = %d, want %d (full: %v)", k, sessions[k], want, sessions)
+		}
+	}
+	// The serve context cancels: the sweep loop ends with it, and serve
+	// returns 0 (it waits for the loop before closing the store).
+	cancel()
+	select {
+	case code := <-exitCh:
+		exited = true
+		if code != 0 {
+			t.Fatalf("serve exit = %d, want 0 after cancel", code)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("serve did not return after the context cancel (the sweep loop is still running)")
+	}
+}
+
+// dja275ServeCreateFaultTrigger opens the registry database with a plain
+// connection (before serve opens it) and creates the fault trigger:
+// every jobs delete aborts, so every sweep fails inside its transaction.
+func dja275ServeCreateFaultTrigger(t *testing.T, db string) {
+	t.Helper()
+	conn := dja275ServeDBConn(t, db)
+	defer conn.Close()
+	if _, err := conn.Exec(`CREATE TRIGGER dja275_fail BEFORE DELETE ON jobs
+		BEGIN SELECT RAISE(ABORT, 'dja275 sweep fault'); END`); err != nil {
+		t.Fatalf("create the fault trigger: %v", err)
+	}
+}
+
+// TestServeSweepFailureKeepsServing: a failed sweep writes the one line
+// on stderr, without path or key, and the serve keeps serving.
+func TestServeSweepFailureKeepsServing(t *testing.T) {
+	dbDir := t.TempDir()
+	db := filepath.Join(dbDir, "registry.db")
+	cfgDir := t.TempDir()
+	dja275ServeSeedDB(t, db)
+	dja275ServeCreateFaultTrigger(t, db)
+	serveSweepInterval = 500 * time.Millisecond
+	var exited bool
+	base, exitCh, cancel, _, errb := startServe(t, cfgDir, db, "--machines", "")
+	t.Cleanup(func() {
+		serveSweepInterval = 24 * time.Hour
+		cancel()
+		if !exited {
+			select {
+			case <-exitCh:
+			case <-time.After(15 * time.Second):
+			}
+		}
+	})
+	line := errb.nextLine(t, 10*time.Second)
+	if !strings.Contains(line, "serve: sweep failed") {
+		t.Fatalf("first stderr line = %q, want the sweep failure line", line)
+	}
+	for _, leak := range []string{db, "j-gone", "registry.db"} {
+		if strings.Contains(line, leak) {
+			t.Errorf("sweep failure line = %q, must not carry %q", line, leak)
+		}
+	}
+	// The serve keeps serving: the health endpoint still answers.
+	resp, err := http.Get(base + "/v1/health")
+	if err != nil {
+		t.Fatalf("GET /v1/health after the sweep failure: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("health after the sweep failure = %d, want 200 (the serve keeps serving)", resp.StatusCode)
+	}
+	cancel()
+	select {
+	case code := <-exitCh:
+		exited = true
+		if code != 0 {
+			t.Fatalf("serve exit = %d, want 0 after cancel", code)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("serve did not return after the context cancel")
+	}
+}
+
+// TestServeListenerFailureStopsSweep: a listener failure after the serve
+// is up exits with the failure code without an external cancellation: the
+// serve cancels the sweep context before waiting for the sweep to end, so
+// the store is closed on the serve's own exit path.
+func TestServeListenerFailureStopsSweep(t *testing.T) {
+	old := serveListen
+	listeners := make(chan net.Listener, 1)
+	serveListen = func(network, address string) (net.Listener, error) {
+		ln, err := net.Listen(network, address)
+		if err == nil {
+			select {
+			case listeners <- ln:
+			default:
+			}
+		}
+		return ln, err
+	}
+	t.Cleanup(func() { serveListen = old })
+	_, exitCh, _, _, errb := startServe(t, t.TempDir(), filepath.Join(t.TempDir(), "registry.db"), "--machines", "")
+	select {
+	case ln := <-listeners:
+		ln.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("no listener captured after the startup line")
+	}
+	select {
+	case code := <-exitCh:
+		if code != 4 {
+			t.Fatalf("serve exit = %d, want 4 (the listener failure)", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("serve did not return within 5 s of the listener failure; stderr=%q", errb.snapshot())
 	}
 }
 

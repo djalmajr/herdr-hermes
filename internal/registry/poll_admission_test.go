@@ -1,14 +1,16 @@
 package registry
 
-// Tests of the whole-request atomic admission (RC1, RC2/SR2, SR1): a
-// poll or an ingest is admitted whole or refused whole. A poll that
-// replaces the rows the budget is full of is admitted in the same poll
-// (the drop runs before the admission); a poll or a record that cannot
-// be admitted whole is refused and rolls back every write of the
-// transaction, the retention sweep included; the stored pane waits are
-// capped at MaxWaits across every node; and the 65th machine is refused
-// on the poll path. Each refused path leaves the full dump (all seven
-// tables) and the caller's input value unchanged.
+// Tests of the whole-request atomic admission of the registry (RC1,
+// RC2/SR2, SR1): a poll is admitted whole or refused whole. A poll that
+// replaces the rows it no longer sees applies the replacement in the
+// same poll (the drop runs before the inserts); a poll that cannot be
+// admitted whole (the nodes or the waits cap) is refused and rolls back
+// every write of the transaction, the retention sweep included; the
+// stored pane waits are capped at MaxWaits across every node; and the
+// 65th machine is refused on the poll path. The jobs kind has no count
+// cap (DJA-275): every new workspace row is admitted. Each refused
+// path leaves the full dump (all seven tables) and the caller's input
+// value unchanged.
 
 import (
 	"bytes"
@@ -139,106 +141,46 @@ func admAgentListBody(n int) []byte {
 	return []byte(b.String())
 }
 
-// TestAdmPollReplacementAtCapacity: a poll that replaces the poll-only
-// rows the jobs budget is full of admits the replacement in the same
-// poll, because the rows the snapshot drops free their slots before the
-// admission counts them. A row of another machine or an active pushed
-// job leaves no room and refuses the poll whole.
-func TestAdmPollReplacementAtCapacity(t *testing.T) {
-	t.Run("at the budget", func(t *testing.T) {
-		s := retStore(t, Options{MaxJobs: 1})
-		mustApplyPoll(t, s, okPoll("node-a", "",
-			PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "working"}))
-		if f := jobFact(t, s, "node-a", "ws:w1"); !f.exists || f.encerrado != 0 {
-			t.Fatalf("seed ws:w1 = %+v, want the live poll row", f)
-		}
-		p := okPoll("node-a", "",
-			PolledWorkspace{ID: "w2", Label: "hm-agent-impl-c2", AgentStatus: "working"})
-		inB := admMarshalInput(t, p)
-		if err := s.ApplyPoll(p); err != nil {
-			t.Fatalf("ApplyPoll of the replacement = %v, want admitted in the same poll", err)
-		}
-		if f := jobFact(t, s, "node-a", "ws:w1"); f.exists {
-			t.Errorf("ws:w1 = %+v, want dropped (the poll no longer lists it)", f)
-		}
-		if f := jobFact(t, s, "node-a", "ws:w2"); !f.exists || f.encerrado != 0 {
-			t.Errorf("ws:w2 = %+v, want admitted in the same poll", f)
-		}
-		if n := tableCount(t, s, "jobs"); n != 1 {
-			t.Errorf("jobs rows = %d, want 1", n)
-		}
-		res, err := s.Check(CheckRequest{Agente: "agent", Workspace: "hm-agent-impl-c2"})
-		if err != nil {
-			t.Fatalf("Check of the new workspace: %v", err)
-		}
-		if res.Status != CheckDuplicate {
-			t.Errorf("check of the workspace the poll just reported = %s, want duplicate", res.Status)
-		}
-		admInputUnchanged(t, p, inB)
-	})
-	t.Run("with a protected fence", func(t *testing.T) {
-		s := retStore(t, Options{MaxJobs: 2})
-		retEndedJob(t, s, "node-a", "job-fence", retSeed1Day)
-		mustApplyPoll(t, s, okPoll("node-a", "",
-			PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "working"}))
-		mustApplyPoll(t, s, okPoll("node-a", "",
-			PolledWorkspace{ID: "w2", Label: "hm-agent-impl-c2", AgentStatus: "working"}))
-		if f := jobFact(t, s, "node-a", "job-fence"); !f.exists || f.encerrado != 1 {
-			t.Errorf("job-fence = %+v, want the protected fence kept", f)
-		}
-		if f := jobFact(t, s, "node-a", "ws:w1"); f.exists {
-			t.Errorf("ws:w1 = %+v, want dropped", f)
-		}
-		if f := jobFact(t, s, "node-a", "ws:w2"); !f.exists || f.encerrado != 0 {
-			t.Errorf("ws:w2 = %+v, want admitted without evicting the fence", f)
-		}
-	})
-	t.Run("other machine rows leave no room", func(t *testing.T) {
-		s := retStore(t, Options{MaxJobs: 1})
-		mustApplyPoll(t, s, okPoll("node-a", "",
-			PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "working"}))
-		// A legacy row of another machine occupies the budget.
-		retActiveJob(t, s, "node-b", "job-b1")
-		before := retDump(t, s)
-		p := okPoll("node-a", "",
-			PolledWorkspace{ID: "w2", Label: "hm-agent-impl-c2", AgentStatus: "working"})
-		inB := admMarshalInput(t, p)
-		err := s.ApplyPoll(p)
-		admCheckRefusal(t, s, err, "jobs", before)
-		if f := jobFact(t, s, "node-a", "ws:w1"); !f.exists {
-			t.Errorf("ws:w1 = %+v, want still present (the refused poll rolled back its drop)", f)
-		}
-		if f := jobFact(t, s, "node-b", "job-b1"); !f.exists || f.encerrado != 0 {
-			t.Errorf("job-b1 = %+v, want untouched (another machine's row)", f)
-		}
-		admInputUnchanged(t, p, inB)
-	})
-	t.Run("pushed job fills the budget", func(t *testing.T) {
-		s := retStore(t, Options{MaxJobs: 1})
-		if !mustIngest(t, s, retJobEventRec("job-1", 1, jobapi.TypeAccepted)) {
-			t.Fatal("job-1: applied = false")
-		}
-		before := retDump(t, s)
-		p := okPoll("node-a", "",
-			PolledWorkspace{ID: "w9", Label: "hm-agent-impl-c9", AgentStatus: "working"})
-		inB := admMarshalInput(t, p)
-		err := s.ApplyPoll(p)
-		admCheckRefusal(t, s, err, "jobs", before)
-		if f := jobFact(t, s, "node-a", "job-1"); !f.exists || f.encerrado != 0 {
-			t.Errorf("pushed job = %+v, want kept (an active pushed job is not dropped)", f)
-		}
-		if f := jobFact(t, s, "node-a", "ws:w9"); f.exists {
-			t.Errorf("ws:w9 = %+v, want no row (the new workspace was refused whole)", f)
-		}
-		res, err := s.Check(CheckRequest{Agente: "agent", Workspace: "hm-agent-impl-c9"})
-		if err != nil {
-			t.Fatalf("Check of the new workspace: %v", err)
-		}
-		if res.Status != CheckOK {
-			t.Errorf("check of the refused workspace = %s, want ok (nothing was admitted)", res.Status)
-		}
-		admInputUnchanged(t, p, inB)
-	})
+// TestAdmPollReplacementAppliesInSamePoll: a poll that replaces the
+// poll-only rows it no longer sees applies the replacement in the same
+// poll, because the rows the snapshot drops leave before the new rows
+// are inserted; rows of another machine and active pushed jobs are
+// never touched. The jobs kind has no count cap (DJA-275): every new
+// workspace row is admitted.
+func TestAdmPollReplacementAppliesInSamePoll(t *testing.T) {
+	s := retStore(t, Options{})
+	mustApplyPoll(t, s, okPoll("node-a", "",
+		PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "working"}))
+	if f := jobFact(t, s, "node-a", "ws:w1"); !f.exists || f.encerrado != 0 {
+		t.Fatalf("seed ws:w1 = %+v, want the live poll row", f)
+	}
+	retActiveJob(t, s, "node-b", "job-b1")
+	p := okPoll("node-a", "",
+		PolledWorkspace{ID: "w2", Label: "hm-agent-impl-c2", AgentStatus: "working"})
+	inB := admMarshalInput(t, p)
+	if err := s.ApplyPoll(p); err != nil {
+		t.Fatalf("ApplyPoll of the replacement = %v, want admitted in the same poll", err)
+	}
+	if f := jobFact(t, s, "node-a", "ws:w1"); f.exists {
+		t.Errorf("ws:w1 = %+v, want dropped (the poll no longer lists it)", f)
+	}
+	if f := jobFact(t, s, "node-a", "ws:w2"); !f.exists || f.encerrado != 0 {
+		t.Errorf("ws:w2 = %+v, want admitted in the same poll", f)
+	}
+	if f := jobFact(t, s, "node-b", "job-b1"); !f.exists || f.encerrado != 0 {
+		t.Errorf("job-b1 = %+v, want untouched (another machine's row)", f)
+	}
+	if n := tableCount(t, s, "jobs"); n != 2 {
+		t.Errorf("jobs rows = %d, want 2 (one dropped, one inserted, the other machine's row kept)", n)
+	}
+	res, err := s.Check(CheckRequest{Agente: "agent", Workspace: "hm-agent-impl-c2"})
+	if err != nil {
+		t.Fatalf("Check of the new workspace: %v", err)
+	}
+	if res.Status != CheckDuplicate {
+		t.Errorf("check of the workspace the poll just reported = %s, want duplicate", res.Status)
+	}
+	admInputUnchanged(t, p, inB)
 }
 
 // TestAdmPollRefusalRollsBackReconciledRows: a snapshot that replaces
@@ -247,7 +189,7 @@ func TestAdmPollReplacementAtCapacity(t *testing.T) {
 // reconciled drop and the admitted row roll back with the refusal.
 func TestAdmPollRefusalRollsBackReconciledRows(t *testing.T) {
 	t.Run("waits over the cap", func(t *testing.T) {
-		s := retStore(t, Options{MaxJobs: 1})
+		s := retStore(t, Options{})
 		mustApplyPoll(t, s, okPoll("node-a", "",
 			PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "working"}))
 		before := retDump(t, s)
@@ -269,7 +211,7 @@ func TestAdmPollRefusalRollsBackReconciledRows(t *testing.T) {
 		admInputUnchanged(t, p, inB)
 	})
 	t.Run("duplicate blocked pane id", func(t *testing.T) {
-		s := retStore(t, Options{MaxJobs: 1})
+		s := retStore(t, Options{})
 		mustApplyPoll(t, s, okPoll("node-a", "",
 			PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "working"}))
 		before := retDump(t, s)
@@ -293,45 +235,6 @@ func TestAdmPollRefusalRollsBackReconciledRows(t *testing.T) {
 		}
 		admInputUnchanged(t, p, inB)
 	})
-}
-
-// TestAdmPollMixedLateBudgetRefusal: a poll that mixes the known rows
-// and the new ones is admitted only whole: when the first new rows fit
-// and a later one does not, nothing of the poll is applied.
-func TestAdmPollMixedLateBudgetRefusal(t *testing.T) {
-	s := retStore(t, Options{MaxJobs: 3})
-	mustApplyPoll(t, s, okPoll("node-a", "",
-		PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "working"}))
-	if !mustIngest(t, s, retJobEventRec("job-1", 1, jobapi.TypeAccepted)) {
-		t.Fatal("job-1: applied = false")
-	}
-	// The budget holds ws:w1 and job-1: the first new workspace fits,
-	// the next ones cannot (the remaining rows are all active).
-	before := retDump(t, s)
-	p := okPoll("node-a", "",
-		PolledWorkspace{ID: "w1", Label: "hm-agent-impl-c1", AgentStatus: "idle"},
-		PolledWorkspace{ID: "a", Label: "hm-agent-impl-a", AgentStatus: "working"},
-		PolledWorkspace{ID: "b", Label: "hm-agent-impl-b", AgentStatus: "working"},
-		PolledWorkspace{ID: "c", Label: "hm-agent-impl-c", AgentStatus: "working"})
-	inB := admMarshalInput(t, p)
-	err := s.ApplyPoll(p)
-	admCheckRefusal(t, s, err, "jobs", before)
-	// Nothing applied: the first new row was not inserted and the known
-	// row was not updated (the poll changed its status).
-	if f := jobFact(t, s, "node-a", "ws:a"); f.exists {
-		t.Errorf("ws:a = %+v, want the first new row rolled back", f)
-	}
-	if f := jobFact(t, s, "node-a", "ws:w1"); !f.exists {
-		t.Errorf("ws:w1 = %+v, want still present", f)
-	}
-	var status string
-	if err := s.db.QueryRow(`SELECT herdr_status FROM jobs WHERE maquina = 'node-a' AND chave = 'ws:w1'`).Scan(&status); err != nil {
-		t.Fatalf("herdr_status: %v", err)
-	}
-	if status != "working" {
-		t.Errorf("herdr_status of the known row = %q, want the stored value kept (the update was rolled back)", status)
-	}
-	admInputUnchanged(t, p, inB)
 }
 
 // TestAdmPollNodeCap: the 65th distinct machine is refused on the poll
@@ -574,108 +477,19 @@ func TestAdmWaitsLargeAgentListRefusedWhole(t *testing.T) {
 	admInputUnchanged(t, p, inB)
 }
 
-// TestAdmIngestRefusalAtomic: a refused record rolls back the whole
-// transaction, the retention sweep included: the jobs and sessions
-// refusals leave the 31-day eligible row and every table
-// byte-identical, the error text unchanged, and the next successful
-// request sweeps the row.
-func TestAdmIngestRefusalAtomic(t *testing.T) {
-	t.Run("jobs refusal with the 31-day row", func(t *testing.T) {
-		s := retStore(t, Options{MaxJobs: 2})
-		retEndedJob(t, s, "node-a", "f1", retSeed1Day)
-		retEndedJob(t, s, "node-a", "f2", retSeed1Day)
-		retEndedJob(t, s, "node-a", "job-past", retSeed31Day)
-		before := retDump(t, s)
-		rec := recordBase(func(r *outbox.Record) {
-			r.JobID = ptr("j-new")
-			r.IdempotencyKey = "j-new:1"
-			r.Dados = eventData(1, jobapi.TypeAccepted, "x", nil)
-		})
-		inB := admMarshalInput(t, rec)
-		_, err := s.Ingest(rec)
-		retWantRefusal(t, err, "jobs")
-		after := retDump(t, s)
-		for table, rows := range before {
-			if !rowsEqual(after[table], rows) {
-				t.Errorf("table %s changed by the refused record:\nbefore: %v\nafter: %v", table, rows, after[table])
-			}
-		}
-		if f := jobFact(t, s, "node-a", "job-past"); !f.exists || f.encerrado != 1 {
-			t.Errorf("the 31-day row after the refusal = %+v, want it to survive", f)
-		}
-		admInputUnchanged(t, rec, inB)
-		// The next successful request sweeps the 31-day row: an event
-		// of a tombstoned job is ignored without an error, so the
-		// request succeeds and its sweep commits.
-		applied, err := s.Ingest(retJobEventRec("f1", 1, jobapi.TypeAccepted))
-		if err != nil {
-			t.Fatalf("Ingest of the tombstoned job event: %v", err)
-		}
-		if applied {
-			t.Errorf("tombstoned job event: applied = true, want false")
-		}
-		if f := jobFact(t, s, "node-a", "job-past"); f.exists {
-			t.Errorf("the 31-day row after the next successful request = %+v, want swept", f)
-		}
-	})
-	t.Run("sessions refusal with the 31-day row", func(t *testing.T) {
-		s := retStore(t, Options{MaxSessions: 2})
-		retEndedSessao(t, s, "node-a", "sessao:org001/repo#feat/a", retSeed1Day)
-		retEndedSessao(t, s, "node-a", "sessao:org002/repo#feat/b", retSeed1Day)
-		retEndedSessao(t, s, "node-a", "sessao:org003/repo#feat/c", retSeed31Day)
-		before := retDump(t, s)
-		rec := sessaoRec("2026-10-10T11:30:00-03:00", "end", "card-9", "feat/x", "", "")
-		inB := admMarshalInput(t, rec)
-		_, err := s.Ingest(rec)
-		retWantRefusal(t, err, "sessions")
-		after := retDump(t, s)
-		for table, rows := range before {
-			if !rowsEqual(after[table], rows) {
-				t.Errorf("table %s changed by the refused record:\nbefore: %v\nafter: %v", table, rows, after[table])
-			}
-		}
-		if f := jobFact(t, s, "node-a", "sessao:org003/repo#feat/c"); !f.exists || f.encerrado != 1 {
-			t.Errorf("the 31-day session row after the refusal = %+v, want it to survive", f)
-		}
-		admInputUnchanged(t, rec, inB)
-		// The next successful request sweeps the 31-day row.
-		if !mustIngest(t, s, recordBase(nil)) {
-			t.Fatal("recordBase: applied = false")
-		}
-		if f := jobFact(t, s, "node-a", "sessao:org003/repo#feat/c"); f.exists {
-			t.Errorf("the 31-day session row after the next successful request = %+v, want swept", f)
-		}
-	})
-	t.Run("new machine refused leaves no node row", func(t *testing.T) {
-		s := retStore(t, Options{MaxSessions: 2})
-		retEndedSessao(t, s, "node-a", "sessao:org001/repo#feat/a", retSeed1Day)
-		retEndedSessao(t, s, "node-a", "sessao:org002/repo#feat/b", retSeed1Day)
-		rec := sessaoRec("2026-10-10T11:30:00-03:00", "end", "card-9", "feat/x", "", "")
-		rec.Maquina = "node-new"
-		rec.IdempotencyKey = "node-new:s1"
-		_, err := s.Ingest(rec)
-		retWantRefusal(t, err, "sessions")
-		var n int
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE maquina = 'node-new'`).Scan(&n); err != nil {
-			t.Fatalf("count nodes: %v", err)
-		}
-		if n != 0 {
-			t.Errorf("nodes rows for the new machine = %d, want 0 (the refusal left no trace)", n)
-		}
-	})
-}
-
 // TestAdmAdmissionConcurrencyAtCap: two Store values on one file with
-// parallel goroutines issuing polls and ingests at the caps end with
-// every cap respected and only valid refusals; the refused requests
-// rolled back nothing half-applied. Run with -race.
+// parallel goroutines issuing polls and ingests end with every cap
+// respected and only valid refusals; the refused requests rolled back
+// nothing half-applied. The jobs kind has no count cap (DJA-275): every
+// ingest is admitted, and only the polls over the waits cap are refused.
+// Run with -race.
 func TestAdmAdmissionConcurrencyAtCap(t *testing.T) {
 	path := pathFor(t)
-	s1, err := Open(path, Options{Now: fixedClock(), MaxJobs: 3})
+	s1, err := Open(path, Options{Now: fixedClock()})
 	if err != nil {
 		t.Fatalf("Open store 1: %v", err)
 	}
-	s2, err := Open(path, Options{Now: fixedClock(), MaxJobs: 3})
+	s2, err := Open(path, Options{Now: fixedClock()})
 	if err != nil {
 		t.Fatalf("Open store 2: %v", err)
 	}
@@ -692,13 +506,17 @@ func TestAdmAdmissionConcurrencyAtCap(t *testing.T) {
 		errs = append(errs, err)
 		mu.Unlock()
 	}
-	// Six ingests of distinct new jobs against the jobs budget of 3.
+	// Six ingests of distinct new jobs: the kind has no cap, so every
+	// one is admitted, across the two stores.
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			rec := retJobEventRec(fmt.Sprintf("job-p%d", i), 1, jobapi.TypeAccepted)
-			_, err := stores[i%2].Ingest(rec)
+			applied, err := stores[i%2].Ingest(rec)
+			if err == nil && !applied {
+				err = fmt.Errorf("ingest %d: applied = false with no error", i)
+			}
 			record(err)
 		}(i)
 	}
@@ -723,10 +541,10 @@ func TestAdmAdmissionConcurrencyAtCap(t *testing.T) {
 			t.Errorf("unexpected refusal class: %v", err)
 		}
 	}
-	// Exactly the jobs budget of rows is admitted, across the two
-	// stores, and no poll row survived: every poll was refused whole.
-	if n := retCountKind(t, s1, kindJobs); n != 3 {
-		t.Errorf("jobs kind rows = %d, want exactly the budget 3", n)
+	// Every ingest was admitted and no poll row survived: every poll was
+	// refused whole on the waits cap.
+	if n := tableCount(t, s1, "jobs"); n != 6 {
+		t.Errorf("jobs rows = %d, want 6 (every ingest was admitted: the kind has no cap)", n)
 	}
 	if n := tableCount(t, s1, "waits"); n != 990 {
 		t.Errorf("waits = %d, want 990 (every poll was refused whole)", n)
@@ -741,7 +559,7 @@ func TestAdmAdmissionConcurrencyAtCap(t *testing.T) {
 	if n := tableCount(t, s1, "nodes"); n > MaxNodes {
 		t.Errorf("nodes = %d, want at most the cap %d", n, MaxNodes)
 	}
-	if refusals != 7 {
-		t.Errorf("refusals = %d, want 7 (the three over-budget jobs and the four over-cap polls)", refusals)
+	if refusals != 4 {
+		t.Errorf("refusals = %d, want 4 (the four over-cap polls)", refusals)
 	}
 }

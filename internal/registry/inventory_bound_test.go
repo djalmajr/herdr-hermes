@@ -108,9 +108,14 @@ func newBoundVals() boundVals {
 	return v
 }
 
-// TestInventoryComposedStateBound: one database at every cap at once, with
-// every value at its worst escaped bound, encoded the way the server
-// encodes it, stays under MaxInventoryBytes. The public paths seed one row
+// TestInventoryComposedStateBound: one database with the reference jobs
+// and sessions populations (1000 rows each, the pre-DJA-275 budgets) at
+// every other cap at once, with every value at its worst escaped bound,
+// encoded the way the server encodes it, stays under MaxInventoryBytes.
+// The jobs and sessions kinds have no row cap since DJA-275, so the
+// population can grow past the reference; an inventory larger than the
+// bound fails the jobs client, and the high-count warn is the advance
+// signal for that, not a guarantee of it. The public paths seed one row
 // of each table and every pane wait, so the real bounds apply; the bulk
 // rows go in through direct SQL inserts of the same stored values (the
 // public path would take too long: 999 jobs through Ingest with their
@@ -121,6 +126,8 @@ func newBoundVals() boundVals {
 // though the poll workspace rows cannot hold one, and the public job's
 // claim-bound facts and the poll's workspace facts are on the same row.
 func TestInventoryComposedStateBound(t *testing.T) {
+	const refJobs = 1000
+	const refSessions = 1000
 	s := openStore(t)
 	v := newBoundVals()
 	now := fixedNow
@@ -220,7 +227,7 @@ func TestInventoryComposedStateBound(t *testing.T) {
 	// and one worst poll workspace row on the second node. Every row
 	// carries its full event ring at the field bounds (the overcount: the
 	// poll workspace rows cannot hold events).
-	for n := 0; n < MaxJobs-1; n++ {
+	for n := 0; n < refJobs-1; n++ {
 		m := m1
 		if n > 0 {
 			m = v.mach[2+n%62]
@@ -246,7 +253,7 @@ func TestInventoryComposedStateBound(t *testing.T) {
 		}
 	}
 	sessCols := `INSERT INTO jobs(maquina, chave, origem, job_id, card, branch, pr, projeto, fonte_push, sessao_ts_unix, sessao_seq, encerrado, ultima_atividade, ultima_atividade_unix) VALUES(` + ph(14) + `)`
-	for n := 0; n < MaxSessions-1; n++ {
+	for n := 0; n < refSessions-1; n++ {
 		m := v.mach[1+n%63]
 		// The key is the row's own projeto and branch, as the public
 		// path builds it; the first projeto part carries a unique run so
@@ -291,8 +298,8 @@ func TestInventoryComposedStateBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
-	if len(inv.Nodes) != MaxNodes || len(inv.Jobs) != MaxJobs+MaxSessions || len(inv.Esperas) != MaxWaits || len(inv.Claims) != MaxClaims || len(inv.Politicas) != MaxPolicies || len(inv.Pastas) != MaxFolders {
-		t.Fatalf("inventory rows = %d nodes, %d jobs, %d esperas, %d claims, %d politicas, %d pastas; want every table at its cap", len(inv.Nodes), len(inv.Jobs), len(inv.Esperas), len(inv.Claims), len(inv.Politicas), len(inv.Pastas))
+	if len(inv.Nodes) != MaxNodes || len(inv.Jobs) != refJobs+refSessions || len(inv.Esperas) != MaxWaits || len(inv.Claims) != MaxClaims || len(inv.Politicas) != MaxPolicies || len(inv.Pastas) != MaxFolders {
+		t.Fatalf("inventory rows = %d nodes, %d jobs, %d esperas, %d claims, %d politicas, %d pastas; want the reference jobs and sessions populations and every other table at its cap", len(inv.Nodes), len(inv.Jobs), len(inv.Esperas), len(inv.Claims), len(inv.Politicas), len(inv.Pastas))
 	}
 	evTotal := 0
 	for i := range inv.Jobs {
@@ -300,8 +307,8 @@ func TestInventoryComposedStateBound(t *testing.T) {
 			evTotal += len(inv.Jobs[i].Eventos)
 		}
 	}
-	if evTotal != MaxJobs*DefaultEventsPerJob {
-		t.Fatalf("jobs-kind events = %d, want %d", evTotal, MaxJobs*DefaultEventsPerJob)
+	if evTotal != refJobs*DefaultEventsPerJob {
+		t.Fatalf("jobs-kind events = %d, want %d", evTotal, refJobs*DefaultEventsPerJob)
 	}
 	// The server encodes the inventory with json.Marshal plus the newline;
 	// the encoder writes the same bytes to the counting writer without

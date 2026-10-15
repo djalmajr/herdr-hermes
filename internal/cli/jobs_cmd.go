@@ -23,8 +23,10 @@ const (
 	jobsTimeout       = 30 * time.Second
 )
 
-// jobsRespCap is the most the jobs client reads from the registry: the
-// bound of a full inventory. A variable so a test can lower it.
+// jobsRespCap is the most the jobs client reads from the registry. The
+// jobs and sessions kinds have no row count cap, so an inventory may
+// exceed it: a response over the bound fails the client with its
+// current error. A variable so a test can lower it.
 var jobsRespCap = registry.MaxInventoryBytes
 
 // jobsForm is the parsed form of a jobs invocation: the subcommand, the

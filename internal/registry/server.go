@@ -43,6 +43,7 @@ const (
 type Backend interface {
 	Ingest(rec outbox.Record) (bool, error)
 	Inventory(f Filter) (Inventory, error)
+	HealthCounts() (HealthCounts, error)
 	Check(req CheckRequest) (CheckResult, error)
 	Release(id string) error
 	SetPolicy(in PolicyInput) error
@@ -189,12 +190,21 @@ func methodAllowed(method, allow string) bool {
 	return false
 }
 
-// handleHealth answers GET /v1/health.
+// handleHealth answers GET /v1/health: the status, the schema and the
+// counts of the jobs and sessions kinds, read in one read transaction.
+// No row data, only the numbers. A failed count answers the 500 error
+// JSON of the server.
 func (h *apiHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	counts, err := h.b.HealthCounts()
+	if err != nil {
+		h.fail(w, r.URL.Path, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, struct {
-		Status string `json:"status"`
-		Schema int    `json:"schema"`
-	}{"ok", SchemaVersion})
+		Status string       `json:"status"`
+		Schema int          `json:"schema"`
+		Counts HealthCounts `json:"counts"`
+	}{"ok", SchemaVersion, counts})
 }
 
 // handleIngest answers POST /v1/ingest: one outbox record, at most

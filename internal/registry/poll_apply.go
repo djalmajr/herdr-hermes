@@ -12,11 +12,11 @@ import (
 // ApplyPoll applies the outcome of polling one machine, in one
 // transaction: the node facts, the workspace rows, the disappeared rows
 // and the pane waits. The request is admitted whole or refused whole:
-// a new node past MaxNodes, a new workspace the jobs budget cannot
-// admit, a waits total past MaxWaits or a duplicate blocked pane id
-// refuses the poll and rolls back every write of the transaction, the
-// retention sweep included. A capacity refusal writes its alert line
-// after the transaction, with the kind and counts only.
+// a new node past MaxNodes or a waits total past MaxWaits refuses the
+// poll and rolls back every write of the transaction, the retention
+// sweep included. A refusal writes its alert line after the transaction,
+// with the kind and counts only. A confirmed poll runs the high-count
+// check after the transaction, outside it.
 func (s *Store) ApplyPoll(p PollResult) error {
 	if err := validateMachine(p.Maquina); err != nil {
 		return err
@@ -25,7 +25,6 @@ func (s *Store) ApplyPoll(p PollResult) error {
 	if err != nil {
 		return err
 	}
-	var newCount int
 	var nodeRefusal bool
 	err = s.tx(func(tx *sql.Tx) error {
 		now := s.now()
@@ -44,9 +43,7 @@ func (s *Store) ApplyPoll(p PollResult) error {
 			if err := touchPollNode(tx, p.Maquina, p.HerdrVersion, at); err != nil {
 				return err
 			}
-			n, err := applyPollWorkspaces(tx, s, p, at, now)
-			if err != nil {
-				newCount = n
+			if err := applyPollWorkspaces(tx, p, at, now); err != nil {
 				return err
 			}
 			return replaceWaits(tx, p, at)
@@ -69,17 +66,15 @@ func (s *Store) ApplyPoll(p PollResult) error {
 		return err
 	})
 	if err == nil {
+		// The high-count check runs after the committed transaction,
+		// outside it; it never blocks, undoes or skips the poll.
+		s.checkHighCount()
 		return nil
 	}
 	// The refusal alerts are written after the transaction, outside it,
 	// with the kind and counts only.
-	var capErr *capacityErr
 	var waitsErr *waitsRefusal
 	switch {
-	case errors.As(err, &capErr):
-		// The jobs and sessions refusal of a whole poll: the new
-		// workspaces of the snapshot were not admitted.
-		s.alertCapacity(capErr.kind, capErr.counts, newCount)
 	case errors.As(err, &waitsErr):
 		s.alertWaits(waitsErr.storedTotal, waitsErr.snapshotBlocked, MaxWaits)
 	case nodeRefusal:
@@ -122,14 +117,12 @@ func workspaceChave(label, id string) (key, origem string, ok bool) {
 // re-derives the owner of an hm row from its current label, binds the
 // matching claims and clears the rows that disappeared. The snapshot's
 // key set is computed first and the disappeared rows are dropped before
-// any new row is admitted, so a poll that replaces the rows the budget
-// is full of admits the replacement in the same poll. A new workspace
-// the jobs budget cannot admit refuses the whole poll (the poll is a
-// snapshot, not a consumed input): nothing of it is applied, the
-// transaction rolls back, and the next poll tries it again; the caller
-// writes the alert after the transaction. The first return is the new
-// workspaces of the snapshot, the alert's skipped count on a refusal.
-func applyPollWorkspaces(tx *sql.Tx, s *Store, p PollResult, at, now time.Time) (int, error) {
+// any new row is inserted, so a poll that replaces the rows it no longer
+// sees applies the replacement in the same poll. The jobs kind has no
+// count cap: every new workspace row is admitted, and a refusal of the
+// whole poll (the nodes or the waits cap) rolls everything back, the
+// reconciled drop included.
+func applyPollWorkspaces(tx *sql.Tx, p PollResult, at, now time.Time) error {
 	atTS := at.Format(outbox.TSLayout)
 	type wsInfo struct {
 		ws     PolledWorkspace
@@ -138,7 +131,6 @@ func applyPollWorkspaces(tx *sql.Tx, s *Store, p PollResult, at, now time.Time) 
 	}
 	var infos []wsInfo
 	seen := make(map[string]bool, len(p.Workspaces))
-	newCount := 0
 	for _, ws := range p.Workspaces {
 		chave, origem, ok := workspaceChave(ws.Label, ws.ID)
 		if !ok {
@@ -147,35 +139,25 @@ func applyPollWorkspaces(tx *sql.Tx, s *Store, p PollResult, at, now time.Time) 
 		}
 		row, err := jobRowOf(tx, p.Maquina, chave)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		if row != nil && row.encerrado == 1 {
 			// A tombstoned id is skipped.
 			continue
 		}
-		if row == nil {
-			newCount++
-		}
 		seen[chave] = true
 		infos = append(infos, wsInfo{ws: ws, chave: chave, origem: origem})
 	}
-	// The rows the poll no longer sees leave before any new row is
-	// admitted, so the slots they free are counted by the admission.
+	// The rows the poll no longer sees leave before the new rows are
+	// inserted.
 	if err := dropUnseen(tx, p.Maquina, seen); err != nil {
-		return 0, err
+		return err
 	}
 	for _, info := range infos {
 		ws, chave, origem := info.ws, info.chave, info.origem
 		row, err := jobRowOf(tx, p.Maquina, chave)
 		if err != nil {
-			return 0, err
-		}
-		if row == nil {
-			if _, err := s.admitNewRow(tx, kindOf(origem), now); err != nil {
-				// The whole poll is refused; the alert is written by
-				// the caller after the transaction.
-				return newCount, err
-			}
+			return err
 		}
 		// The last activity moves when the row is new, the agent is
 		// working, or the status differs from the stored one (a stored
@@ -196,7 +178,7 @@ func applyPollWorkspaces(tx *sql.Tx, s *Store, p PollResult, at, now time.Time) 
 			if _, err := tx.Exec(`INSERT INTO jobs(maquina, chave, origem, job_id, workspace, workspace_id, agente, agente_fonte, trabalho, ref, herdr_status, fonte_poll, visto_poll, ultima_atividade, ultima_atividade_unix)
 				VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				p.Maquina, chave, origem, jobID, strPtr(ws.Label), strPtr(ws.ID), agente, fonte, trabalho, ref, strPtr(ws.AgentStatus), 1, strPtr(atTS), ultima, ultimaUnix); err != nil {
-				return 0, err
+				return err
 			}
 		} else {
 			var sets []string
@@ -231,14 +213,14 @@ func applyPollWorkspaces(tx *sql.Tx, s *Store, p PollResult, at, now time.Time) 
 			}
 			args = append(args, p.Maquina, chave)
 			if _, err := tx.Exec(`UPDATE jobs SET `+strings.Join(sets, ", ")+" WHERE maquina = ? AND chave = ?", args...); err != nil {
-				return 0, err
+				return err
 			}
 		}
 		if err := bindClaim(tx, p.Maquina, chave, ws.Label, now); err != nil {
-			return 0, err
+			return err
 		}
 	}
-	return newCount, nil
+	return nil
 }
 
 // bindClaim copies the fields of the newest unexpired claim that names
