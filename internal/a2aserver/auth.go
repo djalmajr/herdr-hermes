@@ -12,6 +12,7 @@ import (
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/djalmajr/nau/internal/a2acore"
 )
@@ -124,7 +125,12 @@ func loopbackOrigin(o string) bool {
 // execution manager: while streaming is off the SDK refuses it with
 // the same unsupported-operation answer for every task id before any
 // store or manager access, so there is nothing to mask and the answer
-// stays as it is.
+// stays as it is. After the answer, the interceptor rewrites two
+// already failed answers to their stable text (After): the
+// task-not-found of a cancel, so the parked and the idle path answer
+// the one canonical body, and the contention of a send on a visible
+// task, so the caller gets the fixed busy text and not the SDK
+// internal text.
 type authInterceptor struct {
 	auth  a2acore.Authenticator
 	authz a2acore.Authorizer
@@ -168,8 +174,42 @@ var errTaskNotVisible = fmt.Errorf("executor setup failed: failed to load exec c
 // missing id, a task outside the caller's owner or project grant and an
 // interceptor without a task store. It carries no task id, owner,
 // project or store text and is not errTaskNotVisible, which is the text
-// of a send.
+// of a send. It is the canonical text of a failed cancel the SDK
+// answers as task-not-found (the After rewrite): the parked and the
+// idle path answer the same body.
 var errCancelNotVisible = fmt.Errorf("failed to cancel: cancelation failed: canceler setup failed: failed to load a task: %w", a2a.ErrTaskNotFound)
+
+// taskBusyText is the stable contention answer of a permitted send on a
+// visible task that meets another execution or write of the same task:
+// nothing was admitted, written or fenced, so the same message can be
+// sent again later.
+const taskBusyText = "a2a: task busy, retry later"
+
+// sdkExecutionInProgress and sdkCancelationInProgress copy the exact
+// texts of the two in-progress sentinels of the SDK internal taskexec
+// package, which is not exported and cannot be imported; the REST tests
+// break if the SDK changes either text.
+const (
+	sdkExecutionInProgress   = "task execution is already in progress"
+	sdkCancelationInProgress = "task cancelation is in progress"
+)
+
+// taskBusyError is one new internal error of the fixed busy text (a
+// fresh value per call, never a shared *a2a.Error).
+func taskBusyError() error { return a2a.NewError(a2a.ErrInternalError, taskBusyText) }
+
+// isContention reports whether err is the contention of a send on a
+// task with another execution or write of the same task: the SDK
+// optimistic-concurrency failure of the task store or one of the SDK
+// execution manager's in-progress sentinels (matched on the copied
+// text; the taskexec package is not exported).
+func isContention(err error) bool {
+	if errors.Is(err, taskstore.ErrConcurrentModification) {
+		return true
+	}
+	text := err.Error()
+	return strings.Contains(text, sdkExecutionInProgress) || strings.Contains(text, sdkCancelationInProgress)
+}
 
 // requireVisibleTask loads id through the scoped task store on the
 // request context (owner mask and the stored-project predicate of the
@@ -266,8 +306,33 @@ func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContex
 	return ctx, nil, nil
 }
 
-// After implements a2asrv.CallInterceptor.
-func (i *authInterceptor) After(_ context.Context, _ *a2asrv.CallContext, _ *a2asrv.Response) error {
+// After implements a2asrv.CallInterceptor. The SDK calls it on every
+// answer, the early error of a Before refusal included, and it only
+// rewrites answers that already failed: a failed CancelTask whose error
+// is a task-not-found (the SDK canceler setup scoped read failing as
+// the task does not exist, parked execution or idle alike) gets
+// errCancelNotVisible, so both paths answer the one canonical body, and
+// a failed SendMessage that is not a task-not-found and is the
+// contention of another execution or write of the same task gets
+// taskBusyError, so the caller sees the stable busy answer and not the
+// SDK internal text. The Before prechecks run first and untouched: a
+// task the caller cannot see never reaches the busy answer (it stays
+// 404) and the busy answer is never a 404. Every other answer keeps its
+// error, status and reason.
+func (i *authInterceptor) After(_ context.Context, callCtx *a2asrv.CallContext, resp *a2asrv.Response) error {
+	if resp == nil || resp.Err == nil {
+		return nil
+	}
+	switch callCtx.Method() {
+	case "CancelTask":
+		if errors.Is(resp.Err, a2a.ErrTaskNotFound) {
+			resp.Err = errCancelNotVisible
+		}
+	case "SendMessage":
+		if !errors.Is(resp.Err, a2a.ErrTaskNotFound) && isContention(resp.Err) {
+			resp.Err = taskBusyError()
+		}
+	}
 	return nil
 }
 

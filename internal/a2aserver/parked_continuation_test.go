@@ -29,8 +29,10 @@ const pcMissingID = "01a00000-0000-7000-8000-000000000000"
 // missing id must keep rendering exactly this.
 const pcMissingBody = `{"error":{"code":404,"status":"NOT_FOUND","message":"executor setup failed: failed to load exec ctx: task loading failed: task not found","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"a2a-protocol.org","metadata":{"timestamp":""},"reason":"TASK_NOT_FOUND"}]}}`
 
-// pcInProgress is the SDK refusal of a continuation on a task whose
-// execution is still parked; it is the contract of a visible task.
+// pcInProgress is the SDK refusal text of a continuation on a task
+// whose execution is still parked; the visible parked task now gets the
+// stable busy answer instead, so it is a forbidden substring of every
+// answer the busy rewrite covers.
 const pcInProgress = "task execution is already in progress"
 
 // pcWire is what one response looked like on the wire.
@@ -260,13 +262,13 @@ func TestParkedContinuationInvisibleIsTaskNotFound(t *testing.T) {
 	}
 
 	// Restoring the grant makes the original task visible again; the
-	// owner then gets the SDK's own answer for a parked task.
+	// owner then gets the stable busy answer for the parked task.
 	f.pcRestore()
 	if got, err := f.cA.Get(ctxT(t), secretID); err != nil || got.ID != f.secret.ID {
 		t.Fatalf("get after restore = %+v, %v", got, err)
 	}
-	if _, err := pcContinue(t, f.cA, f.recA, secretID, f.secret.ContextID, "pc-restored"); err == nil || !strings.Contains(err.Error(), pcInProgress) {
-		t.Errorf("continuation after restore err = %v, want %q", err, pcInProgress)
+	if _, err := pcContinue(t, f.cA, f.recA, secretID, f.secret.ContextID, "pc-restored"); err == nil || err.Error() != taskBusyText {
+		t.Errorf("continuation after restore err = %v, want %q", err, taskBusyText)
 	}
 	waitLive(t, f.e.srv, 1)
 }
@@ -293,10 +295,11 @@ func TestParkedContinuationStoreFailureIsFixedServerError(t *testing.T) {
 	}
 }
 
-// TestParkedContinuationVisibleKeepsSDKRefusal: the controls on the
-// same kind of fixture: a still-granted parked task keeps the SDK's
-// in-progress refusal and a still-granted task is readable.
-func TestParkedContinuationVisibleKeepsSDKRefusal(t *testing.T) {
+// TestParkedContinuationVisibleIsBusy: the controls on the same kind
+// of fixture: a still-granted parked task gets the stable busy answer
+// (status and reason of the SDK refusal, the fixed busy message) and a
+// still-granted task is readable.
+func TestParkedContinuationVisibleIsBusy(t *testing.T) {
 	f := pcSetup(t)
 	public := sendTask(t, f.cA, idfxSend("org/public", "s-2", "m-2"))
 	waitLive(t, f.e.srv, 2)
@@ -306,11 +309,14 @@ func TestParkedContinuationVisibleKeepsSDKRefusal(t *testing.T) {
 		t.Fatalf("get of the still-granted task = %+v, %v", got, err)
 	}
 	got, err := pcContinue(t, f.cA, f.recA, string(public.ID), public.ContextID, "pc-public")
-	if err == nil || !strings.Contains(err.Error(), pcInProgress) {
-		t.Errorf("visible parked continuation err = %v, want %q", err, pcInProgress)
+	if err == nil || !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
+		t.Fatalf("visible parked continuation err = %v, want the internal error %q", err, taskBusyText)
 	}
 	if got.status != http.StatusInternalServerError {
-		t.Errorf("visible parked continuation status = %d (%s), want the SDK's 500", got.status, got.body)
+		t.Errorf("visible parked continuation status = %d (%s), want 500", got.status, got.body)
+	}
+	if b := strings.TrimSpace(pcNorm(got.body)); b != ctBusyBody {
+		t.Errorf("visible parked continuation body = %s, want %s", b, ctBusyBody)
 	}
 	if errors.Is(err, a2a.ErrTaskNotFound) {
 		t.Errorf("visible parked continuation is task not found: %v", err)
