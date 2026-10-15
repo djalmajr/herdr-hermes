@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,12 @@ const sendMaxMessage = 2048
 const sendCaptureLimit = 4096
 
 // NotifySender delivers notification messages with `herdr-soho send`.
+// The child never receives the process's HERDR_PANE_ID: the
+// notification is sent by Nau itself, not by a pane, so herdr-soho
+// must not attribute the message to the pane that fired the hook or
+// that runs the serve, and must not refuse it as a worker report when
+// that pane is a worker. Every other variable of Environ is forwarded
+// as is.
 type NotifySender struct {
 	Bin     string        // argv0, as soho.Runner.Bin
 	Environ []string      // exact child environment, as soho.Runner.Environ
@@ -41,8 +48,11 @@ type NotifySender struct {
 // Send implements notify.Sender. It refuses to run the command for an
 // invalid ref or message; otherwise it runs `herdr-soho send <ref>
 // <message> --now --timeout <ms>` as an argv subprocess on a fresh
-// Runner (the runner is not safe for concurrent use, and Send is),
-// bounds the process at Timeout plus sendGrace, and maps the child
+// Runner (the runner is not safe for concurrent use, and Send is)
+// with a copy of Environ without the HERDR_PANE_ID entry — the child
+// does not inherit the pane identity of the calling process, because
+// the notification is sent by Nau, not by a pane — bounds the process
+// at Timeout plus sendGrace, and maps the child
 // outcome to a fixed SendResult. The child's stdout is kept bounded
 // only to classify the status word: it is never returned, logged or
 // stored.
@@ -54,7 +64,7 @@ func (s NotifySender) Send(ctx context.Context, ref, message string) notify.Send
 	if timeout <= 0 {
 		timeout = sendDefaultTimeout
 	}
-	r := Runner{Bin: s.Bin, Environ: s.Environ}
+	r := Runner{Bin: s.Bin, Environ: withoutPaneID(s.Environ)}
 	var out captureWriter
 	argv := []string{"send", ref, message, "--now", "--timeout", strconv.FormatInt(timeout.Milliseconds(), 10)}
 	bound := s.Bound
@@ -132,6 +142,45 @@ func statusWord(data []byte) string {
 	default:
 		return "accepted"
 	}
+}
+
+// paneIDKey is the environment variable herdr-soho uses to identify
+// the sending pane. A notification is sent by Nau, not by a pane, so
+// the send child never receives it: herdr-soho must not attribute the
+// message to the pane that fired the hook or that runs the serve, and
+// must not refuse it as a worker report when that pane is a worker.
+const paneIDKey = "HERDR_PANE_ID"
+
+// withoutPaneID returns env without the entries whose key is exactly
+// HERDR_PANE_ID (the key is compared before the first '='; on Windows
+// the comparison is case-insensitive, because environment keys there
+// are case-insensitive). Longer keys such as HERDR_PANE_ID_EXTRA are
+// kept. It never mutates env, keeps the remaining entries in order,
+// and returns env unchanged (nil stays nil) when nothing is removed.
+func withoutPaneID(env []string) []string {
+	kept := make([]string, 0, len(env))
+	for _, kv := range env {
+		if !keyIsPaneID(kv) {
+			kept = append(kept, kv)
+		}
+	}
+	if len(kept) == len(env) {
+		return env
+	}
+	return kept
+}
+
+// keyIsPaneID reports whether the environment entry kv has the key
+// HERDR_PANE_ID exactly.
+func keyIsPaneID(kv string) bool {
+	key := kv
+	if i := strings.IndexByte(kv, '='); i >= 0 {
+		key = kv[:i]
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(key, paneIDKey)
+	}
+	return key == paneIDKey
 }
 
 // captureWriter keeps at most the first sendCaptureLimit bytes of the
