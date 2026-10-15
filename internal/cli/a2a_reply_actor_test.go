@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,18 +84,30 @@ func a2aReplyActorRegisterOwner(t *testing.T, cfgDir, project, owner string) {
 
 // a2aReplyActorRun invokes `a2a reply` with HERDR_PANE_ID set to paneID
 // ("" for the operator outside Herdr) and returns stdout, stderr and the
-// exit code.
+// exit code. It delegates to a2aReplyActorRunNamed with the pane-identity
+// resolver unset; the pane identity is never needed by the reference
+// cases.
 func a2aReplyActorRun(t *testing.T, cfgDir, paneID string, args ...string) (string, string, int) {
+	t.Helper()
+	return a2aReplyActorRunNamed(t, cfgDir, paneID, nil, args...)
+}
+
+// a2aReplyActorRunNamed is a2aReplyActorRun with the pane-identity
+// resolver injected: paneAgentName answers the agent name of the pane
+// (fake.name) or fails (fake.err) and counts its calls; nil leaves it
+// unset.
+func a2aReplyActorRunNamed(t *testing.T, cfgDir, paneID string, paneAgentName func(context.Context, string) (string, error), args ...string) (string, string, int) {
 	t.Helper()
 	var out, errb bytes.Buffer
 	env := Env{
-		Stdin:     strings.NewReader(""),
-		Stdout:    &out,
-		Stderr:    &errb,
-		ConfigDir: cfgDir,
-		Now:       func() time.Time { return serveFixedNow },
-		Sleep:     sleepCtx,
-		Environ:   func() []string { return fakeChildEnv },
+		Stdin:         strings.NewReader(""),
+		Stdout:        &out,
+		Stderr:        &errb,
+		ConfigDir:     cfgDir,
+		Now:           func() time.Time { return serveFixedNow },
+		Sleep:         sleepCtx,
+		Environ:       func() []string { return fakeChildEnv },
+		PaneAgentName: paneAgentName,
 	}
 	env.Getenv = func(k string) string {
 		if k == "HERDR_PANE_ID" {
@@ -104,6 +117,22 @@ func a2aReplyActorRun(t *testing.T, cfgDir, paneID string, args ...string) (stri
 	}
 	exit := cmdA2A(append([]string{"reply"}, args...), env)
 	return out.String(), errb.String(), exit
+}
+
+// a2aReplyActorAgentFake is the injected Env.PaneAgentName: it counts
+// the resolutions and answers fake.name or fails with fake.err, keeping
+// the resolved pane of each call.
+type a2aReplyActorAgentFake struct {
+	name  string
+	err   error
+	calls int
+	panes []string
+}
+
+func (f *a2aReplyActorAgentFake) call(ctx context.Context, pane string) (string, error) {
+	f.calls++
+	f.panes = append(f.panes, pane)
+	return f.name, f.err
 }
 
 // a2aReplyActorDecisions counts the stored decisions of task in db.
@@ -126,7 +155,12 @@ func a2aReplyActorDecisions(t *testing.T, db, task string) int {
 // reference is recorded as the actor and a pane outside the task's
 // recipients (the planned deliveries plus the current routing) is
 // refused with not_a_recipient, writing nothing; a duplicate resend is
-// answered before the gate.
+// answered before the gate. A recipient registered by the agent name is
+// compared with the agent name of the pane that answers (the resolver is
+// called only when the pane reference is not a recipient and a recipient
+// carries the agent-name pattern): the actor stays the pane reference,
+// a pane whose agent has another name is refused and a failed resolution
+// exits 4 without writing anything.
 func TestA2AReplyActor(t *testing.T) {
 	// (a) No HERDR_PANE_ID: records, and the actor is "local".
 	t.Run("no pane id records the local actor", func(t *testing.T) {
@@ -250,6 +284,94 @@ func TestA2AReplyActor(t *testing.T) {
 		line := a2aOneJSONLine(t, "reply (f) resend", stdout)
 		if !strings.Contains(line, `"status":"duplicate"`) {
 			t.Fatalf("reply (f) resend = %q, want duplicate", line)
+		}
+	})
+
+	// (g) The owner is registered by the agent name (the planned
+	// delivery stores the name) and the agent of the pane answers with
+	// that name: records, and the actor is the pane reference, never the
+	// name.
+	t.Run("a pane whose agent has the registered name may answer", func(t *testing.T) {
+		cfgDir := t.TempDir()
+		task, db := a2aReplyActorFixture(t, cfgDir, "owner")
+		fake := &a2aReplyActorAgentFake{name: "owner"}
+		stdout, _, exit := a2aReplyActorRunNamed(t, cfgDir, "w6Y:p1", fake.call, "--task", task, "--answer", "--decision-id", "dec-actor-g", "--db", db, "text-g")
+		if exit != 0 {
+			t.Fatalf("reply exit = %d, want 0 (stdout %q)", exit, stdout)
+		}
+		line := a2aOneJSONLine(t, "reply (g)", stdout)
+		var body struct {
+			Status   string            `json:"status"`
+			Decision *a2acore.Decision `json:"decision"`
+		}
+		if err := json.Unmarshal([]byte(line), &body); err != nil || body.Status != "recorded" || body.Decision == nil {
+			t.Fatalf("reply (g) = %q, want recorded with a decision", line)
+		}
+		if body.Decision.Actor != "local/w6Y:p1" {
+			t.Fatalf("actor = %q, want local/w6Y:p1 (the reference, not the name)", body.Decision.Actor)
+		}
+		if fake.calls != 1 {
+			t.Fatalf("pane identity resolutions = %d, want 1", fake.calls)
+		}
+		if len(fake.panes) != 1 || fake.panes[0] != "w6Y:p1" {
+			t.Fatalf("resolved panes = %v, want [w6Y:p1]", fake.panes)
+		}
+	})
+
+	// (h) The owner is registered by the agent name and the agent of the
+	// pane has another name: refused with not_a_recipient, nothing
+	// recorded.
+	t.Run("a pane whose agent has another name is refused", func(t *testing.T) {
+		cfgDir := t.TempDir()
+		task, db := a2aReplyActorFixture(t, cfgDir, "owner")
+		fake := &a2aReplyActorAgentFake{name: "someone-else"}
+		stdout, _, exit := a2aReplyActorRunNamed(t, cfgDir, "w6Y:p1", fake.call, "--task", task, "--answer", "--decision-id", "dec-actor-h", "--db", db, "text-h")
+		if exit != 2 {
+			t.Fatalf("reply exit = %d, want 2 (stdout %q)", exit, stdout)
+		}
+		if !strings.Contains(stdout, `"status":"refused"`) || !strings.Contains(stdout, `"motivo":"not_a_recipient"`) {
+			t.Fatalf("reply (h) = %q, want refused not_a_recipient", stdout)
+		}
+		if n := a2aReplyActorDecisions(t, db, task); n != 0 {
+			t.Fatalf("decisions in the store = %d, want 0 (nothing recorded)", n)
+		}
+	})
+
+	// (i) The owner is registered by the agent name and the pane-identity
+	// resolution fails: exit 4, pane identity unavailable, nothing
+	// recorded.
+	t.Run("a failed resolution is unavailable and writes nothing", func(t *testing.T) {
+		cfgDir := t.TempDir()
+		task, db := a2aReplyActorFixture(t, cfgDir, "owner")
+		fake := &a2aReplyActorAgentFake{err: errors.New("herdr agent get: exited without the agent answer: exit status 2")}
+		stdout, _, exit := a2aReplyActorRunNamed(t, cfgDir, "w6Y:p1", fake.call, "--task", task, "--answer", "--decision-id", "dec-actor-i", "--db", db, "text-i")
+		if exit != 4 {
+			t.Fatalf("reply exit = %d, want 4 (stdout %q)", exit, stdout)
+		}
+		if !strings.Contains(stdout, `"status":"unavailable"`) || !strings.Contains(stdout, `"motivo":"a2a reply: pane identity unavailable"`) {
+			t.Fatalf("reply (i) = %q, want unavailable pane identity unavailable", stdout)
+		}
+		if n := a2aReplyActorDecisions(t, db, task); n != 0 {
+			t.Fatalf("decisions in the store = %d, want 0 (nothing recorded)", n)
+		}
+	})
+
+	// (j) The owner is registered by the reference and the pane matches
+	// by the reference: the pane identity is never resolved.
+	t.Run("a pane that matches by the reference never resolves the name", func(t *testing.T) {
+		cfgDir := t.TempDir()
+		task, db := a2aReplyActorFixture(t, cfgDir, "local/w6Y:p1")
+		fake := &a2aReplyActorAgentFake{name: "owner"}
+		stdout, _, exit := a2aReplyActorRunNamed(t, cfgDir, "w6Y:p1", fake.call, "--task", task, "--answer", "--decision-id", "dec-actor-j", "--db", db, "text-j")
+		if exit != 0 {
+			t.Fatalf("reply exit = %d, want 0 (stdout %q)", exit, stdout)
+		}
+		line := a2aOneJSONLine(t, "reply (j)", stdout)
+		if !strings.Contains(line, `"status":"recorded"`) {
+			t.Fatalf("reply (j) = %q, want recorded", line)
+		}
+		if fake.calls != 0 {
+			t.Fatalf("pane identity resolutions = %d, want 0 (the reference matched)", fake.calls)
 		}
 	})
 }
