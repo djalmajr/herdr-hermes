@@ -266,6 +266,36 @@ func TestNotifySendDeadline(t *testing.T) {
 	})
 }
 
+// TestNotifySendEnvWithoutPaneID: the send child never receives the
+// caller's HERDR_PANE_ID — the notification is sent by Nau, not by a
+// pane — while every other variable is forwarded, including a longer
+// key that only starts with HERDR_PANE_ID, and the original Environ
+// slice keeps its four entries.
+func TestNotifySendEnvWithoutPaneID(t *testing.T) {
+	env := []string{
+		"HERDR_PANE_ID=w1:p2",
+		"HERDR_ENV=1",
+		"HERDR_WORKSPACE_ID=w1",
+		"HERDR_PANE_ID_EXTRA=x",
+	}
+	exe, dir := installFake(t, fakesoho.Rule{Argv: sendArgv("local/w1:p1", "hi", sendTestTimeout), Stdout: "sent to x\n", Code: 0})
+	s := soho.NotifySender{Bin: exe, Environ: env, Timeout: sendTestTimeout}
+	if res := s.Send(context.Background(), "local/w1:p1", "hi"); res != (notify.SendResult{Outcome: notify.OutcomeAccepted, Status: "sent", Exit: 0}) {
+		t.Fatalf("res = %+v, want accepted/sent", res)
+	}
+	calls, err := fakesoho.ReadCalls(dir)
+	if err != nil {
+		t.Fatalf("ReadCalls: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	childEnvExact(t, calls[0].Env, []string{"HERDR_ENV=1", "HERDR_WORKSPACE_ID=w1", "HERDR_PANE_ID_EXTRA=x"})
+	if !sameStrings(env, []string{"HERDR_PANE_ID=w1:p2", "HERDR_ENV=1", "HERDR_WORKSPACE_ID=w1", "HERDR_PANE_ID_EXTRA=x"}) {
+		t.Errorf("Environ = %v after Send, want the original four entries untouched", env)
+	}
+}
+
 // TestNotifySendUnavailable: a missing binary is a transient
 // unavailable, without a subprocess.
 func TestNotifySendUnavailable(t *testing.T) {

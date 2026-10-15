@@ -64,7 +64,7 @@ Refusal codes (every refusal is deterministic and carries one of these):
 
 Nau routes every admitted message to the explicitly registered recipients, re-reading the registrations on every call: the **owner** is the project's `notify` owner registration, and the **guardian** is the machine coordinator. Nothing is ever guessed: a role with no registration has no recipient (`no_route`), and a message sent to the registered reference of the sender itself is never sent back (`self`, the loop guard).
 
-The notice is identifiers-only — one line built from validated identifiers (a value that fails its pattern renders as `?`): the task id, context id, a fixed class, the recipient role, the project, the optional job id, the task state, and the fixed pointer `details: nau a2a show --task <task id>`. It never contains the message text, the subject, the reference of the sender or any metadata value, and it is delivered through the same `herdr-soho send` transport as every other notification.
+The notice is identifiers-only — one line built from validated identifiers (a value that fails its pattern renders as `?`): the task id, context id, a fixed class, the recipient role, the project, the optional job id, the task state, and the fixed pointer `details: nau a2a show --task <task id>`. It never contains the message text, the subject, the reference of the sender or any metadata value, and it is delivered through the same `herdr-soho send` transport as every other notification, and, as for every other notification, the send runs without `HERDR_PANE_ID`, so the notice is never attributed to the pane that fired the hook or that runs the serve and never refused when that pane is a worker.
 
 The delivery states keep the notify semantics:
 
