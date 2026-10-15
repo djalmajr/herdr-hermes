@@ -1022,3 +1022,75 @@ func hasRole(roles []string, role string) bool {
 	}
 	return false
 }
+
+// ExpeditePending pulls the next attempt to now (the store's clock) on
+// every delivery that is pending, has a non-empty ref, has a
+// NextAttemptAt in the future and whose ref satisfies match — the
+// recipient came back and its due delivery is delivered in the current
+// run instead of after the backoff. It never touches attempts, state, a
+// delivery with a valid lease (in flight) or a final delivery
+// (uncertain, rejected, exhausted, accepted, no_route, self), and
+// without a change it writes nothing (not even the ledger file). It
+// returns how many deliveries were expedited. A disabled store
+// expedites nothing.
+func (s *Store) ExpeditePending(match func(ref string) bool) (int, error) {
+	if !s.Enabled() {
+		return 0, nil
+	}
+	var expedited int
+	err := s.ob.WithLock(func() error {
+		// A missing ledger file is not written here: with nothing to
+		// expedite there is no change to persist, so the initialized
+		// flag of the load is deliberately ignored.
+		led, _, err := s.loadLedgerMutatingLocked()
+		if err != nil {
+			return err
+		}
+		now := s.now()
+		nowTS := now.Format(TSLayout)
+		for i := range led.Notifications {
+			for j := range led.Notifications[i].Deliveries {
+				d := &led.Notifications[i].Deliveries[j]
+				if d.State != StatePending || d.Ref == "" || d.NextAttemptAt == "" || !match(d.Ref) {
+					continue
+				}
+				t, err := time.Parse(TSLayout, d.NextAttemptAt)
+				if err != nil || !t.After(now) {
+					continue // unparseable or not in the future: already due
+				}
+				d.NextAttemptAt = nowTS
+				expedited++
+			}
+		}
+		if expedited > 0 {
+			if err := s.writeLedgerLocked(led); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return expedited, nil
+}
+
+// PendingRefs lists the refs of the pending deliveries (state pending,
+// non-empty ref), in ledger order. It is a read-only lookup: it takes no
+// lock and creates nothing, so the caller can decide without writing.
+func (s *Store) PendingRefs() ([]string, error) {
+	led, err := s.loadLedgerLocked()
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	for i := range led.Notifications {
+		for j := range led.Notifications[i].Deliveries {
+			d := led.Notifications[i].Deliveries[j]
+			if d.State == StatePending && d.Ref != "" {
+				refs = append(refs, d.Ref)
+			}
+		}
+	}
+	return refs, nil
+}
