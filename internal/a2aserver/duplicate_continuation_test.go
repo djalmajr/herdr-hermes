@@ -51,6 +51,20 @@ func (d *dupPushSender) lastEvent() a2a.Event {
 	return d.events[len(d.events)-1]
 }
 
+// dupRoutes and dupRoutedSubject give the push tests a subject whose
+// routing reference is the guardian reference, which grants every
+// project: the push gate sends its configs, so a resend that ran an
+// execution would push, and a zero-push assertion proves that no
+// execution ran rather than a suppression by the gate.
+var dupRoutes = fakeRoutes{owner: "owner-ref-1", guardian: "guardian-ref-1"}
+
+// dupRoutedSubject is testSubject with the guardian routing reference.
+func dupRoutedSubject(id string) a2acore.Subject {
+	s := testSubject(id)
+	s.Ref = "guardian-ref-1"
+	return s
+}
+
 // dupNewServer builds one server with the given push sender injected in
 // Config.PushSender, the way the push tests build theirs.
 func dupNewServer(t *testing.T, store *a2astore.Store, auth a2acore.Authenticator, routes a2acore.RouteSource, sender push.Sender) *Server {
@@ -84,8 +98,8 @@ func dupTaskVersion(t *testing.T, path, taskID string) int {
 // state does not change.
 func TestDuplicateContinuationResend(t *testing.T) {
 	store, path := newTestStore(t)
-	auth := newTableAuth(testSubject("caller-1"))
-	routes := fakeRoutes{owner: "owner-ref-1"}
+	auth := newTableAuth(dupRoutedSubject("caller-1"))
+	routes := dupRoutes
 	pusher := &dupPushSender{}
 	s := dupNewServer(t, store, auth, routes, pusher)
 	c := dialClient(t, serveServer(t, s).URL, auth, "caller-1")
@@ -149,6 +163,9 @@ func TestDuplicateContinuationResend(t *testing.T) {
 	}
 	if got := pusher.count(); got != 0 {
 		t.Errorf("push calls caused by the resend = %d, want 0", got)
+	}
+	if got := s.SuppressedPushes(); got != 0 {
+		t.Errorf("suppressed pushes = %d, want 0 (the config's reference is granted, so zero calls means no execution)", got)
 	}
 	if got := dupTaskVersion(t, path, string(task.ID)); got != versionBefore {
 		t.Errorf("task version after the resend = %d, want %d (no write by the resend)", got, versionBefore)
@@ -314,8 +331,8 @@ func (g *dupHoldBefore) Before(ctx context.Context, callCtx *a2asrv.CallContext,
 // running it.
 func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 	store, path := newTestStore(t)
-	auth := newTableAuth(testSubject("caller-1"))
-	routes := fakeRoutes{owner: "owner-ref-1"}
+	auth := newTableAuth(dupRoutedSubject("caller-1"))
+	routes := dupRoutes
 	pusher := &dupPushSender{}
 	s := dupNewServer(t, store, auth, routes, pusher)
 	c := dialClient(t, serveServer(t, s).URL, auth, "caller-1")
@@ -347,7 +364,7 @@ func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 	s2.handler = a2asrv.NewHandler(
 		s2.executor,
 		a2asrv.WithTaskStore(scopedTaskStore{store: store}),
-		a2asrv.WithPushNotifications(store.PushConfigs(), s2.cfg.PushSender),
+		a2asrv.WithPushNotifications(ownerRefConfigs{store.PushConfigs()}, s2.cfg.PushSender),
 		a2asrv.WithCapabilityChecks(&s2.card.Capabilities),
 		a2asrv.WithCallInterceptors(hold),
 		a2asrv.WithLogger(s2.cfg.Logger),
@@ -474,8 +491,8 @@ func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 // and both servers end with no live execution.
 func TestDuplicateResendWhileFirstExecutionAlive(t *testing.T) {
 	store, path := newTestStore(t)
-	auth := newTableAuth(testSubject("caller-1"))
-	routes := fakeRoutes{owner: "owner-ref-1"}
+	auth := newTableAuth(dupRoutedSubject("caller-1"))
+	routes := dupRoutes
 	pusher := &dupPushSender{}
 	s := dupNewServer(t, store, auth, routes, pusher)
 	c := dialClient(t, serveServer(t, s).URL, auth, "caller-1")
@@ -508,7 +525,7 @@ func TestDuplicateResendWhileFirstExecutionAlive(t *testing.T) {
 	s2.handler = a2asrv.NewHandler(
 		s2.executor,
 		a2asrv.WithTaskStore(scopedTaskStore{store: store}),
-		a2asrv.WithPushNotifications(store.PushConfigs(), s2.cfg.PushSender),
+		a2asrv.WithPushNotifications(ownerRefConfigs{store.PushConfigs()}, s2.cfg.PushSender),
 		a2asrv.WithCapabilityChecks(&s2.card.Capabilities),
 		a2asrv.WithCallInterceptors(hold),
 		a2asrv.WithLogger(s2.cfg.Logger),

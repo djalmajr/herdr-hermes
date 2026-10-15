@@ -249,8 +249,8 @@ func TestContentionVisibleParkedIsBusy(t *testing.T) {
 // the contention the interceptor rewrites.
 func TestBusyAfterAdmission(t *testing.T) {
 	store, path := newTestStore(t)
-	auth := newTableAuth(testSubject("caller-1"))
-	routes := fakeRoutes{owner: "owner-ref-1"}
+	auth := newTableAuth(dupRoutedSubject("caller-1"))
+	routes := dupRoutes
 	s1 := newTestServer(t, store, auth, routes)
 	c1 := dialClient(t, serveServer(t, s1).URL, auth, "caller-1")
 	task := sendTask(t, c1, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
@@ -293,7 +293,7 @@ func TestBusyAfterAdmission(t *testing.T) {
 	s2.handler = a2asrv.NewHandler(
 		s2.executor,
 		a2asrv.WithTaskStore(hooks),
-		a2asrv.WithPushNotifications(store.PushConfigs(), pusher),
+		a2asrv.WithPushNotifications(ownerRefConfigs{store.PushConfigs()}, s2.cfg.PushSender),
 		a2asrv.WithCapabilityChecks(&s2.card.Capabilities),
 		a2asrv.WithCallInterceptors(newAuthInterceptor(s2.cfg)),
 		a2asrv.WithLogger(s2.cfg.Logger),
@@ -384,6 +384,9 @@ func TestBusyAfterAdmission(t *testing.T) {
 	}
 	if got := pusher.count(); got != 0 {
 		t.Errorf("push calls caused by the resend = %d, want 0", got)
+	}
+	if got := s2.SuppressedPushes(); got != 0 {
+		t.Errorf("suppressed pushes = %d, want 0 (the config's reference is granted, so zero calls means no execution)", got)
 	}
 	tv, err := store.TaskView(ctxT(t), string(task.ID))
 	if err != nil || tv == nil {
