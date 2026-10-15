@@ -265,7 +265,8 @@ func runResistantInterrupt(t *testing.T, secondSignal bool) {
 			}
 		}
 	}
-	// The bound: the single-signal run ends within the grace plus 3s;
+	// The bound, counted from the first SIGINT (the sleeps above are
+	// inside it): the single-signal run ends within the grace plus 3s;
 	// the second-signal run ends within the bound between the first
 	// signal's grace (sigGrace) and a grace restarted at the second
 	// signal (4s + sigGrace).
@@ -276,7 +277,7 @@ func runResistantInterrupt(t *testing.T, secondSignal bool) {
 	var runErr error
 	select {
 	case runErr = <-waitErr:
-	case <-time.After(bound):
+	case <-time.After(time.Until(interruptAt.Add(bound))):
 		t.Fatalf("the helper did not end within %s of the first SIGINT to its group (helper stderr: %q): the resistant backend held the interrupted run past the shutdown grace", bound, errOut.String())
 	}
 	elapsed := time.Since(interruptAt)
