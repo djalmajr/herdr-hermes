@@ -194,11 +194,15 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			}
 			// A continuation whose message id was already admitted: the
 			// admission stands (no second ingress row, no second
-			// delivery) and the stored task — the version the SDK loaded
-			// for this continuation, the same one its update is checked
-			// against — is the first event, so the resend never changes
-			// the task state. In a state that is final for the SDK
-			// (input_required or terminal, the rule of
+			// delivery). The interceptor answers the common resend before
+			// any execution (no write, no push); this branch is the
+			// defense for a resend that passes it before the first
+			// admission is stored, and this path still writes the task
+			// and sends its push. The stored task — the version the SDK
+			// loaded for this continuation, the same one its update is
+			// checked against — is the first event, so the resend never
+			// changes the task state. In a state that is final for the
+			// SDK (input_required or terminal, the rule of
 			// SDK/internal/taskupdate/final.go; a terminal task is already
 			// refused before the executor) the execution ends with the
 			// task event; in working it parks like an admitted

@@ -216,24 +216,32 @@ func isContention(err error) bool {
 	return strings.Contains(text, sdkExecutionInProgress) || strings.Contains(text, sdkCancelationInProgress)
 }
 
-// requireVisibleTask loads id through the scoped task store on the
-// request context (owner mask and the stored-project predicate of the
-// freshly authenticated subject): an invisible or missing task is
-// notVisible (the text the SDK gives the same method for a missing id)
-// and a store failure is a fixed-text server error. A nil store fails
-// closed as notVisible.
-func (i *authInterceptor) requireVisibleTask(ctx context.Context, id a2a.TaskID, notVisible error) error {
+// visibleTask is the scoped read the prechecks share: the visible task
+// read through the scoped task store on the request context (owner mask
+// and the stored-project predicate of the freshly authenticated
+// subject), an invisible or missing task is notVisible (the text the
+// SDK gives the same method for a missing id) and a store failure is a
+// fixed-text server error. A nil store fails closed as notVisible.
+func (i *authInterceptor) visibleTask(ctx context.Context, id a2a.TaskID, notVisible error) (*taskstore.StoredTask, error) {
 	if i.tasks.store == nil {
-		return notVisible
+		return nil, notVisible
 	}
-	_, err := i.tasks.Get(ctx, id)
+	stored, err := i.tasks.Get(ctx, id)
 	switch {
 	case err == nil:
-		return nil
+		return stored, nil
 	case errors.Is(err, a2a.ErrTaskNotFound):
-		return notVisible
+		return nil, notVisible
 	}
-	return a2a.NewError(a2a.ErrServerError, "a2a: task lookup failed")
+	return nil, a2a.NewError(a2a.ErrServerError, "a2a: task lookup failed")
+}
+
+// requireVisibleTask is the visibility precheck without the task: an
+// invisible or missing task is notVisible and a store failure is the
+// fixed-text server error.
+func (i *authInterceptor) requireVisibleTask(ctx context.Context, id a2a.TaskID, notVisible error) error {
+	_, err := i.visibleTask(ctx, id, notVisible)
+	return err
 }
 
 // actionForMethod maps one SDK method to the action it authorizes. The
@@ -299,8 +307,25 @@ func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContex
 		lookup := callCtx.Method() == "SendMessage" ||
 			(callCtx.Method() == "SendStreamingMessage" && !i.streamingRefusedBySDK())
 		if lookup && p.Message != nil && p.Message.TaskID != "" {
-			if err := i.requireVisibleTask(ctx, p.Message.TaskID, errTaskNotVisible); err != nil {
+			stored, err := i.visibleTask(ctx, p.Message.TaskID, errTaskNotVisible)
+			if err != nil {
 				return ctx, nil, err
+			}
+			// A resend of an admitted continuation (the same message id
+			// admitted to this task) is answered here, before any SDK
+			// execution: the stored task goes back as it is, and without
+			// execution the SDK stores nothing and sends no push. The
+			// visibility check above runs first, so a task the caller
+			// cannot see stays task-not-found. An empty message id, or a
+			// message admitted to another task, follows the usual path.
+			if callCtx.Method() == "SendMessage" && p.Message.ID != "" {
+				admitted, err := i.tasks.store.AdmittedTask(ctx, subject.ID, string(p.Message.ID))
+				if err != nil {
+					return ctx, nil, a2a.NewError(a2a.ErrServerError, "a2a: task lookup failed")
+				}
+				if admitted == string(p.Message.TaskID) {
+					return ctx, stored.Task, nil
+				}
 			}
 		}
 		if p.Config == nil {
