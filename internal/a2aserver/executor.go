@@ -182,10 +182,40 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			return
 		}
 		if result.Duplicate {
-			m := a2a.NewMessageForTask(a2a.MessageRoleAgent, execCtx,
-				a2a.NewTextPart("duplicate of task "+result.DuplicateTaskID))
-			m.SetMeta(a2acore.MetaDuplicateOf, result.DuplicateTaskID)
-			yield(m, nil)
+			if existing == nil {
+				// The first message of a task was already admitted
+				// elsewhere: answer it with the message that carries
+				// the task id.
+				m := a2a.NewMessageForTask(a2a.MessageRoleAgent, execCtx,
+					a2a.NewTextPart("duplicate of task "+result.DuplicateTaskID))
+				m.SetMeta(a2acore.MetaDuplicateOf, result.DuplicateTaskID)
+				yield(m, nil)
+				return
+			}
+			// A continuation whose message id was already admitted: the
+			// admission stands (no second ingress row, no second
+			// delivery) and the stored task — the version the SDK loaded
+			// for this continuation, the same one its update is checked
+			// against — is the first event, so the resend never changes
+			// the task state. In a state that is final for the SDK
+			// (input_required or terminal, the rule of
+			// SDK/internal/taskupdate/final.go; a terminal task is already
+			// refused before the executor) the execution ends with the
+			// task event; in working it parks like an admitted
+			// continuation, so the owner's decision reaches it through
+			// the live entry and ends the execution with the decision's
+			// final event. A yield failure ends the execution the same
+			// way the admitted path does: the entry is cleaned by
+			// Cleanup when the execution ends.
+			if state := execCtx.StoredTask.Status.State; !state.Terminal() && state != a2a.TaskStateInputRequired {
+				p := e.register(string(execCtx.TaskID))
+				if !yield(execCtx.StoredTask, nil) {
+					return
+				}
+				e.park(ctx, p, yield, execCtx)
+				return
+			}
+			yield(execCtx.StoredTask, nil)
 			return
 		}
 		// Admitted: the parked entry exists before the first event is

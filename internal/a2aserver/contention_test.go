@@ -237,12 +237,15 @@ func TestContentionVisibleParkedIsBusy(t *testing.T) {
 // with it. A resend of the same message (same message id, session, epoch
 // and sequence) is not admitted again (no second ingress row, no second
 // delivery to the owner); the store answers it as a duplicate and the
-// answer comes back as the task itself, which the SDK leaves failed
-// because it does not accept a message answer on a task that is already
-// stored. The order is forced with the store hook: on the working
-// event's update a competing write of the same context and version lands
-// first, so the update loses the SDK optimistic version check and the
-// send's error is the contention the interceptor rewrites.
+// answer comes back as the task itself in its current state (the task
+// stays working, the resend does not change the durable state), the
+// resend parks a live execution like an admitted continuation, and a
+// decision recorded after the resend reaches that live execution and
+// completes the task. The order is forced with the store hook: on the
+// working event's update a competing write of the same context and
+// version lands first, so the update loses the SDK optimistic version
+// check and the send's error is the contention the interceptor
+// rewrites.
 func TestBusyAfterAdmission(t *testing.T) {
 	store, path := newTestStore(t)
 	auth := newTableAuth(testSubject("caller-1"))
@@ -350,11 +353,40 @@ func TestBusyAfterAdmission(t *testing.T) {
 	if err != nil || tv == nil {
 		t.Fatalf("task view after the resend: %v, %v", tv, err)
 	}
-	if resent.Status.State != a2a.TaskStateFailed {
-		t.Errorf("resent task state = %s, want failed (the SDK refuses the duplicate message answer on a stored task)", resent.Status.State)
+	if resent.Status.State != a2a.TaskStateWorking {
+		t.Errorf("resent task state = %s, want %s (the resend answers the stored task, state unchanged)", resent.Status.State, a2a.TaskStateWorking)
 	}
-	if tv.State != a2acore.StateFailed {
-		t.Errorf("durable task state after the resend = %q, want %q (the SDK refuses the duplicate message answer on a stored task)", tv.State, a2acore.StateFailed)
+	if tv.State != a2acore.StateWorking {
+		t.Errorf("durable task state after the resend = %q, want %q (the resend does not change the task state)", tv.State, a2acore.StateWorking)
+	}
+
+	// The resend parked a live execution like an admitted continuation:
+	// the owner's decision reaches it through the live entry and ends
+	// the execution with the decision's final event.
+	waitLive(t, s2, 1)
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAnswer, "ba-answer", "the answer")
+	if applied, refused, err := s2.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply answer after the resend = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitStoredState(t, store, string(task.ID), a2acore.StateCompleted)
+	waitLive(t, s2, 0)
+
+	// A new message on the completed task gets the terminal-state
+	// refusal, not busy: no execution of the resend is left stuck.
+	in3 := SendInput{TaskID: string(task.ID), ContextID: task.ContextID, Session: "s-1", Epoch: 1, Seq: 3, MessageID: "m-3", Text: "third"}
+	res3, err3 := c2.Send(ctxT(t), in3)
+	if err3 == nil || !errors.Is(err3, a2a.ErrUnsupportedOperation) {
+		t.Fatalf("new message after the completion = %T, %v, want the unsupported operation refusal", res3, err3)
+	}
+	wire3 := rec.wire()
+	if wire3.status != http.StatusBadRequest || !strings.Contains(wire3.body, `"reason":"UNSUPPORTED_OPERATION"`) {
+		t.Fatalf("new message wire = %d %s, want 400 unsupported operation", wire3.status, wire3.body)
+	}
+	if !strings.Contains(wire3.body, "terminal state") {
+		t.Errorf("new message body lacks the terminal state cause: %s", wire3.body)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-3"); got != 0 {
+		t.Errorf("ingress rows of the new message = %d, want 0 (the refusal is before the admission)", got)
 	}
 }
 
