@@ -1039,7 +1039,10 @@ func (s *Store) ExpeditePending(match func(ref string) bool) (int, error) {
 	}
 	var expedited int
 	err := s.ob.WithLock(func() error {
-		led, initialized, err := s.loadLedgerMutatingLocked()
+		// A missing ledger file is not written here: with nothing to
+		// expedite there is no change to persist, so the initialized
+		// flag of the load is deliberately ignored.
+		led, _, err := s.loadLedgerMutatingLocked()
 		if err != nil {
 			return err
 		}
@@ -1059,7 +1062,7 @@ func (s *Store) ExpeditePending(match func(ref string) bool) (int, error) {
 				expedited++
 			}
 		}
-		if expedited > 0 || initialized {
+		if expedited > 0 {
 			if err := s.writeLedgerLocked(led); err != nil {
 				return err
 			}

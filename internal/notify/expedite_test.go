@@ -208,6 +208,26 @@ func TestExpeditePending(t *testing.T) {
 		}
 	})
 
+	t.Run("an absent ledger stays absent without a change", func(t *testing.T) {
+		ob3 := openOutbox(t, t.TempDir())
+		s3 := Open(ob3, clk.Now)
+		enableNotify(t, s3)
+		path := filepath.Join(s3.Dir(), "ledger.json")
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove ledger: %v", err)
+		}
+		n, err := s3.ExpeditePending(func(ref string) bool { return false })
+		if err != nil {
+			t.Fatalf("ExpeditePending: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("expedited = %d, want 0", n)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("ExpeditePending created %s without a change (err %v)", path, err)
+		}
+	})
+
 	t.Run("disabled store expedites nothing", func(t *testing.T) {
 		ob2 := openOutbox(t, t.TempDir())
 		s2 := Open(ob2, clk.Now)
