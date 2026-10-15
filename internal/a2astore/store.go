@@ -167,6 +167,12 @@ func (s *Store) installSchema() error {
 	if _, err := txn.Exec(a2aDDL); err != nil {
 		return err
 	}
+	// The additive owner_ref column of a2a_push_configs, in the same
+	// immediate transaction as the DDL: a database created before it is
+	// migrated in place, a second open never alters it again.
+	if err := ensurePushOwnerRef(txn); err != nil {
+		return err
+	}
 	_, err = txn.Exec(`INSERT OR IGNORE INTO a2a_meta(key, value) VALUES('schema', '1')`)
 	if err != nil {
 		return err

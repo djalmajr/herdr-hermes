@@ -205,8 +205,8 @@ func TestOutOfBandDecisionPush(t *testing.T) {
 		t.Fatalf("reopen store: %v", err)
 	}
 	defer store2.Close()
-	auth := newTableAuth(testSubject("caller-1"))
-	routes := fakeRoutes{owner: "owner-ref-1"}
+	auth := newTableAuth(a2acore.Subject{ID: "caller-1", Ref: "guardian-ref-1", Projects: []string{a2acore.AnyProject}, Actions: append([]a2acore.Action{}, a2acore.AllActions...)})
+	routes := fakeRoutes{owner: "owner-ref-1", guardian: "guardian-ref-1"}
 
 	s1 := newTestServer(t, store1, auth, routes)
 	ts1 := serveServer(t, s1)
@@ -235,6 +235,9 @@ func TestOutOfBandDecisionPush(t *testing.T) {
 		t.Errorf("saved config = %+v, want the original secret values", saved)
 	}
 	recordDecision(t, store1, string(task.ID), a2acore.DecisionAnswer, "d-1", "oob answer")
+	// The push below is sent only because the routing still grants the
+	// project to the config's recorded reference (the guardian
+	// reference): the gate re-reads the routing on the send.
 
 	// A second server on the reopened store has no parked execution:
 	// the decision applies out-of-band and pushes the final event.
