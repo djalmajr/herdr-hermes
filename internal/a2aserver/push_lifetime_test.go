@@ -266,23 +266,108 @@ func (plErrRoutes) OwnerRef(string) (string, error) { return "", errors.New("rou
 // GuardianRef implements a2acore.RouteSource.
 func (plErrRoutes) GuardianRef() (string, error) { return "", errors.New("routes unavailable") }
 
+// plBaseline is the push baseline of plNewTask: the sender's calls for
+// pc-1 and the gate's suppressed count right after the working push of
+// the first execution settled.
+type plBaseline struct {
+	calls      int
+	suppressed int64
+}
+
+// plFirstSend is the first SendMessageRequest of one fresh task: the
+// user message of the given input (the same metadata as Client.Send)
+// and the push config pc-1 with the canary URL and token carried in
+// the request, so the SDK stores the config before the execution
+// starts (CreateExecutor) and the working push always reaches it.
+func plFirstSend(in SendInput) *a2a.SendMessageRequest {
+	if in.Job == "" {
+		in.Job = "job-1"
+	}
+	meta := map[string]any{
+		a2acore.MetaSession: in.Session,
+		a2acore.MetaEpoch:   float64(in.Epoch),
+		a2acore.MetaSeq:     float64(in.Seq),
+	}
+	if in.Project != "" {
+		meta[a2acore.MetaProject] = in.Project
+	}
+	if in.Job != "" {
+		meta[a2acore.MetaJob] = in.Job
+	}
+	return &a2a.SendMessageRequest{
+		Message: &a2a.Message{
+			ID:        in.MessageID,
+			Role:      a2a.MessageRoleUser,
+			Parts:     a2a.ContentParts{a2a.NewTextPart(in.Text)},
+			TaskID:    a2a.TaskID(in.TaskID),
+			ContextID: in.ContextID,
+			Metadata:  meta,
+		},
+		Config: &a2a.SendMessageConfig{
+			ReturnImmediately: true,
+			PushConfig:        &a2a.PushConfig{ID: "pc-1", URL: plURL, Token: plPushToken},
+		},
+	}
+}
+
+// plWaitWorkingPush waits, with a deadline (a bounded poll like the
+// shared waits, no sleep for synchronization), until the sender
+// records the working push of the given config: the first-send config
+// is stored before the execution starts, so the working push always
+// reaches it and this wait establishes the test's baseline.
+func plWaitWorkingPush(t *testing.T, s *plSender, configID string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, c := range s.callsFor(configID) {
+			if c.state == a2a.TaskStateWorking {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no working push recorded for %s: the first-send config must be stored before the execution", configID)
+}
+
+// plWaitCalls waits, with a deadline (a bounded poll like the shared
+// waits, no sleep for synchronization), until the sender has recorded
+// at least want calls: the SDK sends the push right after it commits
+// the event, so this bounds that window for a count assertion on a
+// still-parked execution.
+func plWaitCalls(t *testing.T, s *plSender, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.count() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("push calls = %d, want at least %d", s.count(), want)
+}
+
 // plNewTask parks one task in the given project under the bearer
-// subject svc-a / owner-ref-a, creates the push config pc-1 with the
-// canary token after the stored working state and returns the task,
-// the token and the client.
-func plNewTask(t *testing.T, e *plEnv, project string) (*a2a.Task, string, *Client) {
+// subject svc-a / owner-ref-a, with the push config pc-1 (canary URL
+// and token) carried by the first message, and waits until the working
+// push settles (the baseline). It returns the task, the token, the
+// client and the baseline: the caller's push assertions are relative
+// to it, so none depends on the order of the working push. The config
+// is stamped from the call's subject, so its stored owner_ref is
+// owner-ref-a.
+func plNewTask(t *testing.T, e *plEnv, project string) (*a2a.Task, string, *Client, plBaseline) {
 	t.Helper()
 	tok := e.ids.add(t, "svc-a", "owner-ref-a")
 	c := e.client(tok)
-	task := sendTask(t, c, idfxSend(project, "s-1", "m-1"))
-	waitLive(t, e.srv, 1)
-	waitStoredState(t, e.obs, string(task.ID), a2acore.StateWorking)
-	if _, err := c.client.CreateTaskPushConfig(ctxT(t), &a2a.PushConfig{
-		TaskID: task.ID, ID: "pc-1", URL: plURL, Token: plPushToken,
-	}); err != nil {
-		t.Fatalf("create push config: %v", err)
+	res, err := c.client.SendMessage(ctxT(t), plFirstSend(idfxSend(project, "s-1", "m-1")))
+	if err != nil {
+		t.Fatalf("send with the push config: %v", err)
 	}
-	return task, tok, c
+	task, ok := res.(*a2a.Task)
+	if !ok {
+		t.Fatalf("send result = %T, want *a2a.Task", res)
+	}
+	plWaitWorkingPush(t, e.sender, "pc-1")
+	return task, tok, c, plBaseline{calls: len(e.sender.callsFor("pc-1")), suppressed: e.srv.SuppressedPushes()}
 }
 
 // TestPushLifetimeLive proves the live path through the SDK sender:
@@ -298,7 +383,7 @@ func TestPushLifetimeLive(t *testing.T) {
 			store, path := newTestStore(t)
 			e := newPlEnv(t, store, path, sender)
 			e.routes.set("owner-ref-a", "org/secret", "org/public")
-			task, tok, c := plNewTask(t, e, "org/secret")
+			task, tok, c, base := plNewTask(t, e, "org/secret")
 			if revoke {
 				// The project leaves the reference's routing before
 				// the decision.
@@ -311,22 +396,22 @@ func TestPushLifetimeLive(t *testing.T) {
 			waitStoredState(t, e.obs, string(task.ID), a2acore.StateInputRequired)
 			waitLive(t, e.srv, 0)
 			if revoke {
-				if got := sender.callsFor("pc-1"); len(got) != 0 {
-					t.Fatalf("push calls = %+v, want none (the reference no longer grants the project)", got)
+				if got := sender.callsFor("pc-1"); len(got) != base.calls {
+					t.Fatalf("push calls after the baseline = %+v, want none (the reference no longer grants the project)", got[base.calls:])
 				}
-				if got := e.srv.SuppressedPushes(); got != 1 {
-					t.Fatalf("suppressed = %d, want 1", got)
+				if got := e.srv.SuppressedPushes() - base.suppressed; got != 1 {
+					t.Fatalf("suppressed after the baseline = %d, want 1", got)
 				}
 				if !strings.Contains(e.logs.String(), `"reason":"not_granted"`) {
 					t.Errorf("the log lacks the not_granted reason:\n%s", e.logs.String())
 				}
 			} else {
 				got := sender.callsFor("pc-1")
-				if len(got) != 1 || got[0].state != a2a.TaskStateInputRequired {
-					t.Fatalf("push calls = %+v, want exactly one with the input-required state", got)
+				if len(got) != base.calls+1 || got[base.calls].state != a2a.TaskStateInputRequired {
+					t.Fatalf("push calls after the baseline = %+v, want exactly one with the input-required state", got[base.calls:])
 				}
-				if got := e.srv.SuppressedPushes(); got != 0 {
-					t.Fatalf("suppressed = %d, want 0", got)
+				if got := e.srv.SuppressedPushes() - base.suppressed; got != 0 {
+					t.Fatalf("suppressed after the baseline = %d, want 0", got)
 				}
 				// The task is still readable (the project is still
 				// granted) and is input_required, not failed.
@@ -366,7 +451,7 @@ func TestPushLifetimeOutOfBand(t *testing.T) {
 			sender1 := &plSender{}
 			e := newPlEnv(t, store1, path, sender1)
 			e.routes.set("owner-ref-a", "org/secret", "org/public")
-			task, tok, _ := plNewTask(t, e, "org/secret")
+			task, tok, _, base := plNewTask(t, e, "org/secret")
 			if revoke {
 				e.routes.set("owner-ref-a", "org/public")
 			}
@@ -392,8 +477,8 @@ func TestPushLifetimeOutOfBand(t *testing.T) {
 				t.Fatalf("apply = %d/%d err=%v, want 1/0 nil", applied, refused, err)
 			}
 			waitStoredState(t, store2, string(task.ID), a2acore.StateCompleted)
-			if got := sender1.count(); got != 0 {
-				t.Fatalf("first server push calls = %d, want 0 (the decision applied out of band)", got)
+			if got := sender1.count(); got != base.calls {
+				t.Fatalf("first server push calls after the baseline = %d, want 0 (the decision applied out of band)", got-base.calls)
 			}
 			if revoke {
 				if got := sender2.callsFor("pc-1"); len(got) != 0 {
@@ -444,7 +529,7 @@ func TestPushLifetimeToken(t *testing.T) {
 	store, path := newTestStore(t)
 	e := newPlEnv(t, store, path, sender)
 	e.routes.set("owner-ref-a", "org/secret")
-	task, tokA, cA := plNewTask(t, e, "org/secret")
+	task, tokA, cA, base := plNewTask(t, e, "org/secret")
 
 	// The token is revoked alone: the next request with it is refused.
 	e.ids.revoke(tokA)
@@ -459,8 +544,8 @@ func TestPushLifetimeToken(t *testing.T) {
 	}
 	waitStoredState(t, e.obs, string(task.ID), a2acore.StateInputRequired)
 	waitLive(t, e.srv, 0)
-	if got := sender.callsFor("pc-1"); len(got) != 1 || got[0].state != a2a.TaskStateInputRequired {
-		t.Fatalf("push calls = %+v, want one input-required push despite the revoked token", got)
+	if got := sender.callsFor("pc-1"); len(got) != base.calls+1 || got[base.calls].state != a2a.TaskStateInputRequired {
+		t.Fatalf("push calls after the baseline = %+v, want one input-required push despite the revoked token", got[base.calls:])
 	}
 
 	// A new token for the same subject and the same reference sees the
@@ -489,8 +574,9 @@ func TestPushLifetimeToken(t *testing.T) {
 	}
 	waitLive(t, e.srv, 1)
 	waitStoredState(t, e.obs, string(task.ID), a2acore.StateWorking)
-	if got := sender.callsFor("pc-1"); len(got) != 2 || got[1].state != a2a.TaskStateWorking {
-		t.Fatalf("push calls = %+v, want one more working push", got)
+	plWaitCalls(t, sender, base.calls+2)
+	if got := sender.callsFor("pc-1"); len(got) != base.calls+2 || got[base.calls+1].state != a2a.TaskStateWorking {
+		t.Fatalf("push calls after the baseline = %+v, want one more working push", got[base.calls:])
 	}
 
 	// The reference leaves the routing: the next send is suppressed.
@@ -501,11 +587,11 @@ func TestPushLifetimeToken(t *testing.T) {
 	}
 	waitStoredState(t, e.obs, string(task.ID), a2acore.StateInputRequired)
 	waitLive(t, e.srv, 0)
-	if got := sender.callsFor("pc-1"); len(got) != 2 {
-		t.Fatalf("push calls = %+v, want none after the routing revocation", got)
+	if got := sender.callsFor("pc-1"); len(got) != base.calls+2 {
+		t.Fatalf("push calls after the baseline = %+v, want none after the routing revocation", got[base.calls:])
 	}
-	if got := e.srv.SuppressedPushes(); got != 1 {
-		t.Fatalf("suppressed = %d, want 1", got)
+	if got := e.srv.SuppressedPushes() - base.suppressed; got != 1 {
+		t.Fatalf("suppressed after the baseline = %d, want 1", got)
 	}
 	if !strings.Contains(e.logs.String(), `"reason":"not_granted"`) {
 		t.Errorf("the log lacks the not_granted reason:\n%s", e.logs.String())
@@ -528,25 +614,30 @@ func TestPushLifetimeLocalAndLegacy(t *testing.T) {
 		// The routing is empty: the local operator's config is sent
 		// anyway.
 		c := e.client("")
-		task := sendTask(t, c, idfxSend("org/local", "s-1", "m-1"))
-		waitLive(t, e.srv, 1)
-		waitStoredState(t, e.obs, string(task.ID), a2acore.StateWorking)
-		if _, err := c.client.CreateTaskPushConfig(ctxT(t), &a2a.PushConfig{
-			TaskID: task.ID, ID: "pc-1", URL: plURL, Token: plPushToken,
-		}); err != nil {
-			t.Fatalf("create push config: %v", err)
+		// The same first-send preparation as plNewTask, with the local
+		// operator: the config carries no reference and the gate sends
+		// it anyway.
+		res, err := c.client.SendMessage(ctxT(t), plFirstSend(idfxSend("org/local", "s-1", "m-1")))
+		if err != nil {
+			t.Fatalf("send with the push config: %v", err)
 		}
+		task, ok := res.(*a2a.Task)
+		if !ok {
+			t.Fatalf("send result = %T, want *a2a.Task", res)
+		}
+		plWaitWorkingPush(t, sender, "pc-1")
+		base := plBaseline{calls: len(sender.callsFor("pc-1")), suppressed: e.srv.SuppressedPushes()}
 		recordDecision(t, e.store, string(task.ID), a2acore.DecisionAsk, "d-1", "question")
 		if applied, refused, err := e.srv.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
 			t.Fatalf("apply = %d/%d err=%v, want 1/0 nil", applied, refused, err)
 		}
 		waitStoredState(t, e.obs, string(task.ID), a2acore.StateInputRequired)
 		waitLive(t, e.srv, 0)
-		if got := sender.callsFor("pc-1"); len(got) != 1 || got[0].state != a2a.TaskStateInputRequired {
-			t.Fatalf("push calls = %+v, want one input-required push", got)
+		if got := sender.callsFor("pc-1"); len(got) != base.calls+1 || got[base.calls].state != a2a.TaskStateInputRequired {
+			t.Fatalf("push calls after the baseline = %+v, want one input-required push", got[base.calls:])
 		}
-		if got := e.srv.SuppressedPushes(); got != 0 {
-			t.Fatalf("suppressed = %d, want 0", got)
+		if got := e.srv.SuppressedPushes() - base.suppressed; got != 0 {
+			t.Fatalf("suppressed after the baseline = %d, want 0", got)
 		}
 		if got := plOwnerRef(t, e.dbPath, string(task.ID), "pc-1"); got != "" {
 			t.Fatalf("owner_ref = %q, want NULL (the local operator has no reference)", got)
@@ -560,7 +651,7 @@ func TestPushLifetimeLocalAndLegacy(t *testing.T) {
 		store, path := newTestStore(t)
 		e := newPlEnv(t, store, path, sender)
 		e.routes.set("owner-ref-a", "org/secret")
-		task, tok, _ := plNewTask(t, e, "org/secret")
+		task, tok, _, base := plNewTask(t, e, "org/secret")
 		// The row is a legacy one: the reference is cleared like a
 		// pre-migration row (the gate cannot re-evaluate it).
 		plNullOwnerRef(t, e.dbPath, string(task.ID), "pc-1")
@@ -570,11 +661,11 @@ func TestPushLifetimeLocalAndLegacy(t *testing.T) {
 		}
 		waitStoredState(t, e.obs, string(task.ID), a2acore.StateInputRequired)
 		waitLive(t, e.srv, 0)
-		if got := sender.count(); got != 0 {
-			t.Fatalf("push calls = %d, want 0 (the reference cannot be re-evaluated)", got)
+		if got := sender.count(); got != base.calls {
+			t.Fatalf("push calls after the baseline = %d, want 0 (the reference cannot be re-evaluated)", got-base.calls)
 		}
-		if got := e.srv.SuppressedPushes(); got != 1 {
-			t.Fatalf("suppressed = %d, want 1", got)
+		if got := e.srv.SuppressedPushes() - base.suppressed; got != 1 {
+			t.Fatalf("suppressed after the baseline = %d, want 1", got)
 		}
 		if !strings.Contains(e.logs.String(), `"reason":"no_owner_reference"`) {
 			t.Errorf("the log lacks the no_owner_reference reason:\n%s", e.logs.String())
@@ -596,7 +687,7 @@ func TestPushLifetimeGate(t *testing.T) {
 		store, path := newTestStore(t)
 		e := newPlEnv(t, store, path, sender)
 		e.routes.set("owner-ref-a", "org/secret")
-		task, _, _ := plNewTask(t, e, "org/secret")
+		task, _, _, base := plNewTask(t, e, "org/secret")
 		cfg, err := e.store.PushConfigs().Get(ctxT(t), task.ID, "pc-1")
 		if err != nil {
 			t.Fatalf("Get config: %v", err)
@@ -607,8 +698,8 @@ func TestPushLifetimeGate(t *testing.T) {
 		if err := gate.SendPush(ctxT(t), cfg, nil); err != nil {
 			t.Fatalf("SendPush = %v, want nil (a suppression is not an error)", err)
 		}
-		if got := sender.count(); got != 0 {
-			t.Fatalf("wrapped sender calls = %d, want 0", got)
+		if got := sender.count(); got != base.calls {
+			t.Fatalf("wrapped sender calls after the baseline = %d, want 0", got-base.calls)
 		}
 		if got := gate.suppressed.Load(); got != 1 {
 			t.Fatalf("suppressed = %d, want 1", got)
@@ -623,7 +714,7 @@ func TestPushLifetimeGate(t *testing.T) {
 		store, path := newTestStore(t)
 		e := newPlEnv(t, store, path, sender)
 		e.routes.set("owner-ref-a", "org/secret")
-		task, _, _ := plNewTask(t, e, "org/secret")
+		task, _, _, base := plNewTask(t, e, "org/secret")
 		cfg, err := e.store.PushConfigs().Get(ctxT(t), task.ID, "pc-1")
 		if err != nil {
 			t.Fatalf("Get config: %v", err)
@@ -637,8 +728,8 @@ func TestPushLifetimeGate(t *testing.T) {
 		if err := gate.SendPush(ctxT(t), cfg, nil); err != nil {
 			t.Fatalf("SendPush = %v, want nil (a suppression is not an error)", err)
 		}
-		if got := sender.count(); got != 0 {
-			t.Fatalf("wrapped sender calls = %d, want 0", got)
+		if got := sender.count(); got != base.calls {
+			t.Fatalf("wrapped sender calls after the baseline = %d, want 0", got-base.calls)
 		}
 		if got := gate.suppressed.Load(); got != 1 {
 			t.Fatalf("suppressed = %d, want 1", got)
