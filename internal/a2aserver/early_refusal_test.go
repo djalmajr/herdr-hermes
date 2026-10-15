@@ -1,11 +1,13 @@
 package a2aserver
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/djalmajr/nau/internal/a2acore"
 	"github.com/djalmajr/nau/internal/a2astore"
@@ -460,4 +462,81 @@ func erServer(t *testing.T, store *a2astore.Store, auth a2acore.Authenticator, r
 		t.Fatalf("build server: %v", err)
 	}
 	return s
+}
+
+// TestEarlyRefusalLeavesStoredMetadata: the early refusal adds the code
+// to a copy of the task metadata, never to the map the stored task
+// holds.
+func TestEarlyRefusalLeavesStoredMetadata(t *testing.T) {
+	meta := map[string]any{"keep": "value"}
+	stored := &taskstore.StoredTask{Task: &a2a.Task{Metadata: meta}}
+	earlyRefusalResponse(stored, a2acore.RefuseReplay)
+	if _, ok := meta[a2acore.MetaRefusal]; ok {
+		t.Fatalf("the stored metadata carries the refusal code: %v", meta)
+	}
+	if len(meta) != 1 || meta["keep"] != "value" {
+		t.Fatalf("the stored metadata changed: %v", meta)
+	}
+}
+
+// TestEarlyRefusalDiscardsPushConfig: a refused continuation that
+// carries a push config leaves the stored task as it was (same JSON,
+// same version, same deliveries), saves no push config and sends no
+// push.
+func TestEarlyRefusalDiscardsPushConfig(t *testing.T) {
+	store, path := newTestStore(t)
+	auth := newTableAuth(dupRoutedSubject("caller-1"))
+	pusher := &dupPushSender{}
+	s := dupNewServer(t, store, auth, dupRoutes, pusher)
+	c := dialClient(t, serveServer(t, s).URL, auth, "caller-1")
+	task := sendTask(t, c, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateWorking)
+	before, err := c.Get(ctxT(t), string(task.ID))
+	if err != nil {
+		t.Fatalf("Get before: %v", err)
+	}
+	rawBefore, err := json.Marshal(before)
+	if err != nil {
+		t.Fatalf("Marshal before: %v", err)
+	}
+	version := erVersion(t, path, string(task.ID))
+	deliveries := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries`)
+	res, err := c.client.SendMessage(ctxT(t), &a2a.SendMessageRequest{
+		Message: &a2a.Message{
+			ID: "m-2", Role: a2a.MessageRoleUser, TaskID: task.ID, ContextID: task.ContextID,
+			Parts:    a2a.ContentParts{a2a.NewTextPart("second")},
+			Metadata: map[string]any{a2acore.MetaSession: "s-1", a2acore.MetaEpoch: float64(1), a2acore.MetaSeq: float64(2)},
+		},
+		Config: &a2a.SendMessageConfig{PushConfig: &a2a.PushConfig{URL: f1URL}},
+	})
+	if err != nil || refusalCode(res) != a2acore.RefuseNotAwaitingCaller {
+		t.Fatalf("continuation with a push config = %v, %v, want the early not_awaiting_caller refusal", res, err)
+	}
+	after, err := c.Get(ctxT(t), string(task.ID))
+	if err != nil {
+		t.Fatalf("Get after: %v", err)
+	}
+	rawAfter, err := json.Marshal(after)
+	if err != nil {
+		t.Fatalf("Marshal after: %v", err)
+	}
+	if string(rawBefore) != string(rawAfter) {
+		t.Fatalf("the stored task changed:\n%s\n%s", rawBefore, rawAfter)
+	}
+	if got := erVersion(t, path, string(task.ID)); got != version {
+		t.Fatalf("task version = %d, want %d", got, version)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries`); got != deliveries {
+		t.Fatalf("deliveries = %d, want %d", got, deliveries)
+	}
+	configs, err := c.client.ListTaskPushConfigs(ctxT(t), &a2a.ListTaskPushConfigRequest{TaskID: task.ID})
+	if err != nil {
+		t.Fatalf("ListTaskPushConfigs: %v", err)
+	}
+	if len(configs) != 0 {
+		t.Fatalf("push configs = %d, want none saved", len(configs))
+	}
+	if n := pusher.count(); n != 0 {
+		t.Fatalf("pushes = %d, want none", n)
+	}
 }
