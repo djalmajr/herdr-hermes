@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -755,26 +756,26 @@ func TestJobForwardBookkeepingStartOmittedStatus(t *testing.T) {
 	}
 }
 
-// TestJobForwardDeadlineTimeout: a child killed at the bound exits 4 and,
-// when the child wrote nothing to stdout, prints exactly one timeout
-// line; when the child already wrote, stdout keeps only the child's
-// bytes (no timeout line) and the stderr diagnostic stays. Both rules
-// use ExitOnTerm 1: with a plain delay the fake ignores SIGTERM, so
-// each sub would take bound + the runner's WaitDelay (~5.5s) here;
-// exiting 1 on SIGTERM keeps the test fast and mirrors the Windows
-// failure mode. The WaitDelay grace period itself is locked in the
-// soho package (TestSohoRunDeadline).
-func TestJobForwardDeadlineTimeout(t *testing.T) {
+// TestJobForwardDeadlineNoOutput: a child that wrote nothing to stdout
+// before the bound is killed at the bound and the command exits 4 with
+// exactly one timeout line; the stderr diagnostic stays. The bound is
+// the short 500ms on purpose: the child writes nothing at all, so a
+// slow process start cannot change the outcome and the case does not
+// depend on a fast start. The rule would run 5s past the bound but
+// ExitOnTerm 1 ends it on the SIGTERM at the bound, keeping the sub
+// well under the 2s wall limit; the plain-delay case (the fake ignores
+// SIGTERM) would take bound + the runner's WaitDelay (~5.5s) instead.
+// The WaitDelay grace period itself is locked in the soho package
+// (TestSohoRunDeadline).
+func TestJobForwardDeadlineNoOutput(t *testing.T) {
 	oldDefault, oldMargin := jobDefaultBound, jobBoundMargin
 	jobDefaultBound, jobBoundMargin = 500*time.Millisecond, 500*time.Millisecond
 	defer func() { jobDefaultBound, jobBoundMargin = oldDefault, oldMargin }()
 	exe, _ := installFakeSoho(t,
 		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J1"}, Delay: 5000, Code: 0, ExitOnTerm: 1},
-		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J2"}, Stdout: `{"id":"J2"}` + "\n", StdoutFirst: true, Delay: 5000, Code: 0, ExitOnTerm: 1},
 	)
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
-	// No output before the bound: exit 4 and the exact single line.
 	start := time.Now()
 	stdout, stderr, exit := runHermes(t, cfgDir, false, "", "job", "status", "--id", "J1")
 	elapsed := time.Since(start)
@@ -790,18 +791,90 @@ func TestJobForwardDeadlineTimeout(t *testing.T) {
 	if elapsed >= 2*time.Second {
 		t.Errorf("no-output deadline took %s, want well under 2s", elapsed)
 	}
-	// The child wrote a line before the bound: exit 4 and stdout
-	// holds only that line (no timeout line). The rule's StdoutFirst
-	// makes the fake print the line and only then sleep.
-	stdout, stderr, exit = runHermes(t, cfgDir, false, "", "job", "status", "--id", "J2")
+}
+
+// TestJobForwardDeadlineLineBeforeBound: a line the child wrote before
+// the bound leaves stdout with only that line (no timeout line), the
+// stderr diagnostic, and still exit 4. The bound is short (2s), so the
+// case verifies its own premise through the rule's WroteMarker, which
+// records the instant the fake finished writing its stdout: when stdout
+// is not the child's line, a missing marker or one written after
+// start+bound means the child was too slow to start and the test skips
+// with the measured evidence, while a marker at or before the bound
+// means the child really wrote first and the miss is a failure. No
+// retry loop, no automatic repetition. StdoutFirst prints the line
+// before the 60s sleep (well past the bound), and ExitOnTerm 1 ends the
+// child on the SIGTERM at the bound, so the case takes the bound plus a
+// little, never the sleep, under the 5s wall cap asserted below.
+func TestJobForwardDeadlineLineBeforeBound(t *testing.T) {
+	oldDefault, oldMargin := jobDefaultBound, jobBoundMargin
+	bound := 2 * time.Second
+	jobDefaultBound, jobBoundMargin = bound, 500*time.Millisecond
+	defer func() { jobDefaultBound, jobBoundMargin = oldDefault, oldMargin }()
+	marker := filepath.Join(t.TempDir(), "wrote-marker")
+	exe, _ := installFakeSoho(t,
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J2"}, Stdout: `{"id":"J2"}` + "\n", StdoutFirst: true, Delay: 60000, Code: 0, ExitOnTerm: 1, WroteMarker: marker},
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	start := time.Now()
+	stdout, stderr, exit := runHermes(t, cfgDir, false, "", "job", "status", "--id", "J2")
+	elapsed := time.Since(start)
 	if exit != 4 {
-		t.Fatalf("output deadline: exit = %d, stdout %q, stderr %q", exit, stdout, stderr)
+		t.Fatalf("line-before-bound deadline: exit = %d, stdout %q, stderr %q", exit, stdout, stderr)
 	}
 	if stdout != `{"id":"J2"}`+"\n" {
-		t.Errorf("output deadline stdout = %q, want only the child's line", stdout)
+		// The premise is "the child wrote before the bound"; the marker
+		// records when the fake finished writing its stdout, so a miss
+		// can be told apart from a slow process start.
+		b, err := os.ReadFile(marker)
+		if err != nil {
+			t.Skipf("line-before-bound deadline premise unmet: no write marker (child never finished writing stdout before the %s bound; elapsed %s), stdout %q", bound, elapsed, stdout)
+		}
+		nano, err := strconv.ParseInt(string(b), 10, 64)
+		if err != nil {
+			t.Fatalf("line-before-bound deadline: unreadable write marker %q: %v", b, err)
+		}
+		wrote := time.Unix(0, nano)
+		if late := wrote.Sub(start.Add(bound)); late > 0 {
+			t.Skipf("line-before-bound deadline premise unmet: child wrote %s after the %s bound (start %s, wrote %s, elapsed %s), stdout %q", late.Round(time.Millisecond), bound, start, wrote, elapsed, stdout)
+		}
+		t.Fatalf("line-before-bound deadline: child wrote before the %s bound (wrote %s) but stdout = %q, want only the child's line", bound, wrote, stdout)
 	}
 	if stderr == "" {
-		t.Errorf("output deadline: stderr empty, want the diagnostic kept")
+		t.Errorf("line-before-bound deadline: stderr empty, want the diagnostic kept")
+	}
+	if elapsed >= 5*time.Second {
+		t.Errorf("line-before-bound deadline took %s, want under the 5s wall cap", elapsed)
+	}
+}
+
+// TestJobForwardDeadlineStartDelay: the control for the flake's class.
+// A start delay (700ms) longer than the bound (500ms) kills the child
+// before its first byte even though the rule would print first
+// (StdoutFirst): the result is the timeout line, the symptom of the
+// original flake, now reproduced on purpose and stable, because the
+// assertion is about the absence of bytes before the bound, which
+// holds whether the rule's handler ends the child or the signal's
+// default action does.
+func TestJobForwardDeadlineStartDelay(t *testing.T) {
+	oldDefault, oldMargin := jobDefaultBound, jobBoundMargin
+	jobDefaultBound, jobBoundMargin = 500*time.Millisecond, 500*time.Millisecond
+	defer func() { jobDefaultBound, jobBoundMargin = oldDefault, oldMargin }()
+	exe, _ := installFakeSoho(t,
+		fakesoho.Rule{Argv: []string{"job", "status", "--id", "J3"}, Stdout: `{"id":"J3"}` + "\n", StdoutFirst: true, StartDelay: 700, Delay: 60000, Code: 0, ExitOnTerm: 1},
+	)
+	cfgDir := t.TempDir()
+	setSohoConfig(t, cfgDir, exe, "machine-a")
+	stdout, stderr, exit := runHermes(t, cfgDir, false, "", "job", "status", "--id", "J3")
+	if exit != 4 {
+		t.Fatalf("start-delay deadline: exit = %d, stdout %q, stderr %q", exit, stdout, stderr)
+	}
+	if want := `{"status":"timeout","motivo":"herdr-soho job status did not finish within 500ms"}` + "\n"; stdout != want {
+		t.Errorf("start-delay deadline stdout = %q, want %q", stdout, want)
+	}
+	if stderr == "" {
+		t.Errorf("start-delay deadline: stderr empty, want the diagnostic kept")
 	}
 }
 
