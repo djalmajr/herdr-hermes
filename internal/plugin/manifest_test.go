@@ -13,7 +13,7 @@ import (
 // it parses with the small line-based TOML subset reader below (no
 // third-party module), carries the bridge id, every section id matches the
 // Herdr id rule, and every command is an argv array starting with
-// herdr-hermes.
+// nau.
 
 var sectionIDRe = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
@@ -131,8 +131,8 @@ func TestManifest(t *testing.T) {
 			t.Errorf("[%s %s] has no command", s.name, s.id)
 			continue
 		}
-		if s.command[0] != "herdr-hermes" {
-			t.Errorf("[%s %s] command %v does not start with herdr-hermes", s.name, s.id, s.command)
+		if s.command[0] != "nau" {
+			t.Errorf("[%s %s] command %v does not start with nau", s.name, s.id, s.command)
 		}
 	}
 	for name, seen := range wantPairs {

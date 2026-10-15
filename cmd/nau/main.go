@@ -6,9 +6,8 @@ import (
 	"github.com/djalmajr/nau/internal/cli"
 )
 
-// nau is the primary entry point. It runs the same cli.Run code path as
-// the deprecated herdr-hermes entry point, against the same state
-// directory, with its own program name for the usage text and the
+// nau is the single entry point of the program. It runs cli.Run against
+// the state directory, with its program name for the usage text and the
 // stderr diagnostic prefix.
 func main() {
 	env := cli.EnvFromOS()

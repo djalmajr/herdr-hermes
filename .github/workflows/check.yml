@@ -72,8 +72,6 @@ jobs:
         run: |
           go build -o "$env:RUNNER_TEMP/nau" ./cmd/nau
           if ($LASTEXITCODE -ne 0) { throw "go build ./cmd/nau failed" }
-          go build -o "$env:RUNNER_TEMP/herdr-hermes" ./cmd/herdr-hermes
-          if ($LASTEXITCODE -ne 0) { throw "go build ./cmd/herdr-hermes failed" }
       - name: Native tests
         shell: pwsh
         run: |

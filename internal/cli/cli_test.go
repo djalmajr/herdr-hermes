@@ -464,25 +464,23 @@ func TestOutboxTrailerUnchangedByLastPush(t *testing.T) {
 }
 
 // TestProgramNameIdentity covers the identity contract at the Env level:
-// the two exported names, the empty-Program default, and how each name
-// renders the usage text (the deprecation line only right after the
-// title of the deprecated name, the texts otherwise identical) and the
-// stderr diagnostic prefix.
+// the program name, the empty-Program default, the usage text rendered
+// with no arguments (no mention of the retired name) and the stderr
+// diagnostic prefix.
 func TestProgramNameIdentity(t *testing.T) {
-	if ProgramNau != "nau" || ProgramHerdrHermes != "herdr-hermes" {
-		t.Fatalf("names = %q/%q, want %q/%q", ProgramNau, ProgramHerdrHermes, "nau", "herdr-hermes")
+	if ProgramNau != "nau" {
+		t.Fatalf("name = %q, want %q", ProgramNau, "nau")
 	}
 	if got := (Env{}).program(); got != ProgramNau {
 		t.Errorf("empty Env program = %q, want %q (the default)", got, ProgramNau)
 	}
-	if got := (Env{Program: ProgramHerdrHermes}).program(); got != ProgramHerdrHermes {
-		t.Errorf("Env{Program: %q} program = %q, want %q", ProgramHerdrHermes, got, ProgramHerdrHermes)
+	if got := (Env{Program: ProgramNau}).program(); got != ProgramNau {
+		t.Errorf("Env{Program: %q} program = %q, want %q", ProgramNau, got, ProgramNau)
 	}
 	const title = " - universal messaging and registry core; this build bridges a remote job dispatcher and a Herdr node"
-	const deprecation = "herdr-hermes is the deprecated name of nau: same commands, same state, same exit codes.\n"
 
-	// Default program: no-args prints the primary usage on stdout, exit 0,
-	// empty stderr, no deprecation line.
+	// No-args prints the usage on stdout, exit 0, empty stderr, and the
+	// usage mentions no name other than the program name itself.
 	stdout, stderr, exit := runCLI(t, t.TempDir(), false)
 	if exit != 0 {
 		t.Fatalf("no-args exit = %d, want 0, stderr %q", exit, stderr)
@@ -497,64 +495,18 @@ func TestProgramNameIdentity(t *testing.T) {
 	if !strings.Contains(nauUsage, "usage: "+ProgramNau+" <command> [args]\n") {
 		t.Errorf("no-args stdout lacks the nau usage line")
 	}
-	if strings.Contains(nauUsage, "deprecated name of nau") {
-		t.Errorf("no-args stdout carries the deprecation line: %q", firstNLines(nauUsage, 3))
-	}
-
-	// Deprecated program: the same usage under its own name, with the one
-	// deprecation line right after the title.
-	var out, errb bytes.Buffer
-	env := Env{
-		Stdin:     strings.NewReader(""),
-		Stdout:    &out,
-		Stderr:    &errb,
-		Getenv:    getenvFor(false),
-		Program:   ProgramHerdrHermes,
-		ConfigDir: t.TempDir(),
-		Now:       func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
-		Sleep:     sleepCtx,
-	}
-	if exit := Run(nil, env); exit != 0 {
-		t.Fatalf("no-args (herdr-hermes) exit = %d, want 0", exit)
-	}
-	hhUsage := out.String()
-	if errb.String() != "" {
-		t.Errorf("no-args (herdr-hermes) stderr = %q, want empty", errb.String())
-	}
-	if !strings.HasPrefix(hhUsage, ProgramHerdrHermes+title+"\n"+deprecation) {
-		t.Errorf("no-args (herdr-hermes) does not lead with the title and the deprecation line: %q", firstNLines(hhUsage, 3))
-	}
-	if !strings.Contains(hhUsage, "usage: "+ProgramHerdrHermes+" <command> [args]\n") {
-		t.Errorf("no-args (herdr-hermes) lacks its usage line")
-	}
-	// Same text otherwise: dropping the deprecation line and normalizing
-	// the name makes the two usages byte-identical.
-	normalized := strings.ReplaceAll(hhUsage, deprecation, "")
-	normalized = strings.ReplaceAll(normalized, ProgramHerdrHermes, ProgramNau)
-	if normalized != nauUsage {
-		t.Errorf("the two usages differ beyond the name and the deprecation line:\n--- nau ---\n%s--- herdr-hermes normalized ---\n%s", nauUsage, normalized)
+	if strings.Contains(nauUsage, "herdr-hermes") {
+		t.Errorf("no-args stdout mentions the retired name: %q", firstNLines(nauUsage, 3))
 	}
 
 	// The stderr diagnostic prefix follows the program name for the same
-	// failure: default Env prints the nau prefix, the deprecated Env its
-	// own.
+	// failure.
 	_, stderr, exit = runCLI(t, t.TempDir(), false, "config", "get", "no_such_key")
 	if exit != 2 {
 		t.Fatalf("config get unknown key exit = %d, want 2, stderr %q", exit, stderr)
 	}
 	if !strings.HasPrefix(stderr, ProgramNau+": ") {
 		t.Errorf("stderr prefix = %q, want %q: ...", firstLineOf(stderr), ProgramNau)
-	}
-	var out2, errb2 bytes.Buffer
-	env2 := env
-	env2.Stdout = &out2
-	env2.Stderr = &errb2
-	env2.ConfigDir = t.TempDir()
-	if exit := Run([]string{"config", "get", "no_such_key"}, env2); exit != 2 {
-		t.Fatalf("config get unknown key (herdr-hermes) exit = %d, want 2", exit)
-	}
-	if !strings.HasPrefix(errb2.String(), ProgramHerdrHermes+": ") {
-		t.Errorf("stderr prefix = %q, want %q: ...", firstLineOf(errb2.String()), ProgramHerdrHermes)
 	}
 }
 

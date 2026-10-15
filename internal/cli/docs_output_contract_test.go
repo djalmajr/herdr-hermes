@@ -30,9 +30,8 @@ func docFirstLine(s string) string {
 }
 
 // TestDocsHelpIsPlainText keeps the README output contract for the
-// plain-text exceptions: `help` and running `nau` (or the deprecated
-// `herdr-hermes`) with no arguments print the usage on stdout and exit 0
-// instead of a JSON line.
+// plain-text exceptions: `help` and running `nau` with no arguments print
+// the usage on stdout and exit 0 instead of a JSON line.
 func TestDocsHelpIsPlainText(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -130,7 +129,7 @@ func TestDocsReadmeOutputContract(t *testing.T) {
 		t.Errorf("README still carries the unqualified single-JSON-line promise")
 	}
 	for _, want := range []string{
-		"with these exceptions: `help` and `nau` (or the deprecated `herdr-hermes`) run with no arguments print the plain-text usage on stdout and exit 0",
+		"with these exceptions: `help` and `nau` run with no arguments print the plain-text usage on stdout and exit 0",
 		"`outbox` prints one JSON line per record and then the trailer line",
 		"for `job events` is JSON lines and a trailer line",
 		"docs/routing.md#preflight-read-only",
