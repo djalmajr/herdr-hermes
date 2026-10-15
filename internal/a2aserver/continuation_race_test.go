@@ -2,6 +2,7 @@ package a2aserver
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 // real one; the hooks only block or signal.
 type hookedTaskStore struct {
 	taskstore.Store
+	reviewHook   func(context.Context, *taskstore.UpdateRequest)
 	afterGet     func(id a2a.TaskID)
 	beforeUpdate func(req *taskstore.UpdateRequest)
 	afterUpdate  func(req *taskstore.UpdateRequest)
@@ -38,6 +40,9 @@ func (h *hookedTaskStore) Get(ctx context.Context, id a2a.TaskID) (*taskstore.St
 
 // Update implements taskstore.Store.
 func (h *hookedTaskStore) Update(ctx context.Context, req *taskstore.UpdateRequest) (taskstore.TaskVersion, error) {
+	if h.reviewHook != nil {
+		h.reviewHook(ctx, req)
+	}
 	if h.beforeUpdate != nil {
 		h.beforeUpdate(req)
 	}
@@ -100,10 +105,10 @@ func awaitSignal(t *testing.T, name string, ch <-chan struct{}) {
 // still running execution after that answer. A second server on the
 // same store that loads the task in that window and appends the
 // continuation message loses the SDK optimistic version check, and the
-// caller gets the "concurrent modification" error of the executor
-// setup. The order is forced with store hooks: the second server's Get
-// returns first, then the first server's WORKING update lands, then the
-// second server's history update runs.
+// caller gets the stable busy answer of the executor setup. The order
+// is forced with store hooks: the second server's Get returns first,
+// then the first server's WORKING update lands, then the second
+// server's history update runs.
 func TestContinuationOnSecondServerRacesFirstExecutionWrite(t *testing.T) {
 	store1, path := newTestStore(t)
 	store2, err := a2astore.OpenFile(path, a2astore.Options{})
@@ -155,12 +160,14 @@ func TestContinuationOnSecondServerRacesFirstExecutionWrite(t *testing.T) {
 		Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-2", Text: "stale",
 	})
 	if err == nil {
-		t.Fatal("continuation succeeded, want the concurrent modification of the executor setup")
+		t.Fatal("continuation succeeded, want the contention refusal of the executor setup")
 	}
-	t.Logf("caller sees: %v", err)
-	for _, want := range []string{"failed to load exec ctx", "task message history update failed", "concurrent modification"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not carry %q", err, want)
+	if !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
+		t.Fatalf("error = %q, want the internal error %q", err, taskBusyText)
+	}
+	for _, forbidden := range []string{"in progress", "concurrent modification", "exec ctx"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("error %q carries the forbidden text %q", err, forbidden)
 		}
 	}
 	// Nothing was parked or half applied by the lost continuation.
@@ -180,9 +187,9 @@ func TestContinuationOnSecondServerRacesFirstExecutionWrite(t *testing.T) {
 // single-server counterpart: a continuation that arrives while the
 // task's own execution is still storing its WORKING event never reaches
 // the store on the same server. The SDK execution manager refuses it
-// because one execution per task is live, so the caller gets a
-// deterministic refusal and not a version conflict, and the execution
-// that is mid-write is unaffected.
+// because one execution per task is live, and the caller gets the
+// stable busy answer and not a version conflict; the execution that is
+// mid-write is unaffected.
 func TestContinuationOnSameServerWhileExecutionWritesIsRefused(t *testing.T) {
 	store, _ := newTestStore(t)
 	auth := newTableAuth(testSubject("caller-1"))
@@ -214,12 +221,13 @@ func TestContinuationOnSameServerWhileExecutionWritesIsRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("continuation of a task whose execution is mid-write succeeded, want a refusal")
 	}
-	t.Logf("caller sees: %v", err)
-	if strings.Contains(err.Error(), "concurrent modification") || strings.Contains(err.Error(), "exec ctx") {
-		t.Errorf("error %q is the store version conflict, want the execution-in-progress refusal", err)
+	if !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
+		t.Fatalf("error = %q, want the internal error %q", err, taskBusyText)
 	}
-	if !strings.Contains(err.Error(), "already in progress") {
-		t.Errorf("error %q does not say the task execution is already in progress", err)
+	for _, forbidden := range []string{"in progress", "concurrent modification", "exec ctx"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("error %q carries the forbidden text %q", err, forbidden)
+		}
 	}
 
 	// The execution that was mid-write is not disturbed: it stores its
