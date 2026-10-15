@@ -238,11 +238,14 @@ func jobProjeto(env Env, jobID string) string {
 }
 
 // pluginAgentStatusEvent ingests the Herdr pane.agent_status_changed
-// event and delivers the pending notifications within the hook bound. It
-// always exits 0, prints nothing on stdout, and writes nothing (not even
-// the state dir) when the pane is not watched or notifications are
-// disabled: an over-cap, malformed or non-agent-status JSON is one
-// friction line with a fixed text.
+// event, pulls the next attempt to now for the pending deliveries of
+// the pane when the status is a responsive idle or done (so a recipient
+// pane that came back is delivered in the same hook), and delivers the
+// pending notifications within the hook bound. It always exits 0,
+// prints nothing on stdout, and writes nothing (not even the state dir)
+// when the pane is not watched or notifications are disabled: an
+// over-cap, malformed or non-agent-status JSON is one friction line
+// with a fixed text.
 func pluginAgentStatusEvent(env Env) {
 	raw := env.Getenv(plugin.EnvEventJSON)
 	if len(raw) > notifyStdinCap {
@@ -279,7 +282,65 @@ func pluginAgentStatusEvent(env Env) {
 		pluginFriction(env, "event: agent status ingest failed")
 		return
 	}
+	pluginAgentStatusExpedite(env, nstore, ev)
 	runNotify(context.Background(), env, cfg, notifyHookBound)
+}
+
+// pluginAgentStatusExpedite pulls the next attempt to now for the
+// pending deliveries of the event's pane, before the hook's delivery
+// run, so a recipient pane that just became idle or done receives its
+// due delivery in the same hook instead of after the backoff. The pane
+// matches a ref as "local/<pane>"; the agent name of the pane (the same
+// Env.PaneAgentName field the reply resolves with) is resolved only when
+// the ref alone does not match and some pending ref carries the
+// agent-name pattern, so the common case — no pending delivery of the
+// pane — writes nothing and never calls herdr. A failed resolution
+// expedites nothing and writes the fixed friction line; the hook's
+// delivery run follows unchanged. A working, blocked or unknown status
+// expedites nothing.
+func pluginAgentStatusExpedite(env Env, nstore *notify.Store, ev notify.AgentStatusEvent) {
+	if ev.Status != "idle" && ev.Status != "done" {
+		return
+	}
+	refs, err := nstore.PendingRefs()
+	if err != nil {
+		pluginFriction(env, "event: agent status state dir unavailable")
+		return
+	}
+	localRef := "local/" + ev.Pane
+	byRef, byName := false, false
+	for _, ref := range refs {
+		if ref == localRef {
+			byRef = true
+		} else if notify.AgentNamePattern.MatchString(ref) {
+			byName = true
+		}
+	}
+	if !byRef && !byName {
+		return
+	}
+	match := func(ref string) bool { return ref == localRef }
+	if !byRef {
+		resolve := env.PaneAgentName
+		if resolve == nil {
+			environ := childEnviron(env)
+			resolve = func(ctx context.Context, pane string) (string, error) {
+				return paneAgentName(ctx, environ, pane)
+			}
+		}
+		name, err := resolve(context.Background(), ev.Pane)
+		if err != nil {
+			pluginFriction(env, "event: recipient name unavailable")
+			return
+		}
+		if name == "" {
+			return // the pane has no agent: nothing matches by name
+		}
+		match = func(ref string) bool { return ref == localRef || ref == name }
+	}
+	if _, err := nstore.ExpeditePending(match); err != nil {
+		pluginFriction(env, "event: agent status state dir unavailable")
+	}
 }
 
 // pluginBridgeStatus is the read-only popup action: exactly one JSON line
