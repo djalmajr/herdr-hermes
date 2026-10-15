@@ -223,12 +223,20 @@ func TestIngestInvalid(t *testing.T) {
 // until a decision is made for it.
 //
 //	type                      esperando  motivo     terminal  tombstone
-//	accepted..note (15)          0         -            0        no
+//	phase-only (21)              0         -            0        no
+//	  accepted, preparing, worker_spawned, worker_done, commit, push,
+//	  pr_opened, checkpoint, review_verdict, amend_received,
+//	  delivery_uncertain, control_held, decision, decision_acked,
+//	  timeout_warning, blocked_warning, failure, note, needs_attention,
+//	  workspace_closed, folder_retained
 //	question                     1      question        0        no
 //	blocked                      1      blocked         0        no
 //	unblocked                    0         -            0        no
 //	terminal                     1*       -*           1        no  (*exit 7/11/14)
 //	cleanup                      0         -            0       yes
+//
+//	The phase-only types (the default of the ingest) only advance the fase:
+//	no wait, no terminal, no tombstone.
 //
 // Mutation captured: a mapping row changed (or the seq > ultimo_seq gate
 // widened) fails the matching type.
@@ -244,8 +252,11 @@ func TestEventMappingCoversContract(t *testing.T) {
 		jobapi.TypeAccepted, jobapi.TypePreparing, jobapi.TypeWorkerSpawned,
 		jobapi.TypeWorkerDone, jobapi.TypeCommit, jobapi.TypePush,
 		jobapi.TypePrOpened, jobapi.TypeCheckpoint, jobapi.TypeReviewVerdict,
-		jobapi.TypeAmendReceived, jobapi.TypeDecision, jobapi.TypeDecisionAcked,
-		jobapi.TypeTimeoutWarning, jobapi.TypeFailure, jobapi.TypeNote,
+		jobapi.TypeAmendReceived, jobapi.TypeDeliveryUncertain,
+		jobapi.TypeControlHeld, jobapi.TypeDecision, jobapi.TypeDecisionAcked,
+		jobapi.TypeTimeoutWarning, jobapi.TypeBlockedWarning, jobapi.TypeFailure,
+		jobapi.TypeNote, jobapi.TypeNeedsAttention, jobapi.TypeWorkspaceClosed,
+		jobapi.TypeFolderRetained,
 	} {
 		m[tipo] = want{}
 	}

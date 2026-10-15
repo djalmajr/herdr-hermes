@@ -585,6 +585,79 @@ func TestOutboxJobEventCursor(t *testing.T) {
 	}
 }
 
+// typedEvent is one job event with the given tipo.
+func typedEvent(seq int, tipo string) json.RawMessage {
+	return json.RawMessage(`{"seq":` + strconv.Itoa(seq) + `,"ts":"2026-01-02T03:04:05-03:00","tipo":"` + tipo + `","resumo":"e` + strconv.Itoa(seq) + `"}`)
+}
+
+// TestOutboxJobEventTail: JobEventTail reports, per job, whether a close
+// tail type is durable and the ts of the first stored terminal record,
+// without writing: an empty outbox, a later duplicate terminal, another
+// job's records, a non job_event record and a record whose dados has no
+// tipo.
+func TestOutboxJobEventTail(t *testing.T) {
+	dir := t.TempDir()
+	s := openStore(t, dir)
+	// Empty outbox: no tail, no terminal.
+	hasTail, terminalTS, err := s.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || hasTail || terminalTS != "" {
+		t.Fatalf("empty outbox: hasTail=%v terminalTS=%q err=%v, want false,\"\",nil", hasTail, terminalTS, err)
+	}
+	// J1 stores a terminal at seq 1 and a folder_retained at seq 2; a
+	// second terminal at seq 3 keeps the first record's ts.
+	for _, ev := range []json.RawMessage{typedEvent(1, "terminal"), typedEvent(2, "folder_retained"), typedEvent(3, "terminal")} {
+		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A foreign job's close tail is not J1's.
+	if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J2", typedEvent(1, "cleanup")); err != nil {
+		t.Fatal(err)
+	}
+	// A dispatch record named J1 is not a job event.
+	id := "J1"
+	if _, err := s.Append(Record{Tipo: TipoDispatch, Maquina: testMaquina, Projeto: testProjeto, JobID: &id, Dados: json.RawMessage(`{"id":"J1"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	// A job event whose dados carries no tipo is skipped.
+	if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", json.RawMessage(`{"seq":4}`)); err != nil {
+		t.Fatal(err)
+	}
+	hasTail, terminalTS, err = s.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || !hasTail || terminalTS == "" {
+		t.Fatalf("J1: hasTail=%v terminalTS=%q err=%v, want true,<ts>,nil", hasTail, terminalTS, err)
+	}
+	// The terminalTS is the ts the store assigned to the record, not the
+	// event's own ts.
+	if terminalTS != fixedNow().Format(TSLayout) {
+		t.Fatalf("J1 terminalTS = %q, want %q (the record ts, not the event ts)", terminalTS, fixedNow().Format(TSLayout))
+	}
+	hasTail, terminalTS, err = s.JobEventTail("J2", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || !hasTail || terminalTS != "" {
+		t.Fatalf("J2: hasTail=%v terminalTS=%q err=%v, want true,\"\",nil (its cleanup is the tail, it has no terminal)", hasTail, terminalTS, err)
+	}
+	// A read-only store answers without taking the lock, and the tail
+	// stays read-only: it wrote nothing.
+	before := stateDirFiles(t, dir)
+	ro, err := Open(dir, Options{Now: fixedNow, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasTail, terminalTS, err = ro.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || !hasTail || terminalTS == "" {
+		t.Fatalf("read-only J1: hasTail=%v terminalTS=%q err=%v, want true,<ts>,nil", hasTail, terminalTS, err)
+	}
+	after := stateDirFiles(t, dir)
+	if len(before) != len(after) {
+		t.Fatalf("JobEventTail left %d files, want %d (it wrote nothing)", len(after), len(before))
+	}
+	for name, b := range before {
+		if !bytes.Equal(after[name], b) {
+			t.Fatalf("JobEventTail changed %s (it wrote nothing)", name)
+		}
+	}
+}
+
 // stateDirFiles snapshots the state dir's files: name -> bytes.
 func stateDirFiles(t *testing.T, dir string) map[string][]byte {
 	t.Helper()

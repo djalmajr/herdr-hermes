@@ -419,6 +419,61 @@ func (s *Store) JobEventCursor(jobID string) (prefix, maxStored int64, err error
 	return contiguousPrefix(present), maxStoredSeq(present), nil
 }
 
+// JobEventTail reports the close-tail evidence of the job's stored job
+// events without writing anything: hasTail is true when one of the job's
+// stored records carries a dados tipo in tailTypes, and terminalTS is the
+// ts of the job's first stored record whose dados tipo is terminal (file
+// order, "" when none). Records whose dados is not a JSON object with a
+// tipo are skipped. It reuses the jobEventsLocked scan; a read-only store
+// reads without the lock, like LoadJobs.
+func (s *Store) JobEventTail(jobID, terminal string, tailTypes []string) (hasTail bool, terminalTS string, err error) {
+	if !s.readOnly {
+		l, err := s.lock()
+		if err != nil {
+			return false, "", err
+		}
+		defer l.unlock()
+	}
+	return s.jobEventTailLocked(jobID, terminal, tailTypes)
+}
+
+// jobEventTailLocked scans outbox.jsonl once and reports the close-tail
+// evidence of the job's stored job events. The caller holds the lock.
+func (s *Store) jobEventTailLocked(jobID, terminal string, tailTypes []string) (bool, string, error) {
+	data, err := s.readOutbox()
+	if err != nil {
+		return false, "", err
+	}
+	tail := make(map[string]bool, len(tailTypes))
+	for _, t := range tailTypes {
+		tail[t] = true
+	}
+	var hasTail bool
+	var terminalTS string
+	for _, line := range completeLines(data) {
+		var r Record
+		if err := json.Unmarshal(line, &r); err != nil {
+			continue
+		}
+		if r.Tipo != TipoJobEvent || r.JobID == nil || *r.JobID != jobID {
+			continue
+		}
+		var ev struct {
+			Tipo string `json:"tipo"`
+		}
+		if err := json.Unmarshal(r.Dados, &ev); err != nil {
+			continue
+		}
+		if tail[ev.Tipo] {
+			hasTail = true
+		}
+		if ev.Tipo == terminal && terminalTS == "" {
+			terminalTS = r.TS
+		}
+	}
+	return hasTail, terminalTS, nil
+}
+
 // syncCursorLocked tracks the job in jobs.json when unknown, sets its
 // last_event_seq to the contiguous stored prefix, and writes jobs.json
 // when the value or the job entry changed. The caller holds the lock.
