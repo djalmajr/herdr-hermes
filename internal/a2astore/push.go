@@ -44,6 +44,12 @@ func (s *Store) PushConfigs() *PushConfigStore {
 // original secret values. Save does no owner check: the SDK masks every
 // existing task before it saves and a new task id is server-generated.
 //
+// The owner_ref column records the routing reference stamped on the
+// context by the call (WithOwnerRef) through nullStr: an empty
+// reference (a call without an authenticated subject, or the local
+// operator) stores NULL. The reference is the re-evaluation key of the
+// push gate, never a token or a provider value.
+//
 // The order protects the committed config: the new handles are put
 // first, outside the transaction (when the credentials Put fails the
 // token handle just put is compensated); then one transaction reads the
@@ -101,11 +107,12 @@ func (p *PushConfigStore) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.
 			return err
 		}
 		nowTS, _ := stamp(p.s.now())
-		_, err = tx.Exec(`INSERT INTO a2a_push_configs(task_id, config_id, url, auth_scheme, token_ref, credentials_ref, created)
-			VALUES(?,?,?,?,?,?,?)
+		_, err = tx.Exec(`INSERT INTO a2a_push_configs(task_id, config_id, url, auth_scheme, token_ref, credentials_ref, owner_ref, created)
+			VALUES(?,?,?,?,?,?,?,?)
 			ON CONFLICT(task_id, config_id) DO UPDATE SET url = excluded.url, auth_scheme = excluded.auth_scheme,
-			token_ref = excluded.token_ref, credentials_ref = excluded.credentials_ref`,
-			string(taskID), id, cfg.URL, nullStr(scheme), nullStr(tokenRef), nullStr(credsRef), nowTS)
+			token_ref = excluded.token_ref, credentials_ref = excluded.credentials_ref,
+			owner_ref = excluded.owner_ref`,
+			string(taskID), id, cfg.URL, nullStr(scheme), nullStr(tokenRef), nullStr(credsRef), nullStr(ownerRefFrom(ctx)), nowTS)
 		if err != nil {
 			return err
 		}

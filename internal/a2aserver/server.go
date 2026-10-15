@@ -35,11 +35,14 @@ const maxBodyBytes = 1 << 20
 // Config is the input of New. Store, Auth and Routes are required;
 // Authz defaults to a2acore.SubjectPolicy{}, PushSender to the SDK HTTP
 // sender with a 10 s timeout and the default SSRF guard on, Now to
-// time.Now and Logger to a discard handler. The logger never logs
-// credentials, message text or secrets. LoopbackOnly makes Handler
-// refuse, before routing, every request whose Host or Origin is not a
-// loopback one; set it by the command that binds the agent to
-// loopback only.
+// time.Now and Logger to a discard handler. New wraps the sender,
+// configured or default, in the push gate, which suppresses a send when
+// the config's recorded reference no longer grants the task's project;
+// a suppressed send never reaches the wrapped sender and never fails
+// the task. The logger never logs credentials, message text or
+// secrets. LoopbackOnly makes Handler refuse, before routing, every
+// request whose Host or Origin is not a loopback one; set it by the
+// command that binds the agent to loopback only.
 type Config struct {
 	Store        *a2astore.Store
 	Auth         a2acore.Authenticator
@@ -62,6 +65,7 @@ type Server struct {
 	card     *a2a.AgentCard
 	handler  a2asrv.RequestHandler
 	executor *executor
+	gate     *pushGate
 }
 
 // discardHandler is the default Logger target: every record is dropped.
@@ -104,13 +108,21 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(discardHandler{})
 	}
-	s := &Server{cfg: cfg}
+	// The push gate wraps the sender, configured or default, so the SDK
+	// live sends and the out-of-band final event both pass through it:
+	// every send is re-evaluated against the stored task row and the
+	// current routing at the moment of the send. The SDK saves through
+	// ownerRefConfigs, which stamps the subject's routing reference on
+	// the context so the Save records it (never a token).
+	gate := newPushGate(cfg.PushSender, cfg.Store.PushConfigs(), cfg.Routes, cfg.Authz, cfg.Logger)
+	cfg.PushSender = gate
+	s := &Server{cfg: cfg, gate: gate}
 	s.card = buildCard(cfg)
 	s.executor = newExecutor(cfg)
 	s.handler = a2asrv.NewHandler(
 		s.executor,
 		a2asrv.WithTaskStore(scopedTaskStore{store: cfg.Store}),
-		a2asrv.WithPushNotifications(cfg.Store.PushConfigs(), cfg.PushSender),
+		a2asrv.WithPushNotifications(ownerRefConfigs{cfg.Store.PushConfigs()}, cfg.PushSender),
 		a2asrv.WithCapabilityChecks(&s.card.Capabilities),
 		a2asrv.WithCallInterceptors(newAuthInterceptor(cfg).withCapabilities(&s.card.Capabilities)),
 		a2asrv.WithLogger(cfg.Logger),
@@ -140,6 +152,10 @@ func (s *Server) Card() *a2a.AgentCard { return s.card }
 // LiveExecutions reports how many executions are parked awaiting the
 // decision of the owner or guardian (a test observation point).
 func (s *Server) LiveExecutions() int { return s.executor.liveExecutions() }
+
+// SuppressedPushes reports how many push sends the gate suppressed
+// since the server started (a test observation point).
+func (s *Server) SuppressedPushes() int64 { return s.gate.suppressed.Load() }
 
 // now is the server clock (Config.Now, time.Now when unset).
 func (s *Server) now() time.Time { return s.cfg.Now() }
