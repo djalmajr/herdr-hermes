@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,13 +52,19 @@ func sameStrings(a, b []string) bool {
 func childEnvExact(t *testing.T, env, want []string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
-		kept := env[:0]
+		// Windows adds SYSTEMROOT and hands the child its environment
+		// block sorted by key, so the comparison drops the one and
+		// ignores the order there.
+		kept := make([]string, 0, len(env))
 		for _, kv := range env {
 			if !strings.HasPrefix(kv, "SYSTEMROOT=") {
 				kept = append(kept, kv)
 			}
 		}
 		env = kept
+		want = append([]string(nil), want...)
+		sort.Strings(env)
+		sort.Strings(want)
 	}
 	if !sameStrings(env, want) {
 		t.Errorf("child env = %v, want %v", env, want)
