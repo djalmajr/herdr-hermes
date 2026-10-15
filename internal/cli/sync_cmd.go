@@ -79,6 +79,15 @@ func syncPostTerminalExpired(env Env, j *outbox.Job, terminalTS string) bool {
 	return env.Now().Sub(stored) >= syncPostTerminalGrace
 }
 
+// validTerminalAnchor reports whether s parses as an outbox.TSLayout
+// instant: an empty or unparseable terminal_seen_at is treated as absent,
+// so the next terminal update rewrites it and a bad format can never keep
+// the job being queried forever.
+func validTerminalAnchor(s string) bool {
+	_, err := time.Parse(outbox.TSLayout, s)
+	return err == nil
+}
+
 // syncResult is the outcome of one sync run: the counts and the push step
 // result, plus the one-line reason (ErrMotivo) for the non-push failure
 // exits (2, 3 and 43).
@@ -192,15 +201,22 @@ func runSync(ctx context.Context, env Env, jobID string, pushOnly bool) (syncRes
 			estado := res.Trailer.Estado
 			if err := store.UpdateJobs(func(js *outbox.Jobs) error {
 				if jj := js.Jobs[id]; jj != nil {
-					// terminal_seen_at is written once, on the first update
-					// that makes the job terminal, with the env clock, and
-					// cleared when the job stops being terminal: it anchors
-					// the post-terminal grace when the state came only from
-					// the trailer.
+					// terminal_seen_at anchors the post-terminal grace when
+					// the state came only from the trailer. It is rewritten
+					// with the env clock when the update makes the job
+					// terminal (the stored state before the update was not
+					// terminal, so a stale value never starts the grace
+					// already expired) and when the stored value does not
+					// parse (an invalid anchor is absent, so the first valid
+					// rewrite bounds the recurrence); it is cleared when the
+					// job stops being terminal and preserved while the job
+					// stays terminal with a valid anchor.
 					terminal := isSyncTerminal(estado)
-					if terminal && jj.TerminalSeenAt == "" {
-						jj.TerminalSeenAt = env.Now().Format(outbox.TSLayout)
-					} else if !terminal {
+					if terminal {
+						if !isSyncTerminal(jj.Estado) || !validTerminalAnchor(jj.TerminalSeenAt) {
+							jj.TerminalSeenAt = env.Now().Format(outbox.TSLayout)
+						}
+					} else {
 						jj.TerminalSeenAt = ""
 					}
 					jj.Estado = estado
