@@ -17,7 +17,7 @@ Status: under development. Nothing here is stable yet.
 
 ## Names
 
-`nau` is the primary command, built from `./cmd/nau`; `herdr-hermes` is its deprecated name, built from `./cmd/herdr-hermes`. Both run the same code with the same commands, flags, JSON output and exit codes. Both names use the same existing state directory, the `herdr-hermes` directory under the user's configuration directory: nothing is migrated, and a `nau` state directory is never read or created. The `HERDR_HERMES_NOWRITE` variable, the `User-Agent` header value `herdr-hermes/<version>`, the notification marker `[herdr-hermes]`, the plugin manifest and the skill directory keep the `herdr-hermes` name.
+`nau` is the command, built from `./cmd/nau`; the old `herdr-hermes` command name and its binary are retired. `nau` uses the existing state directory, the `herdr-hermes` directory under the user's configuration directory: nothing is migrated, and a `nau` state directory is never read or created. The `HERDR_HERMES_NOWRITE` variable, the `User-Agent` header value `herdr-hermes/<version>`, the notification marker `[herdr-hermes]`, the plugin manifest and the skill directory keep the `herdr-hermes` name.
 
 ## Install
 
@@ -27,27 +27,30 @@ With Go 1.26 or newer, from a checkout of the module `github.com/djalmajr/nau`:
 go build -o <dir>/nau ./cmd/nau
 ```
 
-Optionally, also build the deprecated name:
-
-```text
-go build -o <dir>/herdr-hermes ./cmd/herdr-hermes
-```
-
 The binary must be on your `PATH`; the optional plugin also needs it on the Herdr server's `PATH`.
+
+### Upgrading from herdr-hermes
+
+`nau` replaces the retired `herdr-hermes` binary: the commands, flags, JSON output and exit codes are the same.
+
+- Install `nau` on your `PATH` (`go build -o <dir>/nau ./cmd/nau`), and on the Herdr server's `PATH` when the optional plugin is linked.
+- Change `job_wake_cmd=herdr-hermes wake` to `job_wake_cmd=nau wake` in the `herdr-soho` machine configuration, because `nau doctor` no longer accepts the old name.
+- A plugin already linked (`herdr plugin link`) now calls `nau`.
+- The state directory is the same `herdr-hermes` directory under the user's configuration directory: nothing is migrated.
 
 ## Setup
 
 1. Set the machine label that outbox records are stamped with: `nau config set machine_label <label>`.
 2. Store the per-user API key your dispatcher operator issued you: `nau auth login --key -` (the key is read from stdin and never accepted as a flag value or environment variable).
 3. Point the node at the dispatcher (HTTPS): `nau config set dispatcher_url <https-url>`. Until this is set, push is disabled and the dispatcher can still pull the outbox.
-4. Register the wake hook in the `herdr-soho` machine configuration: `job_wake_cmd=nau wake` (`nau doctor` also accepts `job_wake_cmd=herdr-hermes wake`), so every job event that wakes the dispatcher is recorded in the outbox as it happens.
+4. Register the wake hook in the `herdr-soho` machine configuration: `job_wake_cmd=nau wake`, so every job event that wakes the dispatcher is recorded in the outbox as it happens.
 5. Verify with `nau doctor`, which reports the `herdr-soho` capabilities, the configuration state, the wake hook and the outbox counts in one JSON line.
 6. Optionally, register the notification recipients so this machine's native events reach them: `nau notify register owner --projeto <org>/<repo> --to <ref>`, `nau notify register orchestrator --job <id> --to <ref>`, `nau notify register coordinator --to <ref>` `nau notify register watch --pane <ws:pane>` and `nau notify register workspace --workspace <ws>`, where `<ref>` is a `herdr-soho send` reference or a local agent name. Until the first `notify register`, no notification file is written.
 7. On the dispatcher host that chooses machines, list the fleet in priority order: `nau config set route_machines <label>,<label>` (dispatcher side only; the nodes do not need it — see [`docs/routing.md`](docs/routing.md)). Run the read-only preflight in [`docs/routing.md`](docs/routing.md#preflight-read-only) as the operating-system user that saved the Herdr machines, and make sure each orchestrator's Herdr agent is named after the orchestrator base — `orchestrator` or `orchestrator-<n>` by default, `<base>` or `<base>-<n>` when `route_orchestrator_name` sets another base — as `herdr-soho init` names it, or it does not count toward its machine's load.
 
 ## Commands
 
-Every command prints exactly one JSON line on stdout and its diagnostics on stderr, with these exceptions: `help` and `nau` (or the deprecated `herdr-hermes`) run with no arguments print the plain-text usage on stdout and exit 0; `outbox` prints one JSON line per record and then the trailer line; and the forwarded `job` subcommands copy the stdout of `herdr-soho job` unchanged, which for `job events` is JSON lines and a trailer line. On bad usage the usage text goes to stderr and stdout still carries one JSON error line. The exit codes are `0`, `2`, `3`, `4`, `40`, `41`, `42`, `43`, `44` (`44` is the `jobs check` pre-dispatch refusal: duplicate work or a hold).
+Every command prints exactly one JSON line on stdout and its diagnostics on stderr, with these exceptions: `help` and `nau` run with no arguments print the plain-text usage on stdout and exit 0; `outbox` prints one JSON line per record and then the trailer line; and the forwarded `job` subcommands copy the stdout of `herdr-soho job` unchanged, which for `job events` is JSON lines and a trailer line. On bad usage the usage text goes to stderr and stdout still carries one JSON error line. The exit codes are `0`, `2`, `3`, `4`, `40`, `41`, `42`, `43`, `44` (`44` is the `jobs check` pre-dispatch refusal: duplicate work or a hold).
 
 - `job <sub> [args]` — forward a dispatcher-facing job subcommand to `herdr-soho` (`start`, `status`, `wait`, `events`, `collect`, `amend`, `send`, `ack`, `cancel`, `close`, `list`), applying the contract input limits first.
 - `a2a <sub>` — the A2A agent of this machine (see [`docs/a2a.md`](docs/a2a.md)): `serve` runs an A2A v1.0 agent on a loopback address that accepts messages about a project as data to evaluate and queues identifiers-only notices for the project owner, `card`, `send`, `get` and `cancel` are its client, and `inbox`, `show` and `reply` let the owner list, read and decide on the waiting tasks locally.
@@ -64,7 +67,7 @@ Every command prints exactly one JSON line on stdout and its diagnostics on stde
 - `doctor` — check the bridge prerequisites and print one status line.
 - `capabilities --json` — print the bridge capability line `{"schema":1,"bridge":1,"outbox":1,"push":1}`.
 - `version` — print the version.
-- `help` — print the usage as plain text (not JSON); running `nau` (or the deprecated `herdr-hermes`) with no arguments does the same.
+- `help` — print the usage as plain text (not JSON); running `nau` with no arguments does the same.
 - `plugin startup|event|bridge` — Herdr plugin entry points (see the optional plugin below).
 
 ## Pull and push
@@ -89,7 +92,6 @@ go vet ./...
 go test ./...
 go test -race -timeout=30m ./...
 go build ./cmd/nau
-go build ./cmd/herdr-hermes
 ```
 
 The project is Go only; well-established, maintained community libraries are used when a dependency is justified, following normal engineering and security best practices. Tests are hermetic (no network beyond loopback, injected clocks) and must not hang. The vendored contract in [`docs/upstream/job-contract.md`](docs/upstream/job-contract.md) is copied verbatim and never edited; the drift test in `internal/jobapi` fails when the vendored constants drift from it.

@@ -2,14 +2,12 @@ package cli
 
 import (
 	"fmt"
-	"strings"
 )
 
 // usageTemplate is the usage text printed by `help`, with no arguments and
 // on bad usage (to stderr). It lists every command and every exit code of
 // the bridge, including the commands the later slices register. The %s
-// slots are the program name: the primary name gets the product title and
-// the deprecated name the same text under its own name.
+// slots are the program name (ProgramNau).
 const usageTemplate = `%s - universal messaging and registry core; this build bridges a remote job dispatcher and a Herdr node
 
 usage: %s <command> [args]
@@ -113,17 +111,8 @@ exit codes:
   44  the pre-dispatch check refused: duplicate work or a hold (jobs check)
 `
 
-// usageText renders the usage for the program name of env: the primary
-// name gets the template as is, and the deprecated name gets the same
-// text under its own name plus one deprecation line right after the
-// title.
+// usageText renders the usage for the program name of env.
 func usageText(env Env) string {
 	prog := env.program()
-	text := fmt.Sprintf(usageTemplate, prog, prog, prog)
-	if prog == ProgramHerdrHermes {
-		const deprecation = "herdr-hermes is the deprecated name of nau: same commands, same state, same exit codes.\n"
-		i := strings.IndexByte(text, '\n')
-		text = text[:i+1] + deprecation + text[i+1:]
-	}
-	return text
+	return fmt.Sprintf(usageTemplate, prog, prog, prog)
 }

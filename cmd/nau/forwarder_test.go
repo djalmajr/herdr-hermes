@@ -1,17 +1,16 @@
-// Process-level regression for the job forwarder: the real herdr-hermes
-// binary is built once (TestMain) and run against the fake herdr-soho
-// while the test's stdout reader pauses 15s before draining, so the CLI's
-// stdout pipe stays full while the command is still running. The child's
-// full output must still reach the pipe and the forwarder's friction
-// diagnostic must not be lost: a stalled consumer must never make the CLI
-// exit with only the pipe buffer's worth of bytes.
+// Process-level regression for the job forwarder: the real nau binary
+// (built once by TestMain in main_test.go) is run against the fake
+// herdr-soho while the test's stdout reader pauses 15s before draining, so
+// the CLI's stdout pipe stays full while the command is still running.
+// The child's full output must still reach the pipe and the forwarder's
+// friction diagnostic must not be lost: a stalled consumer must never
+// make the CLI exit with only the pipe buffer's worth of bytes.
 package main
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -28,12 +27,8 @@ import (
 )
 
 const (
-	// buildBound bounds the one-shot go build of the CLI in TestMain.
-	buildBound = 180 * time.Second
 	// cliCaseBound is the strict outer deadline of one CLI case.
 	cliCaseBound = 90 * time.Second
-	// graceWaitDelay is the WaitDelay of the build and of every CLI run.
-	graceWaitDelay = 5 * time.Second
 	// readerPause is the exact pause before the test drains the CLI's
 	// stdout. It is longer than the 10s delivery bound an earlier
 	// forwarder had, which exited while the pipe was still full.
@@ -64,53 +59,6 @@ func cyclePayload(n int, lo byte) []byte {
 	return b
 }
 
-// TestMain lets the re-executed test binary act as the fake herdr-soho,
-// then builds the real CLI once (into a temp dir removed after m.Run) and
-// runs the package.
-func TestMain(m *testing.M) {
-	fakesoho.Main()
-	bin, err := buildCLI()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "herdr-hermes test: %v\n", err)
-		os.Exit(1)
-	}
-	cliPath = bin
-	code := m.Run()
-	_ = os.RemoveAll(filepath.Dir(bin))
-	os.Exit(code)
-}
-
-// cliPath is the real CLI binary built by TestMain.
-var cliPath string
-
-// buildCLI builds the real CLI binary out of tree with the go tool found
-// on the test's PATH (the go tool puts its own bin dir there), under a
-// context deadline and a WaitDelay, with no shell.
-func buildCLI() (string, error) {
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		return "", fmt.Errorf("look up go on PATH: %w", err)
-	}
-	dir, err := os.MkdirTemp("", "herdr-hermes-cli-build-")
-	if err != nil {
-		return "", fmt.Errorf("create build dir: %w", err)
-	}
-	ext := ""
-	if runtime.GOOS == "windows" {
-		ext = ".exe"
-	}
-	out := filepath.Join(dir, "herdr-hermes"+ext)
-	ctx, cancel := context.WithTimeout(context.Background(), buildBound)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, goBin, "build", "-o", out, "github.com/djalmajr/nau/cmd/herdr-hermes")
-	cmd.WaitDelay = graceWaitDelay
-	if o, err := cmd.CombinedOutput(); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("go build: %v\n%s", err, o)
-	}
-	return out, nil
-}
-
 // runSpec configures one process-level case.
 type runSpec struct {
 	name     string
@@ -134,20 +82,6 @@ type runResult struct {
 	waitErr error
 	elapsed time.Duration
 	cfgDir  string
-}
-
-// cfgDirFor returns the herdr-hermes config dir the child resolves from
-// its explicit environment; it matches os.UserConfigDir for the standard
-// per-OS variables the test sets (HOME, XDG_CONFIG_HOME, APPDATA).
-func cfgDirFor(root string) string {
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(root, "home", "Library", "Application Support", "herdr-hermes")
-	case "windows":
-		return filepath.Join(root, "appdata", "herdr-hermes")
-	default:
-		return filepath.Join(root, "xdg", "herdr-hermes")
-	}
 }
 
 // runCase runs one case: it installs the fake, writes the config, runs
@@ -183,7 +117,7 @@ func runCase(t *testing.T, spec runSpec) runResult {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cliCaseBound)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, cliPath, spec.argv...)
+	cmd := exec.CommandContext(ctx, nauBin, spec.argv...)
 	cmd.Env = env
 	cmd.WaitDelay = graceWaitDelay
 	if spec.stdin != "" {

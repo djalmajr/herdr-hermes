@@ -21,7 +21,7 @@ func configTable(rows ...string) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-const wakeRow = "job_wake_cmd        herdr-hermes wake                    file"
+const wakeRow = "job_wake_cmd        nau wake                              file"
 
 type doctorLine struct {
 	HerdrSoho struct {
@@ -204,10 +204,9 @@ func TestDoctorWakeHook(t *testing.T) {
 }
 
 // TestDoctorWakeHookExactValue: the wake hook is accepted only when the
-// trimmed value's first field is the program name (nau or herdr-hermes)
-// and its second field is exactly wake; later fields, extra whitespace
-// and the source column are allowed. Both identities are covered, with
-// the brief's six accepted and seven rejected examples and their mirrors.
+// trimmed value's first field is exactly nau and its second field is
+// exactly wake; later fields, extra whitespace and the source column are
+// allowed. The retired herdr-hermes name is rejected on every shape.
 func TestDoctorWakeHookExactValue(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -216,20 +215,20 @@ func TestDoctorWakeHookExactValue(t *testing.T) {
 	}{
 		// Accepted.
 		{"nauWake", "nau wake", "true"},
-		{"herdrHermesWake", "herdr-hermes wake", "true"},
 		{"nauWakeExtraArgs", "nau wake --extra x", "true"},
 		{"nauWakeTripleSpace", "nau   wake", "true"},
 		{"nauWakeTab", "nau\twake", "true"},
 		{"nauWakePadded", "  nau wake  ", "true"},
-		{"herdrHermesWakeExtraArgs", "herdr-hermes wake --extra x", "true"},
-		{"herdrHermesWakeTripleSpace", "herdr-hermes   wake", "true"},
-		{"herdrHermesWakeTab", "herdr-hermes\twake", "true"},
-		{"herdrHermesWakePadded", "  herdr-hermes wake  ", "true"},
-		// Rejected.
+		// Rejected, including the retired herdr-hermes name on every shape.
+		{"herdrHermesWake", "herdr-hermes wake", "false"},
 		{"nauWakeup", "nau wakeup", "false"},
 		{"herdrHermesWakeup", "herdr-hermes wakeup", "false"},
 		{"nauWakeboard", "nau wakeboard", "false"},
 		{"herdrHermesWakeboard", "herdr-hermes wakeboard", "false"},
+		{"herdrHermesWakeExtraArgs", "herdr-hermes wake --extra x", "false"},
+		{"herdrHermesWakeTripleSpace", "herdr-hermes   wake", "false"},
+		{"herdrHermesWakeTab", "herdr-hermes\twake", "false"},
+		{"herdrHermesWakePadded", "  herdr-hermes wake  ", "false"},
 		{"nauwakeGlued", "nauwake", "false"},
 		{"herdrHermeswakeGlued", "herdr-hermeswake", "false"},
 		{"nauOnly", "nau", "false"},

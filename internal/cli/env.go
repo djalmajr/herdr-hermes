@@ -8,16 +8,10 @@ import (
 	"time"
 )
 
-// ProgramNau and ProgramHerdrHermes are the two program names the CLI
-// runs under: ProgramNau is the primary name and ProgramHerdrHermes the
-// deprecated name of the same program (same commands, same state, same
-// exit codes). The names drive only the usage text and the stderr
-// diagnostic prefix; every state and wire surface keeps its own literal
-// identifiers.
-const (
-	ProgramNau         = "nau"
-	ProgramHerdrHermes = "herdr-hermes"
-)
+// ProgramNau is the program name the CLI runs under. It drives only the
+// usage text and the stderr diagnostic prefix; every state and wire
+// surface keeps its own literal identifiers.
+const ProgramNau = "nau"
 
 // Env carries every dependency a command needs from the process. Tests
 // replace each field; ConfigDir is the herdr-hermes directory itself (in
@@ -25,10 +19,10 @@ const (
 type Env struct {
 	Stdin          io.Reader
 	Stdout, Stderr io.Writer
-	// Program is the name the entry point runs under (ProgramNau or
-	// ProgramHerdrHermes); it drives the usage text and the stderr
-	// diagnostic prefix. Empty (tests that build Env by hand) defaults
-	// to ProgramNau.
+	// Program is the name the entry point runs under; it is always
+	// ProgramNau. It drives the usage text and the stderr diagnostic
+	// prefix. Empty (tests that build Env by hand) defaults to
+	// ProgramNau.
 	Program string
 	Getenv  func(string) string
 	// Environ returns the exact environment of the nau process;

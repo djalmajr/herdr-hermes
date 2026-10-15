@@ -108,8 +108,8 @@ func doctorOutboxCounts(env Env) doctorOutbox {
 
 // wakeHookConfigured runs `herdr-soho config` with HERDR_SOHO_NOWRITE=1 in
 // the child environment and classifies the job_wake_cmd value: "true"
-// when the trimmed value's first field is "nau" or "herdr-hermes" and its
-// second field is exactly "wake", "false" when the output is parseable but
+// when the trimmed value's first field is exactly "nau" and its second
+// field is exactly "wake", "false" when the output is parseable but
 // shows no such hook, "unknown" on a non-zero exit or unparseable output.
 func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string {
 	environ := childEnviron(env)
@@ -143,11 +143,10 @@ func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string
 
 // parseWakeHook classifies the `herdr-soho config` output. A line whose
 // first whitespace-separated field is job_wake_cmd decides the result:
-// true when the trimmed value's first field is the program name (nau or
-// herdr-hermes) and its second field is exactly wake; fields after the
-// second, extra whitespace and the source column are allowed. The rest of
-// the output must be parseable as key-value lines for the result to be
-// false; otherwise it is unknown.
+// true when the trimmed value's first field is exactly nau and its second
+// field is exactly wake; fields after the second, extra whitespace and the
+// source column are allowed. The rest of the output must be parseable as
+// key-value lines for the result to be false; otherwise it is unknown.
 func parseWakeHook(output string) string {
 	parseable := false
 	for _, line := range strings.Split(output, "\n") {
@@ -158,7 +157,7 @@ func parseWakeHook(output string) string {
 		parseable = true
 		if fields[0] == "job_wake_cmd" {
 			value := strings.Fields(line[len(fields[0]):])
-			if len(value) >= 2 && (value[0] == ProgramNau || value[0] == ProgramHerdrHermes) && value[1] == "wake" {
+			if len(value) >= 2 && value[0] == ProgramNau && value[1] == "wake" {
 				return "true"
 			}
 			return "false"

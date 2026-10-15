@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -13,7 +14,7 @@ import (
 // it parses with the small line-based TOML subset reader below (no
 // third-party module), carries the bridge id, every section id matches the
 // Herdr id rule, and every command is an argv array starting with
-// herdr-hermes.
+// nau.
 
 var sectionIDRe = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
@@ -25,6 +26,7 @@ type manifestSection struct {
 
 type manifest struct {
 	id       string
+	name     string
 	sections []manifestSection
 }
 
@@ -62,8 +64,11 @@ func parseManifest(t *testing.T, path string) manifest {
 		key = strings.TrimSpace(key)
 		val = strings.TrimSpace(val)
 		if cur == nil {
-			if key == "id" {
+			switch key {
+			case "id":
 				m.id = unquoteManifest(t, val)
+			case "name":
+				m.name = unquoteManifest(t, val)
 			}
 			continue
 		}
@@ -108,21 +113,31 @@ func TestManifest(t *testing.T) {
 	if m.id != "djalmajr.herdr-hermes" {
 		t.Fatalf("plugin id = %q, want djalmajr.herdr-hermes", m.id)
 	}
+	if m.name != "herdr-hermes" {
+		t.Fatalf("plugin name = %q, want herdr-hermes", m.name)
+	}
 	if len(m.sections) == 0 {
 		t.Fatal("manifest has no sections; the reader is not reading the file")
 	}
 
-	wantPairs := map[string]bool{
-		"startup sync":             false,
-		"events workspace-created": false,
-		"events workspace-closed":  false,
-		"events agent-status":      false,
-		"actions status":           false,
-		"actions sync":             false,
+	// Each expected section pair maps to its exact argv, element by
+	// element: a joined string would accept "plugin bridge" as one
+	// argument, which the CLI rejects.
+	wantPairs := map[string][]string{
+		"startup sync":             {"nau", "plugin", "startup"},
+		"events workspace-created": {"nau", "plugin", "event"},
+		"events workspace-closed":  {"nau", "plugin", "event"},
+		"events agent-status":      {"nau", "plugin", "event"},
+		"actions status":           {"nau", "plugin", "bridge", "status"},
+		"actions sync":             {"nau", "plugin", "bridge", "sync"},
 	}
+	seenPairs := map[string]bool{}
 	for _, s := range m.sections {
-		if _, want := wantPairs[s.name+" "+s.id]; want {
-			wantPairs[s.name+" "+s.id] = true
+		if want, ok := wantPairs[s.name+" "+s.id]; ok {
+			seenPairs[s.name+" "+s.id] = true
+			if !slices.Equal(s.command, want) {
+				t.Errorf("[%s %s] command %q, want %q", s.name, s.id, s.command, want)
+			}
 		}
 		if !sectionIDRe.MatchString(s.id) {
 			t.Errorf("[%s] id %q does not match [a-z][a-z0-9-]*", s.name, s.id)
@@ -131,12 +146,12 @@ func TestManifest(t *testing.T) {
 			t.Errorf("[%s %s] has no command", s.name, s.id)
 			continue
 		}
-		if s.command[0] != "herdr-hermes" {
-			t.Errorf("[%s %s] command %v does not start with herdr-hermes", s.name, s.id, s.command)
+		if s.command[0] != "nau" {
+			t.Errorf("[%s %s] command %v does not start with nau", s.name, s.id, s.command)
 		}
 	}
-	for name, seen := range wantPairs {
-		if !seen {
+	for name := range wantPairs {
+		if !seenPairs[name] {
 			t.Errorf("manifest is missing the expected section pair %q", name)
 		}
 	}
