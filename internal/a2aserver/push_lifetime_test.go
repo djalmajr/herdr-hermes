@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,9 @@ var plLogCanaries = []string{plPushToken, "owner-ref-a", "svc-a", "org/secret", 
 type plSender struct {
 	mu    sync.Mutex
 	calls []plCall
+	// wake is closed and replaced on every call, so a waiter blocks on
+	// a channel instead of polling.
+	wake chan struct{}
 }
 
 type plCall struct {
@@ -62,7 +66,36 @@ func (s *plSender) SendPush(_ context.Context, cfg *a2a.PushConfig, ev a2a.Event
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, plCall{configID: cfg.ID, state: plEventState(ev)})
+	if s.wake != nil {
+		close(s.wake)
+	}
+	s.wake = make(chan struct{})
 	return nil
+}
+
+// waitFor waits until cond holds over the recorded calls, bounded by a
+// 10s deadline: every call closes the channel the waiter blocks on, so
+// the wait needs no sleep.
+func (s *plSender) waitFor(t *testing.T, what string, cond func([]plCall) bool) {
+	t.Helper()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for {
+		s.mu.Lock()
+		if s.wake == nil {
+			s.wake = make(chan struct{})
+		}
+		ok, n, wake := cond(s.calls), len(s.calls), s.wake
+		s.mu.Unlock()
+		if ok {
+			return
+		}
+		select {
+		case <-wake:
+		case <-timer.C:
+			t.Fatalf("%s: not reached within 10s (%d push calls recorded)", what, n)
+		}
+	}
 }
 
 // callsFor returns the calls of one config id, in call order.
@@ -310,40 +343,33 @@ func plFirstSend(in SendInput) *a2a.SendMessageRequest {
 	}
 }
 
-// plWaitWorkingPush waits, with a deadline (a bounded poll like the
-// shared waits, no sleep for synchronization), until the sender
-// records the working push of the given config: the first-send config
-// is stored before the execution starts, so the working push always
-// reaches it and this wait establishes the test's baseline.
+// plWaitWorkingPush waits, with a deadline and no sleep (the sender
+// wakes the wait on every call), until the sender records the working
+// push of the given config: the first-send config is stored before the
+// execution starts, so the working push always reaches it and this
+// wait establishes the test's baseline.
 func plWaitWorkingPush(t *testing.T, s *plSender, configID string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, c := range s.callsFor(configID) {
-			if c.state == a2a.TaskStateWorking {
-				return
+	s.waitFor(t, "the working push of "+configID+" (the first-send config must be stored before the execution)", func(calls []plCall) bool {
+		for _, c := range calls {
+			if c.configID == configID && c.state == a2a.TaskStateWorking {
+				return true
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("no working push recorded for %s: the first-send config must be stored before the execution", configID)
+		return false
+	})
 }
 
-// plWaitCalls waits, with a deadline (a bounded poll like the shared
-// waits, no sleep for synchronization), until the sender has recorded
-// at least want calls: the SDK sends the push right after it commits
-// the event, so this bounds that window for a count assertion on a
-// still-parked execution.
+// plWaitCalls waits, with a deadline and no sleep (the sender wakes
+// the wait on every call), until the sender has recorded at least want
+// calls: the SDK sends the push right after it commits the event, so
+// this bounds that window for a count assertion on a still-parked
+// execution.
 func plWaitCalls(t *testing.T, s *plSender, want int) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if s.count() >= want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("push calls = %d, want at least %d", s.count(), want)
+	s.waitFor(t, fmt.Sprintf("at least %d push calls", want), func(calls []plCall) bool {
+		return len(calls) >= want
+	})
 }
 
 // plNewTask parks one task in the given project under the bearer
