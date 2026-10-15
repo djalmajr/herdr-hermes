@@ -76,4 +76,15 @@ func TestParseHerdrAgentGet(t *testing.T) {
 			t.Fatal("parse = nil error, want an error for another error code")
 		}
 	})
+
+	// (h) An error next to a result is an error, whatever the result
+	// says: the error member decides before the result is read.
+	t.Run("an error next to a matching result is an error", func(t *testing.T) {
+		for _, code := range []string{"invalid_target", "agent_not_found"} {
+			body := `{"error":{"code":"` + code + `"},"id":"cli:agent:get","result":{"agent":{"name":"orchestrator-4","pane_id":"w6Y:p1"},"type":"agent_info"}}`
+			if name, err := parseHerdrAgentGet(body, "w6Y:p1"); err == nil {
+				t.Fatalf("parse with error %s = %q, nil, want an error", code, name)
+			}
+		}
+	})
 }

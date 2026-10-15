@@ -4,9 +4,10 @@ package cli
 // of a pane on the local Herdr, read from the herdr binary of the PATH
 // with `herdr agent get <pane>`. The query is read-only and the
 // subprocess is an argv array with the exact environment of the nau
-// process, never a shell; the bound and the wait delay leave no process
-// behind. The parser of the one JSON line the binary prints is pure and
-// is tested without a subprocess.
+// process, never a shell; on the bound the direct child is canceled and,
+// after the wait delay, killed. Like the herdr-soho runner, it does not
+// track descendants the child may start. The parser of the one JSON line
+// the binary prints is pure and is tested without a subprocess.
 
 import (
 	"bytes"
@@ -27,7 +28,7 @@ const (
 	herdrAgentGetBound = 10 * time.Second
 	// herdrAgentGetWaitDelay gives a child that ignores the cancel
 	// signal a bounded grace period before the process is killed, so
-	// the bound never leaves a process behind.
+	// the bound never leaves the direct child behind.
 	herdrAgentGetWaitDelay = 5 * time.Second
 )
 
@@ -52,19 +53,23 @@ type herdrAgentGet struct {
 // parseHerdrAgentGet reads the output of `herdr agent get <pane>` and
 // returns the agent name of the pane. It returns "" and a nil error when
 // the pane has no agent (the binary's agent_not_found answer, which
-// exits 0); every other answer that is not the agent of the requested
-// pane — an invalid JSON, a result without an agent, an empty name, a
-// different pane_id or any other error answer — is an error (fail
-// closed).
+// exits 0, with no result); every other answer that is not the agent of
+// the requested pane — an invalid JSON, any other error answer, an error
+// next to a result, a result without an agent, an empty name or a
+// different pane_id — is an error (fail closed). An error member decides
+// the answer before the result is read.
 func parseHerdrAgentGet(out, pane string) (string, error) {
 	var body herdrAgentGet
 	if err := json.Unmarshal([]byte(out), &body); err != nil {
 		return "", fmt.Errorf("herdr agent get: invalid JSON output: %v", err)
 	}
-	if body.Result == nil {
-		if body.Error != nil && body.Error.Code == "agent_not_found" {
+	if body.Error != nil {
+		if body.Error.Code == "agent_not_found" && body.Result == nil {
 			return "", nil
 		}
+		return "", errors.New("herdr agent get: the answer carries an error")
+	}
+	if body.Result == nil {
 		return "", errors.New("herdr agent get: no agent in the answer")
 	}
 	agent := body.Result.Agent
