@@ -3,7 +3,9 @@
 package proctree_test
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -106,4 +108,33 @@ func TestPrepareLeavesSysProcAttrAlone(t *testing.T) {
 	if cmd.SysProcAttr.CreationFlags != 0x1 {
 		t.Fatalf("Prepare changed the SysProcAttr (CreationFlags = %x, want 1)", cmd.SysProcAttr.CreationFlags)
 	}
+}
+
+// TestAttachErrorReturnsAnInertRelease proves the release contract of
+// the Attach error path on Windows: a cmd whose process was never
+// started takes the os.ErrProcessDone path, and the release it
+// returns is not nil — the callers run `defer release()` without
+// checking the error, so a nil release there is a panic at the end of
+// the run, not the documented degraded fallback. Calling the release
+// must not panic and must not change anything.
+func TestAttachErrorReturnsAnInertRelease(t *testing.T) {
+	cmd := exec.Command("true")
+	release, err := proctree.Attach(cmd)
+	if err == nil {
+		t.Fatal("Attach = nil error, want the no-process error")
+	}
+	if !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Attach error = %v, want os.ErrProcessDone", err)
+	}
+	if release == nil {
+		t.Fatal("the Attach error path returned a nil release: the caller's defer release() would panic")
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("calling the error-path release panicked: %v", r)
+			}
+		}()
+		release()
+	}()
 }

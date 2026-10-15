@@ -12,8 +12,12 @@
 //	cmd.Start()
 //	release, _ := proctree.Attach(cmd) // right after Start
 //	defer release()
+//	stop, cleanup := proctree.ForwardSignals(cmd) // around Wait, while the child runs
+//	defer cleanup() // stops the relay's reception (the no-signal path only)
 //	cmd.Cancel = ... proctree.Terminate(cmd) ... // on the context cancel
 //	cmd.Wait()
+//	sig, had := stop()
+//	if had { proctree.ReRaise(sig) }    // the run ends on the very signal
 //	if the cancel fired { proctree.Kill(cmd) }   // after Wait
 //
 // Terminate is the graceful tree termination on the cancel, and Kill is
@@ -21,4 +25,15 @@
 // cancelled run to end whatever the graceful step left behind. Neither
 // is called on a run that finished without a cancel, so the group or
 // job of a child that exited on its own is never touched.
+//
+// ForwardSignals and ReRaise keep an interrupted run from leaving the
+// child's tree behind: the group isolation that makes the cancel reach
+// the whole tree also takes the child out of the foreground group, so
+// a terminal signal (the Ctrl-C) reaches only the caller; the relay
+// hands it to the child's group while the child runs, and the caller
+// ends on the very signal (ReRaise) when one was received. A run that
+// received no signal changes nothing: the exit, the interrupted flag
+// and the deadline are all decided as before. On Windows the relay is
+// inert: the child never leaves the console group, so the console's
+// Ctrl-C keeps reaching it.
 package proctree

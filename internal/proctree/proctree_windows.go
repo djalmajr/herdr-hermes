@@ -56,24 +56,27 @@ func Prepare(cmd *exec.Cmd) {}
 // On failure (the job object, the process handle or the assignment
 // could not be created) the run continues and the cancel falls back to
 // the child alone — the behavior before this package existed — because
-// a run that started is not refused over a tracking step.
+// a run that started is not refused over a tracking step. Every path
+// returns a non-nil release (inert on the error paths), so a caller's
+// `defer release()` is safe without checking the error.
 func Attach(cmd *exec.Cmd) (func(), error) {
+	inert := func() {}
 	if cmd.Process == nil {
-		return nil, os.ErrProcessDone
+		return inert, os.ErrProcessDone
 	}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
-		return nil, err
+		return inert, err
 	}
 	proc, err := windows.OpenProcess(windows.PROCESS_ALL_ACCESS, false, uint32(cmd.Process.Pid))
 	if err != nil {
 		windows.CloseHandle(job)
-		return nil, err
+		return inert, err
 	}
 	if err := windows.AssignProcessToJobObject(job, proc); err != nil {
 		windows.CloseHandle(job)
 		windows.CloseHandle(proc)
-		return nil, err
+		return inert, err
 	}
 	a := &attach{job: job, proc: proc}
 	regMu.Lock()
@@ -148,3 +151,19 @@ func release(cmd *exec.Cmd) {
 	windows.CloseHandle(a.proc)
 	windows.CloseHandle(a.job)
 }
+
+// ForwardSignals is a no-op on Windows: Prepare changes nothing before
+// the start, and the job object Attach creates does not move the child
+// out of the console group, so the console's Ctrl-C keeps reaching the
+// child the way it did before the group isolation on unix; there is no
+// signal for the runner process to relay. The returned stop is inert:
+// it always reports no signal, so the caller's post-Wait re-raise never
+// runs, and cleanup is likewise inert.
+func ForwardSignals(cmd *exec.Cmd) (stop func() (os.Signal, bool), cleanup func()) {
+	return func() (os.Signal, bool) { return nil, false }, func() {}
+}
+
+// ReRaise is a no-op on Windows: the relay never reports a signal (see
+// ForwardSignals), so there is no signal to re-raise; the console's
+// Ctrl-C ends the process the normal way.
+func ReRaise(sig os.Signal) {}

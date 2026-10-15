@@ -196,7 +196,19 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 	// to the child alone, the behavior before internal/proctree.
 	release, _ := proctree.Attach(cmd)
 	defer release()
+	// The relay forwards the terminal's signals (SIGINT, SIGTERM and
+	// SIGHUP on unix) to the child's group while the child runs, so an
+	// interrupted run does not leave the tree behind as orphans; on
+	// Windows the relay is inert and the console's Ctrl-C keeps
+	// reaching the child. The stop runs after the wait and reports the
+	// last signal received, if any, leaving the signal reception in
+	// place so the re-raise can end the process on the very signal;
+	// cleanup stops the reception (the no-signal path only, since the
+	// re-raise ends the process).
+	stopForward, cleanupForward := proctree.ForwardSignals(cmd)
+	defer cleanupForward()
 	waitErr := cmd.Wait()
+	sig, hadSignal := stopForward()
 	// The writers are closed (deferred, not awaited) once the wait
 	// machinery has decided the run: a delivery that is still in flight
 	// may finish into the wrapped writer after Run returned.
@@ -206,6 +218,17 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 	// deadline whatever exit code it ended with — the Windows
 	// TerminateProcess code 1 and a unix child that exits on SIGTERM
 	// both stay deadlines.
+	if hadSignal {
+		// The relay forwarded the terminal's signal to the child's
+		// group and the run ended on it: the process must die on the
+		// very signal it would have died on without the group
+		// isolation, so the default action is restored and the signal
+		// re-raised on the process itself. The child's exit code is not
+		// translated; the re-raise ends the process, so the return
+		// below is the fallback only when the re-raise did not.
+		proctree.ReRaise(sig)
+		return -1, waitErr
+	}
 	if interrupted.Load() {
 		// The cancel reached a live child: end whatever the graceful
 		// step left behind in the tree before the run is reported, so a

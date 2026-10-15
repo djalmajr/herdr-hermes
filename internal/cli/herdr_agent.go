@@ -140,7 +140,27 @@ func paneAgentName(ctx context.Context, environ []string, pane string) (string, 
 	// child alone.
 	release, _ := proctree.Attach(cmd)
 	defer release()
-	if err := cmd.Wait(); err != nil {
+	// The relay forwards the terminal's signals (SIGINT, SIGTERM and
+	// SIGHUP on unix) to the child's group while the child runs, so an
+	// interrupted run does not leave the tree behind as orphans; on
+	// Windows the relay is inert and the console's Ctrl-C keeps
+	// reaching the child. The stop reports the last signal received, if
+	// any, leaving the reception in place so the re-raise can end the
+	// process on the very signal; cleanup stops it (the no-signal path
+	// only).
+	stopForward, cleanupForward := proctree.ForwardSignals(cmd)
+	defer cleanupForward()
+	waitErr := cmd.Wait()
+	if sig, hadSignal := stopForward(); hadSignal {
+		// The relay forwarded the terminal's signal to the child's
+		// group and the run ended on it: the process must die on the
+		// very signal it would have died on without the group
+		// isolation. The re-raise ends the process, so the error below
+		// is the fallback only when the re-raise did not.
+		proctree.ReRaise(sig)
+		return "", fmt.Errorf("herdr agent get: ended by %v", sig)
+	}
+	if waitErr != nil {
 		if cctx.Err() != nil {
 			// The bound expired while the child (or one of its
 			// descendants) was still alive: end whatever the cancel
@@ -150,7 +170,7 @@ func paneAgentName(ctx context.Context, environ []string, pane string) (string, 
 			}
 			return "", fmt.Errorf("herdr agent get: killed after %s", herdrAgentGetBound)
 		}
-		return "", fmt.Errorf("herdr agent get: exited without the agent answer: %v", err)
+		return "", fmt.Errorf("herdr agent get: exited without the agent answer: %v", waitErr)
 	}
 	return parseHerdrAgentGet(out.String(), pane)
 }

@@ -205,7 +205,11 @@ func TestCancelTerminatesTheTree(t *testing.T) {
 // TestNormalExitLeavesDescendants is the control of the regression: a
 // child that exits on its own, without any cancel, must leave the
 // descendants it left on purpose running (a bounded command may leave
-// legitimate work behind), and the test is the one that ends them.
+// legitimate work behind), and the test is the one that ends them. The
+// release runs before the survival proof, and the proof is a fresh
+// liveness request answered only after the release: a release that
+// ends the tree, or a pid merely still visible during the reap window,
+// never answers it.
 func TestNormalExitLeavesDescendants(t *testing.T) {
 	dir := t.TempDir()
 	exe, err := os.Executable()
@@ -226,7 +230,6 @@ func TestNormalExitLeavesDescendants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
-	defer release()
 	start := time.Now()
 	err = cmd.Wait()
 	elapsed := time.Since(start)
@@ -251,18 +254,61 @@ func TestNormalExitLeavesDescendants(t *testing.T) {
 	if err != nil || pid <= 0 {
 		t.Fatalf("the pid file holds %q, want a pid", string(b))
 	}
+	// The release runs first, before the survival proof: the proof must
+	// observe the tree after the release, not before it.
+	release()
 	// The grandchild the child left on purpose is still running...
 	alive, aerr := processAlive(pid)
 	if aerr != nil {
 		t.Fatalf("probe: %v", aerr)
 	}
 	if !alive {
-		t.Fatalf("the grandchild %d is not alive after the child's normal exit: the normal exit touched the tree", pid)
+		t.Fatalf("the grandchild %d is not alive after the child's normal exit and the release: the release touched the tree", pid)
 	}
+	// ...and it can still run: a fresh liveness request, written only
+	// after the release, is answered.
+	livenessRequest(t, pidfile+".liveness")
 	// ...and the test is the one that ends it, with the cleanup
 	// proved (the probe says the process is gone, not just signalled).
 	killTree(pid)
 	if err := processGone(pid); err != nil {
 		t.Fatalf("cleanup: the grandchild %d the test ended is not gone: %v", pid, err)
+	}
+}
+
+// livenessRequest asks the grandchild for a fresh answer and waits
+// with a bound (pidFileBound) for it: the response file is removed
+// first, and the grandchild answers only in response to the request
+// (its content echoed), so an answer is created in response to this
+// request only — it proves the holder ran after the request was
+// written. A release that ended the tree, or a pid merely still
+// visible during the reap window, never answers.
+func livenessRequest(t *testing.T, liveness string) {
+	t.Helper()
+	req := []byte("liveness")
+	respPath := liveness + ".resp"
+	if err := os.Remove(respPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("remove a stale liveness answer: %v", err)
+	}
+	if err := os.WriteFile(liveness+".req", req, 0o600); err != nil {
+		t.Fatalf("write the liveness request: %v", err)
+	}
+	var last []byte
+	var lastErr error
+	deadline := time.Now().Add(pidFileBound)
+	for {
+		b, err := os.ReadFile(respPath)
+		if err == nil {
+			last, lastErr = b, nil
+			if bytes.Equal(b, req) {
+				return
+			}
+		} else {
+			last, lastErr = nil, err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the grandchild did not answer the fresh liveness request within %s (answer: %q, %v): the release touched the tree", pidFileBound, string(last), lastErr)
+		}
+		time.Sleep(pidPoll)
 	}
 }

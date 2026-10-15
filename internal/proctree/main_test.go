@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/djalmajr/nau/internal/proctree"
 )
 
 // The argv markers that route a re-executed copy of this test binary
@@ -18,6 +20,7 @@ const (
 	grandchildMarker = "-proctree-grandchild"
 	childHoldMarker  = "-proctree-child-hold"
 	childExitMarker  = "-proctree-child-exit"
+	forwarderMarker  = "-proctree-forwarder"
 )
 
 // TestMain lets the re-executed copy of this test binary play the child
@@ -28,10 +31,15 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case grandchildMarker:
-			if len(os.Args) != 2 {
-				roleDie(fmt.Errorf("usage: %s", grandchildMarker))
+			if len(os.Args) != 3 {
+				roleDie(fmt.Errorf("usage: %s <liveness>", grandchildMarker))
 			}
-			runGrandchild()
+			runGrandchild(os.Args[2])
+		case forwarderMarker:
+			if len(os.Args) != 4 {
+				roleDie(fmt.Errorf("usage: %s <childpidfile> <grandchildpidfile>", forwarderMarker))
+			}
+			runForwarder(os.Args[2], os.Args[3])
 		case childHoldMarker:
 			if len(os.Args) < 3 || len(os.Args) > 4 {
 				roleDie(fmt.Errorf("usage: %s <pidfile> [hard]", childHoldMarker))
@@ -57,12 +65,34 @@ func roleDie(err error) {
 
 // runGrandchild is the grandchild role: it holds the stdout and stderr
 // the child gave it (the pipe the test pointed the child at stays open
-// through it), until it is killed. The sleep loop keeps a timer
+// through it), until it is killed, and answers the liveness requests
+// the test writes to liveness+".req". The sleep loop keeps a timer
 // pending, so the runtime's deadlock check (all goroutines asleep with
 // no timer) does not end the holder.
-func runGrandchild() {
+func runGrandchild(liveness string) {
+	if liveness != "" {
+		go serveLiveness(liveness)
+	}
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+// serveLiveness polls the liveness request file and answers it: the
+// request's content is echoed on the response file and the request is
+// removed, so one request yields exactly one fresh answer — an answer
+// only exists after a request, so a request written after the run
+// ended is answered only if the holder is still able to run. It is
+// file polling with the package's tick, the same idiom the tests use
+// for the pid file.
+func serveLiveness(liveness string) {
+	for {
+		req, err := os.ReadFile(liveness + ".req")
+		if err == nil {
+			_ = os.WriteFile(liveness+".resp", req, 0o600)
+			_ = os.Remove(liveness + ".req")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -89,12 +119,13 @@ func runChild(pidfile string, stay, hard bool) {
 	if hard {
 		armInheritedTermIgnore()
 	}
-	cmd := exec.Command(exe, grandchildMarker)
+	cmd := exec.Command(exe, grandchildMarker, pidfile+".liveness")
 	// os/exec connects a nil Stdout/Stderr to the null device, it does
 	// not inherit: the grandchild must take the child's own descriptors
 	// explicitly (the same way fakesoho's pipe holder takes them), so
 	// the pipe the test pointed the child at stays held through the
-	// grandchild's lifetime.
+	// grandchild's lifetime. The liveness file derives from the pid
+	// file, so the test knows its path without another argument.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -109,4 +140,48 @@ func runChild(pidfile string, stay, hard bool) {
 	for {
 		time.Sleep(time.Hour)
 	}
+}
+
+// runForwarder is the helper role of the relay test: it runs the
+// production wiring of a run — Prepare before Start, Attach right
+// after Start, the ForwardSignals relay around Wait and the ReRaise
+// when the stop reports a signal — on a child that starts a grandchild
+// and holds the helper's stdout (the pipe the test pointed the helper
+// at, held through the grandchild). The test starts the helper in its
+// own process group, so a signal the test sends to the helper's group
+// reaches only the helper, the way the terminal's Ctrl-C reaches only
+// the foreground process after the child left the group.
+func runForwarder(childpidfile, grandchildpidfile string) {
+	exe, err := os.Executable()
+	if err != nil {
+		roleDie(err)
+	}
+	cmd := exec.Command(exe, childHoldMarker, grandchildpidfile)
+	proctree.Prepare(cmd)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		roleDie(err)
+	}
+	if err := os.WriteFile(childpidfile, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		roleDie(err)
+	}
+	release, err := proctree.Attach(cmd)
+	if err != nil {
+		roleDie(err)
+	}
+	defer release()
+	stop, cleanup := proctree.ForwardSignals(cmd)
+	cmd.Wait()
+	sig, had := stop()
+	if had {
+		// The relay forwarded the terminal's signal to the child's
+		// group and the run ended on it: the helper must die on the
+		// very signal it would have died on without the group
+		// isolation, so the re-raise ends the process and the exit
+		// below is the fallback only when it did not.
+		proctree.ReRaise(sig)
+	}
+	cleanup()
+	os.Exit(0)
 }
