@@ -193,35 +193,16 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 				return
 			}
 			// A continuation whose message id was already admitted: the
-			// admission stands (no second ingress row, no second
-			// delivery). The interceptor answers the common resend before
-			// any execution (no write, no push); this branch is the
-			// defense for a resend that passes it before the first
-			// admission is stored, and this path still writes the task
-			// and sends its push: an execution cannot answer without an
-			// event (with none the SDK waits forever, and an error fails
-			// the task). The stored task — the version the SDK
-			// loaded for this continuation, the same one its update is
-			// checked against — is the first event, so the resend never
-			// changes the task state. In a state that is final for the
-			// SDK (input_required or terminal, the rule of
-			// SDK/internal/taskupdate/final.go; a terminal task is already
-			// refused before the executor) the execution ends with the
-			// task event; in working it parks like an admitted
-			// continuation, so the owner's decision reaches it through
-			// the live entry and ends the execution with the decision's
-			// final event. A yield failure ends the execution the same
-			// way the admitted path does: the entry is cleaned by
-			// Cleanup when the execution ends.
-			if state := execCtx.StoredTask.Status.State; !state.Terminal() && state != a2a.TaskStateInputRequired {
-				p := e.register(string(execCtx.TaskID))
-				if !yield(execCtx.StoredTask, nil) {
-					return
-				}
-				e.park(ctx, p, yield, execCtx)
-				return
-			}
-			yield(execCtx.StoredTask, nil)
+			// admission stands (no second ingress row, no second delivery)
+			// and the interceptor answers the common resend before any
+			// execution (no write, no push); this branch is the defense
+			// for the resend that passes it before the first admission is
+			// stored. It ends the execution with the busy error and no
+			// event, so the caller gets the stable retry-later answer and
+			// the retry is safe: the SDK's failed-state write attempts the
+			// store on the canceled execution context, which the store
+			// refuses, so nothing is written and no push goes out.
+			yield(nil, taskBusyError())
 			return
 		}
 		// Admitted: the parked entry exists before the first event is

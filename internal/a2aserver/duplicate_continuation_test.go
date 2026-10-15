@@ -2,6 +2,7 @@ package a2aserver
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -268,21 +269,28 @@ func TestDuplicateResendInvisibleTaskStaysNotFound(t *testing.T) {
 	}
 }
 
-// dupHoldBefore delegates to the real interceptor and, for the held
-// message id, waits after the real Before has run (its admission lookup
-// found nothing) until the test releases it, so the request reaches the
-// SDK only after another request admitted the same message.
+// dupHoldBefore delegates to the real interceptor and, for the first
+// send of the held message id, waits after the real Before has run
+// (its admission lookup found nothing) until the test releases it, so
+// the request reaches the SDK only after another request admitted the
+// same message. A later send of the same message id (the resend,
+// answered early by the interceptor) is not held.
 type dupHoldBefore struct {
 	*authInterceptor
 	messageID string
 	entered   chan struct{}
 	release   chan struct{}
+	heldOnce  sync.Once
 }
 
 // Before implements a2asrv.CallInterceptor.
 func (g *dupHoldBefore) Before(ctx context.Context, callCtx *a2asrv.CallContext, req *a2asrv.Request) (context.Context, any, error) {
 	ctx, result, err := g.authInterceptor.Before(ctx, callCtx, req)
-	if p, ok := req.Payload.(*a2a.SendMessageRequest); ok && callCtx.Method() == "SendMessage" && p != nil && p.Message != nil && string(p.Message.ID) == g.messageID {
+	var held bool
+	if p, ok := req.Payload.(*a2a.SendMessageRequest); ok && callCtx.Method() == "SendMessage" && p != nil && p.Message != nil && string(p.Message.ID) == g.messageID && err == nil {
+		g.heldOnce.Do(func() { held = true })
+	}
+	if held {
 		close(g.entered)
 		select {
 		case <-g.release:
@@ -296,12 +304,14 @@ func (g *dupHoldBefore) Before(ctx context.Context, callCtx *a2asrv.CallContext,
 // TestDuplicateResendPastInterceptorWindow pins the one window the
 // interceptor cannot close: a send whose admission lookup ran before
 // the first admission of the same message committed, and that reaches
-// the SDK only after that admission's execution ended (here, after the
-// owner's second question). The executor then answers the stored task
-// through the execution, the only answer the SDK accepts there: the
-// task keeps its state and is not failed, and no second ingress row or
-// delivery is made, but the task is stored again and its push configs
-// receive the current state once more.
+// the SDK only after that admission is stored (here, after the
+// owner's second question ended the first execution). The executor's
+// defense branch answers it with the stable busy refusal: the task
+// keeps its state and is not failed, no second ingress row or
+// delivery is made, nothing is written and no push goes out, and the
+// second server keeps no live execution. The next resend of the same
+// message is answered by the interceptor with the stored task, without
+// running it.
 func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 	store, path := newTestStore(t)
 	auth := newTableAuth(testSubject("caller-1"))
@@ -342,7 +352,12 @@ func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 		a2asrv.WithCallInterceptors(hold),
 		a2asrv.WithLogger(s2.cfg.Logger),
 	)
-	c2 := dialClient(t, serveServer(t, s2).URL, auth, "caller-1")
+	rec := &pcRecorder{}
+	c2, err := Dial(ctxT(t), serveServer(t, s2).URL, staticCredential{value: auth.token("caller-1")}, &http.Client{Timeout: 10 * time.Second, Transport: rec})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { c2.Close() })
 
 	in := SendInput{TaskID: string(task.ID), ContextID: task.ContextID, Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-2", Text: "continuation"}
 	type answer struct {
@@ -370,9 +385,10 @@ func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 	if _, err := c.client.CreateTaskPushConfig(ctxT(t), &a2a.PushConfig{TaskID: task.ID, URL: f1URL}); err != nil {
 		t.Fatalf("create push config before the release: %v", err)
 	}
+	versionBefore := dupTaskVersion(t, path, string(task.ID))
+	pushesBefore := pusher.count()
 	ingressID := f1Count(t, path, `SELECT ingress_id FROM a2a_ingress WHERE message_id = ?`, "m-2")
 	deliveriesBefore := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID)
-	pushesBefore := pusher.count()
 
 	close(hold.release)
 	released = true
@@ -382,15 +398,27 @@ func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the held send did not answer within 10s of its release")
 	}
-	if ans.err != nil {
-		t.Fatalf("held send: %v", ans.err)
+	// The held send gets the canonical busy answer: the stable text,
+	// the 500 INTERNAL body, no new version, no push, the durable state
+	// unchanged and no live execution on the second server.
+	if ans.err == nil || !errors.Is(ans.err, a2a.ErrInternalError) || ans.err.Error() != taskBusyText {
+		state := ""
+		if task, ok := ans.res.(*a2a.Task); ok {
+			state = string(task.Status.State)
+		}
+		t.Errorf("held send = %T (state %s), %v, want the internal error %q and no result", ans.res, state, ans.err, taskBusyText)
 	}
-	got, ok := ans.res.(*a2a.Task)
-	if !ok || got.ID != task.ID {
-		t.Fatalf("held send = %T %+v, want the same task", ans.res, ans.res)
+	wire := rec.wire()
+	if wire.status != http.StatusInternalServerError {
+		t.Errorf("busy status = %d, want 500 (body: %.120s)", wire.status, wire.body)
+	} else if got := strings.TrimSpace(pcNorm(wire.body)); got != ctBusyBody {
+		t.Errorf("busy body = %s, want %s", got, ctBusyBody)
 	}
-	if got.Status.State != a2a.TaskStateInputRequired {
-		t.Errorf("held send state = %s, want %s (the task keeps its state)", got.Status.State, a2a.TaskStateInputRequired)
+	if got := dupTaskVersion(t, path, string(task.ID)); got != versionBefore {
+		t.Errorf("task version after the held send = %d, want %d (no write by the held send)", got, versionBefore)
+	}
+	if got := pusher.count() - pushesBefore; got != 0 {
+		t.Errorf("pushes caused by the held send = %d, want 0 (no push by the held send)", got)
 	}
 	tv, err := store.TaskView(ctxT(t), string(task.ID))
 	if err != nil || tv == nil || tv.State != a2acore.StateInputRequired {
@@ -402,8 +430,181 @@ func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
 	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID); got != deliveriesBefore {
 		t.Errorf("deliveries of m-2 = %d, want %d (no second delivery)", got, deliveriesBefore)
 	}
-	if got := pusher.count() - pushesBefore; got != 1 {
-		t.Errorf("pushes caused by the held send = %d, want 1 (the current state sent once more)", got)
-	}
 	waitLive(t, s2, 0)
+
+	// The next resend of the same message is answered by the
+	// interceptor with the stored task, without running it: no new
+	// version, no push and the durable state unchanged.
+	res, err := c2.Send(ctxT(t), in)
+	if err != nil {
+		t.Fatalf("resent the same message: %v", err)
+	}
+	resent, ok := res.(*a2a.Task)
+	if !ok {
+		t.Fatalf("resent result = %T, want *a2a.Task", res)
+	}
+	if resent.ID != task.ID {
+		t.Errorf("resent task id = %s, want %s", resent.ID, task.ID)
+	}
+	if resent.Status.State != a2a.TaskStateInputRequired {
+		t.Errorf("resent task state = %s, want %s (the state before the resend)", resent.Status.State, a2a.TaskStateInputRequired)
+	}
+	if got := dupTaskVersion(t, path, string(task.ID)); got != versionBefore {
+		t.Errorf("task version after the resend = %d, want %d (no write by the resend)", got, versionBefore)
+	}
+	if got := pusher.count(); got != pushesBefore {
+		t.Errorf("push calls after the resend = %d, want %d (no push by the resend)", got, pushesBefore)
+	}
+	tvAfter, err := store.TaskView(ctxT(t), string(task.ID))
+	if err != nil || tvAfter == nil {
+		t.Fatalf("task view after the resend: %v, %v", tvAfter, err)
+	}
+	if tvAfter.State != a2acore.StateInputRequired {
+		t.Errorf("durable task state after the resend = %q, want %q (unchanged by the resend)", tvAfter.State, a2acore.StateInputRequired)
+	}
+}
+
+// TestDuplicateResendWhileFirstExecutionAlive pins the cross-instance
+// reach of the same window: the held send is released while the first
+// admission's execution is still alive on the first server (working,
+// before the decision). The defense branch answers it with the stable
+// busy refusal: no push, no new version, the durable state still
+// working and the first server's live execution the only one. The
+// answer decision then completes the task through that live execution
+// and both servers end with no live execution.
+func TestDuplicateResendWhileFirstExecutionAlive(t *testing.T) {
+	store, path := newTestStore(t)
+	auth := newTableAuth(testSubject("caller-1"))
+	routes := fakeRoutes{owner: "owner-ref-1"}
+	pusher := &dupPushSender{}
+	s := dupNewServer(t, store, auth, routes, pusher)
+	c := dialClient(t, serveServer(t, s).URL, auth, "caller-1")
+
+	task := sendTask(t, c, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateWorking)
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAsk, "dw-ask-1", "question 1")
+	if applied, refused, err := s.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply ask 1 = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateInputRequired)
+	waitLive(t, s, 0)
+
+	// A second server on the same store whose interceptor holds the m-2
+	// send right after its admission lookup (which finds nothing, the
+	// first admission not committed yet).
+	s2 := dupNewServer(t, store, auth, routes, pusher)
+	hold := &dupHoldBefore{
+		authInterceptor: newAuthInterceptor(s2.cfg).withCapabilities(&s2.card.Capabilities),
+		messageID:       "m-2",
+		entered:         make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(hold.release)
+		}
+	})
+	s2.handler = a2asrv.NewHandler(
+		s2.executor,
+		a2asrv.WithTaskStore(scopedTaskStore{store: store}),
+		a2asrv.WithPushNotifications(store.PushConfigs(), s2.cfg.PushSender),
+		a2asrv.WithCapabilityChecks(&s2.card.Capabilities),
+		a2asrv.WithCallInterceptors(hold),
+		a2asrv.WithLogger(s2.cfg.Logger),
+	)
+	rec := &pcRecorder{}
+	c2, err := Dial(ctxT(t), serveServer(t, s2).URL, staticCredential{value: auth.token("caller-1")}, &http.Client{Timeout: 10 * time.Second, Transport: rec})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { c2.Close() })
+
+	in := SendInput{TaskID: string(task.ID), ContextID: task.ContextID, Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-2", Text: "continuation"}
+	type answer struct {
+		res a2a.SendMessageResult
+		err error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		res, err := c2.Send(ctxT(t), in)
+		done <- answer{res, err}
+	}()
+	awaitSignal(t, "held send after its admission lookup", hold.entered)
+
+	// The same message is admitted through the first server and stays
+	// working: its execution is still alive, before the decision.
+	sendTask(t, c, in)
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateWorking)
+	waitLive(t, s, 1)
+
+	if _, err := c.client.CreateTaskPushConfig(ctxT(t), &a2a.PushConfig{TaskID: task.ID, URL: f1URL}); err != nil {
+		t.Fatalf("create push config before the release: %v", err)
+	}
+	versionBefore := dupTaskVersion(t, path, string(task.ID))
+	pushesBefore := pusher.count()
+	ingressID := f1Count(t, path, `SELECT ingress_id FROM a2a_ingress WHERE message_id = ?`, "m-2")
+	deliveriesBefore := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID)
+
+	close(hold.release)
+	released = true
+	var ans answer
+	select {
+	case ans = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the held send did not answer within 10s of its release")
+	}
+	// The held send gets the canonical busy answer while the first
+	// execution is still alive: the stable text, the 500 INTERNAL body,
+	// no new version, no push and the durable state still working.
+	if ans.err == nil || !errors.Is(ans.err, a2a.ErrInternalError) || ans.err.Error() != taskBusyText {
+		state := ""
+		if task, ok := ans.res.(*a2a.Task); ok {
+			state = string(task.Status.State)
+		}
+		t.Errorf("held send = %T (state %s), %v, want the internal error %q and no result", ans.res, state, ans.err, taskBusyText)
+	}
+	wire := rec.wire()
+	if wire.status != http.StatusInternalServerError {
+		t.Errorf("busy status = %d, want 500 (body: %.120s)", wire.status, wire.body)
+	} else if got := strings.TrimSpace(pcNorm(wire.body)); got != ctBusyBody {
+		t.Errorf("busy body = %s, want %s", got, ctBusyBody)
+	}
+	if got := dupTaskVersion(t, path, string(task.ID)); got != versionBefore {
+		t.Errorf("task version after the held send = %d, want %d (no write by the held send)", got, versionBefore)
+	}
+	if got := pusher.count() - pushesBefore; got != 0 {
+		t.Errorf("pushes caused by the held send = %d, want 0 (no push by the held send)", got)
+	}
+	tv, err := store.TaskView(ctxT(t), string(task.ID))
+	if err != nil || tv == nil || tv.State != a2acore.StateWorking {
+		t.Errorf("durable task after the held send = %+v, %v, want %q", tv, err, a2acore.StateWorking)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-2"); got != 1 {
+		t.Errorf("ingress rows of m-2 = %d, want 1 (no second admission)", got)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID); got != deliveriesBefore {
+		t.Errorf("deliveries of m-2 = %d, want %d (no second delivery)", got, deliveriesBefore)
+	}
+	// The first server's live execution stays the only one.
+	waitLive(t, s, 1)
+	waitLive(t, s2, 0)
+
+	// The answer decision completes the task through the first
+	// server's live execution; both servers end with no live execution
+	// and the final event is pushed.
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAnswer, "dw-answer", "the answer")
+	if applied, refused, err := s.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply answer = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitStoredState(t, store, string(task.ID), a2acore.StateCompleted)
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateCompleted)
+	waitLive(t, s, 0)
+	waitLive(t, s2, 0)
+	if got := pusher.count() - pushesBefore; got != 2 {
+		t.Errorf("pushes after the answer = %d, want 2 (the decision's artifact and final events)", got)
+	}
+	if ev, ok := pusher.lastEvent().(*a2a.TaskStatusUpdateEvent); !ok || ev.Status.State != a2a.TaskStateCompleted {
+		t.Errorf("pushed final event = %T, want the completed status update", pusher.lastEvent())
+	}
 }
