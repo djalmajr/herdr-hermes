@@ -81,6 +81,12 @@ var (
 	// one, so it is nil and a request that carries a credential fails
 	// closed; the tests inject a fixture.
 	a2aIdentityProvider a2acore.IdentityProvider
+	// a2aServeSecrets is the injected SecretProvider of the a2a serve
+	// store; nil uses the store default (the process-lifetime in-memory
+	// provider). No flag, environment variable or file configures a
+	// provider in this release; the tests inject a fixture whose Delete
+	// fails to prove the serve survives a cleanup failure.
+	a2aServeSecrets a2acore.SecretProvider
 )
 
 // a2aNeutralStates are the neutral task states a filter may name.
@@ -360,7 +366,7 @@ func cmdA2AServe(args []string, env Env) int {
 		fail(env, 2, "config: "+err.Error())
 		return 2
 	}
-	store, err := a2astore.OpenFile(db, a2astore.Options{Now: env.Now})
+	store, err := a2astore.OpenFile(db, a2astore.Options{Now: env.Now, Secrets: a2aServeSecrets})
 	if err != nil {
 		_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a serve:", err)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a serve: registry database unavailable"}))
@@ -423,12 +429,34 @@ func cmdA2AServe(args []string, env Env) int {
 	}
 	// The held deliveries of a task that never committed (a crash between
 	// the admission and the task write) become obsolete before serving.
+	// A transaction or SQL failure of the recovery still refuses the
+	// start; a failure that came only from the cleanup of the secret
+	// handles (the recovery itself committed) does not: the handles are
+	// pending in the durable cleanup ledger and are retried on the next
+	// recovery.
 	if _, err := store.RecoverHeld(context.Background(), env.Now(), a2aRecoverGrace); err != nil {
+		if !errors.Is(err, a2astore.ErrSecretCleanupPending) {
+			_ = ln.Close()
+			_ = store.Close()
+			_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a serve:", err)
+			_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a serve: registry database unavailable"}))
+			return 4
+		}
+	}
+	// The pending count is consulted whether or not a fresh cleanup
+	// failed: an old failure alone must not start with an empty stderr.
+	// At most one count-only line: no handle, no secret and no provider
+	// message, only the number.
+	pending, cerr := store.PendingSecretCleanup(context.Background())
+	if cerr != nil {
 		_ = ln.Close()
 		_ = store.Close()
-		_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a serve:", err)
+		_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a serve:", cerr)
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a serve: registry database unavailable"}))
 		return 4
+	}
+	if pending > 0 {
+		_, _ = fmt.Fprintf(env.Stderr, "a2a serve: %d secret handle deletions are pending; they are retried on the next recovery\n", pending)
 	}
 
 	ctx, cancel := a2aServeContext()
