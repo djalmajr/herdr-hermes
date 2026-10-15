@@ -262,6 +262,7 @@ const (
 	RefuseUnknownTask         = "unknown_task"         // no such task (or not the caller's)
 	RefuseDecisionConflict    = "decision_conflict"    // decision id reused with other content
 	RefuseInvalidDecision     = "invalid_decision"     // decision kind, id or text refused
+	RefuseNotARecipient       = "not_a_recipient"      // a reply from a pane that is not a recipient of the task
 )
 
 // Refusal is a deterministic refusal with a fixed code. Detail is a

@@ -973,7 +973,7 @@ func cmdA2AReply(args []string, env Env) int {
 	defer func() { _ = store.Close() }()
 	// The task must exist: reply never creates anything, and the stored
 	// decisions answer the duplicate before the write.
-	_, _, decisions, err := store.Show(context.Background(), task)
+	_, item, decisions, err := store.Show(context.Background(), task)
 	if err != nil {
 		if errors.Is(err, a2a.ErrTaskNotFound) {
 			return notFound()
@@ -993,12 +993,67 @@ func cmdA2AReply(args []string, env Env) int {
 			return 0
 		}
 	}
+	// Inside Herdr (HERDR_PANE_ID set) the reply records the pane
+	// reference as the actor and is refused with not_a_recipient when the
+	// pane is not a recipient of the task: one of the planned deliveries
+	// or, when not planned, the current routing, so a re-registered owner
+	// may answer. Outside Herdr the actor is "local" and no check runs.
+	actor := "local"
+	if paneID := env.Getenv("HERDR_PANE_ID"); paneID != "" {
+		ref := paneID
+		if !strings.HasPrefix(ref, "local/") {
+			ref = "local/" + ref
+		}
+		actor = ref
+		planned, err := store.TaskRecipientRefs(context.Background(), task)
+		if err != nil {
+			_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a reply:", err)
+			_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a reply: registry database unavailable"}))
+			return 4
+		}
+		recipient := false
+		for _, r := range planned {
+			if r == ref {
+				recipient = true
+				break
+			}
+		}
+		if !recipient {
+			// The planned deliveries do not include the pane: the current
+			// routing is read, only then (a read-only open, like the serve
+			// opens it), so a routing change after the admission is what
+			// lets a new owner answer.
+			ro, err := outbox.Open(outbox.StateDir(env.ConfigDir), outbox.Options{Now: env.Now, ReadOnly: true})
+			if err != nil {
+				_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a reply:", err)
+				_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a reply: routing unavailable"}))
+				return 4
+			}
+			plan, err := a2acore.Route(a2aNotifyRoutes{ob: ro, now: env.Now}, item.Project, "")
+			if err != nil {
+				_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a reply:", err)
+				_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a reply: routing unavailable"}))
+				return 4
+			}
+			for _, p := range plan {
+				if p.Ref == ref {
+					recipient = true
+					break
+				}
+			}
+		}
+		if !recipient {
+			_, _ = fmt.Fprintf(env.Stderr, "%s: a2a reply: refused: %s\n", env.program(), a2acore.RefuseNotARecipient)
+			_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "refused", Motivo: a2acore.RefuseNotARecipient}))
+			return 2
+		}
+	}
 	d := a2acore.Decision{
 		ID:     decisionID,
 		TaskID: task,
 		Kind:   kind,
 		Text:   text,
-		Actor:  "local",
+		Actor:  actor,
 	}
 	stored, refusal, err := store.RecordDecision(context.Background(), d, env.Now())
 	if err != nil {
