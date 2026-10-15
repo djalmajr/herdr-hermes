@@ -26,8 +26,9 @@ import (
 )
 
 // waitDelay gives a child that ignores the cancel signal a bounded grace
-// period before the process is killed.
-const waitDelay = 5 * time.Second
+// period before the process is killed; it is the process tree's one
+// grace, the same the first forwarded terminal signal gives the group.
+const waitDelay = proctree.Grace
 
 // defaultBound bounds the subprocesses without a caller-specific bound
 // (capabilities, events and the job forwarder subs without a wait).
@@ -200,13 +201,12 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 	// SIGHUP on unix) to the child's group while the child runs, so an
 	// interrupted run does not leave the tree behind as orphans; on
 	// Windows the relay is inert and the console's Ctrl-C keeps
-	// reaching the child. The stop runs after the wait and reports the
-	// last signal received, if any, leaving the signal reception in
-	// place so the re-raise can end the process on the very signal;
-	// cleanup stops the reception (the no-signal path only, since the
-	// re-raise ends the process).
-	stopForward, cleanupForward := proctree.ForwardSignals(cmd)
-	defer cleanupForward()
+	// reaching the child. The first forwarded signal starts the relay's
+	// fixed grace: the child's group that survives it is forced down
+	// (SIGKILL) so the wait returns. The stop runs after the wait: it
+	// ends the relay, stops the signal reception and reports the last
+	// signal received, if any.
+	stopForward := proctree.ForwardSignals(cmd)
 	waitErr := cmd.Wait()
 	sig, hadSignal := stopForward()
 	// The writers are closed (deferred, not awaited) once the wait
@@ -222,8 +222,8 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 		// The relay forwarded the terminal's signal to the child's
 		// group and the run ended on it: the process must die on the
 		// very signal it would have died on without the group
-		// isolation, so the default action is restored and the signal
-		// re-raised on the process itself. The child's exit code is not
+		// isolation, so the default handling is restored and the signal
+		// re-sent on the process itself. The child's exit code is not
 		// translated; the re-raise ends the process, so the return
 		// below is the fallback only when the re-raise did not.
 		proctree.ReRaise(sig)

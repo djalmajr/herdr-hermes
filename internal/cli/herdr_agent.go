@@ -34,8 +34,10 @@ const (
 	herdrAgentGetBound = 10 * time.Second
 	// herdrAgentGetWaitDelay gives a child that ignores the cancel
 	// signal a bounded grace period before the process is killed, so
-	// the bound never leaves the child's tree behind.
-	herdrAgentGetWaitDelay = 5 * time.Second
+	// the bound never leaves the child's tree behind; it is the process
+	// tree's one grace, the same the first forwarded terminal signal
+	// gives the group.
+	herdrAgentGetWaitDelay = proctree.Grace
 )
 
 // herdrAgentGet is the one JSON line `herdr agent get <pane>` prints: on
@@ -144,12 +146,12 @@ func paneAgentName(ctx context.Context, environ []string, pane string) (string, 
 	// SIGHUP on unix) to the child's group while the child runs, so an
 	// interrupted run does not leave the tree behind as orphans; on
 	// Windows the relay is inert and the console's Ctrl-C keeps
-	// reaching the child. The stop reports the last signal received, if
-	// any, leaving the reception in place so the re-raise can end the
-	// process on the very signal; cleanup stops it (the no-signal path
-	// only).
-	stopForward, cleanupForward := proctree.ForwardSignals(cmd)
-	defer cleanupForward()
+	// reaching the child. The first forwarded signal starts the relay's
+	// fixed grace: the child's group that survives it is forced down
+	// (SIGKILL) so the wait returns. The stop runs after the wait: it
+	// ends the relay, stops the signal reception and reports the last
+	// signal received, if any.
+	stopForward := proctree.ForwardSignals(cmd)
 	waitErr := cmd.Wait()
 	if sig, hadSignal := stopForward(); hadSignal {
 		// The relay forwarded the terminal's signal to the child's

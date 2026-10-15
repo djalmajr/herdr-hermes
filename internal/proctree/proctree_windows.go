@@ -158,9 +158,9 @@ func release(cmd *exec.Cmd) {
 // child the way it did before the group isolation on unix; there is no
 // signal for the runner process to relay. The returned stop is inert:
 // it always reports no signal, so the caller's post-Wait re-raise never
-// runs, and cleanup is likewise inert.
-func ForwardSignals(cmd *exec.Cmd) (stop func() (os.Signal, bool), cleanup func()) {
-	return func() (os.Signal, bool) { return nil, false }, func() {}
+// runs.
+func ForwardSignals(cmd *exec.Cmd) func() (os.Signal, bool) {
+	return func() (os.Signal, bool) { return nil, false }
 }
 
 // ReRaise is a no-op on Windows: the relay never reports a signal (see

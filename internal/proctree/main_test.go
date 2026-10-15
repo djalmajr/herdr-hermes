@@ -171,7 +171,7 @@ func runForwarder(childpidfile, grandchildpidfile string) {
 		roleDie(err)
 	}
 	defer release()
-	stop, cleanup := proctree.ForwardSignals(cmd)
+	stop := proctree.ForwardSignals(cmd)
 	cmd.Wait()
 	sig, had := stop()
 	if had {
@@ -182,6 +182,5 @@ func runForwarder(childpidfile, grandchildpidfile string) {
 		// below is the fallback only when it did not.
 		proctree.ReRaise(sig)
 	}
-	cleanup()
 	os.Exit(0)
 }
