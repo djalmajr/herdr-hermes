@@ -182,10 +182,27 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			return
 		}
 		if result.Duplicate {
-			m := a2a.NewMessageForTask(a2a.MessageRoleAgent, execCtx,
-				a2a.NewTextPart("duplicate of task "+result.DuplicateTaskID))
-			m.SetMeta(a2acore.MetaDuplicateOf, result.DuplicateTaskID)
-			yield(m, nil)
+			if existing == nil {
+				// The first message of a task was already admitted
+				// elsewhere: answer it with the message that carries
+				// the task id.
+				m := a2a.NewMessageForTask(a2a.MessageRoleAgent, execCtx,
+					a2a.NewTextPart("duplicate of task "+result.DuplicateTaskID))
+				m.SetMeta(a2acore.MetaDuplicateOf, result.DuplicateTaskID)
+				yield(m, nil)
+				return
+			}
+			// A continuation whose message id was already admitted: the
+			// admission stands (no second ingress row, no second delivery)
+			// and the interceptor answers the common resend before any
+			// execution (no write, no push); this branch is the defense
+			// for the resend that passes it before the first admission is
+			// stored. It ends the execution with the busy error and no
+			// event, so the caller gets the stable retry-later answer and
+			// the retry is safe: the SDK's failed-state write attempts the
+			// store on the canceled execution context, which the store
+			// refuses, so nothing is written and no push goes out.
+			yield(nil, taskBusyError())
 			return
 		}
 		// Admitted: the parked entry exists before the first event is

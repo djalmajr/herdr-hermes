@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/djalmajr/nau/internal/a2acore"
@@ -236,17 +237,20 @@ func TestContentionVisibleParkedIsBusy(t *testing.T) {
 // stands: the ingress row of the message and the session fence advance
 // with it. A resend of the same message (same message id, session, epoch
 // and sequence) is not admitted again (no second ingress row, no second
-// delivery to the owner); the store answers it as a duplicate and the
-// answer comes back as the task itself, which the SDK leaves failed
-// because it does not accept a message answer on a task that is already
-// stored. The order is forced with the store hook: on the working
-// event's update a competing write of the same context and version lands
-// first, so the update loses the SDK optimistic version check and the
-// send's error is the contention the interceptor rewrites.
+// delivery to the owner) and is answered by the interceptor before any
+// SDK execution: the stored task in its current state (the task stays
+// working, no live execution, no new write and no push of the resend).
+// A decision recorded after the resend is applied out of band by
+// ApplyPendingDecisions, pushes the final event and completes the task,
+// and a new message on the completed task gets the terminal refusal.
+// The order is forced with the store hook: on the working event's update
+// a competing write of the same context and version lands first, so the
+// update loses the SDK optimistic version check and the send's error is
+// the contention the interceptor rewrites.
 func TestBusyAfterAdmission(t *testing.T) {
 	store, path := newTestStore(t)
-	auth := newTableAuth(testSubject("caller-1"))
-	routes := fakeRoutes{owner: "owner-ref-1"}
+	auth := newTableAuth(dupRoutedSubject("caller-1"))
+	routes := dupRoutes
 	s1 := newTestServer(t, store, auth, routes)
 	c1 := dialClient(t, serveServer(t, s1).URL, auth, "caller-1")
 	task := sendTask(t, c1, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
@@ -259,7 +263,19 @@ func TestBusyAfterAdmission(t *testing.T) {
 	waitLive(t, s1, 0)
 
 	var once sync.Once
-	s2 := newHookedServer(t, store, auth, routes, &hookedTaskStore{
+	pusher := &dupPushSender{}
+	s2, err := New(Config{
+		Store:      store,
+		Auth:       auth,
+		Routes:     routes,
+		BaseURL:    "http://127.0.0.1:7430",
+		Version:    "test-1",
+		PushSender: pusher,
+	})
+	if err != nil {
+		t.Fatalf("build second server: %v", err)
+	}
+	hooks := &hookedTaskStore{
 		reviewHook: func(ctx context.Context, req *taskstore.UpdateRequest) {
 			if !isWorkingEvent(req) {
 				return
@@ -272,7 +288,16 @@ func TestBusyAfterAdmission(t *testing.T) {
 				}
 			})
 		},
-	})
+	}
+	hooks.Store = store
+	s2.handler = a2asrv.NewHandler(
+		s2.executor,
+		a2asrv.WithTaskStore(hooks),
+		a2asrv.WithPushNotifications(ownerRefConfigs{store.PushConfigs()}, s2.cfg.PushSender),
+		a2asrv.WithCapabilityChecks(&s2.card.Capabilities),
+		a2asrv.WithCallInterceptors(newAuthInterceptor(s2.cfg)),
+		a2asrv.WithLogger(s2.cfg.Logger),
+	)
 	rec := &pcRecorder{}
 	c2, err := Dial(ctxT(t), serveServer(t, s2).URL, staticCredential{value: auth.token("caller-1")}, &http.Client{Timeout: 10 * time.Second, Transport: rec})
 	if err != nil {
@@ -325,9 +350,17 @@ func TestBusyAfterAdmission(t *testing.T) {
 	}
 	t.Logf("task state after the busy answer: %s", before.Status.State)
 
+	// A push config on the task would be the target of a push of the
+	// resend; the recording sender counts it.
+	if _, err := c2.client.CreateTaskPushConfig(ctxT(t), &a2a.PushConfig{TaskID: task.ID, URL: f1URL}); err != nil {
+		t.Fatalf("create push config before the resend: %v", err)
+	}
+	versionBefore := f1Count(t, path, `SELECT version FROM a2a_tasks WHERE task_id = ?`, string(task.ID))
+
 	// The resend of the same message (same message id, session, epoch
-	// and sequence) is not admitted again: no second ingress row and no
-	// second delivery to the owner.
+	// and sequence) is not admitted again and is answered by the
+	// interceptor before any SDK execution: no second ingress row and no
+	// second delivery to the owner, no new write and no push.
 	res, err = c2.Send(ctxT(t), in)
 	if err != nil {
 		t.Fatalf("resent the same message: %v", err)
@@ -346,15 +379,59 @@ func TestBusyAfterAdmission(t *testing.T) {
 	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID); got != 1 {
 		t.Errorf("deliveries of the message after the resend = %d, want 1 (no second notice to the owner)", got)
 	}
+	if got := f1Count(t, path, `SELECT version FROM a2a_tasks WHERE task_id = ?`, string(task.ID)); got != versionBefore {
+		t.Errorf("task version after the resend = %d, want %d (no write by the resend)", got, versionBefore)
+	}
+	if got := pusher.count(); got != 0 {
+		t.Errorf("push calls caused by the resend = %d, want 0", got)
+	}
+	if got := s2.SuppressedPushes(); got != 0 {
+		t.Errorf("suppressed pushes = %d, want 0 (the config's reference is granted, so zero calls means no execution)", got)
+	}
 	tv, err := store.TaskView(ctxT(t), string(task.ID))
 	if err != nil || tv == nil {
 		t.Fatalf("task view after the resend: %v, %v", tv, err)
 	}
-	if resent.Status.State != a2a.TaskStateFailed {
-		t.Errorf("resent task state = %s, want failed (the SDK refuses the duplicate message answer on a stored task)", resent.Status.State)
+	if resent.Status.State != a2a.TaskStateWorking {
+		t.Errorf("resent task state = %s, want %s (the resend answers the stored task, state unchanged)", resent.Status.State, a2a.TaskStateWorking)
 	}
-	if tv.State != a2acore.StateFailed {
-		t.Errorf("durable task state after the resend = %q, want %q (the SDK refuses the duplicate message answer on a stored task)", tv.State, a2acore.StateFailed)
+	if tv.State != a2acore.StateWorking {
+		t.Errorf("durable task state after the resend = %q, want %q (the resend does not change the task state)", tv.State, a2acore.StateWorking)
+	}
+	waitLive(t, s2, 0)
+
+	// The decision recorded after the resend is applied out of band: no
+	// live execution of the resend exists for it, the store applies the
+	// decision's events and the final event is pushed.
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAnswer, "ba-answer", "the answer")
+	if applied, refused, err := s2.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply answer after the resend = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitStoredState(t, store, string(task.ID), a2acore.StateCompleted)
+	waitLive(t, s2, 0)
+	if got := pusher.count(); got != 1 {
+		t.Errorf("push calls after the out-of-band answer = %d, want 1 (the decision's final event)", got)
+	}
+	if ev, ok := pusher.lastEvent().(*a2a.TaskStatusUpdateEvent); !ok || ev.Status.State != a2a.TaskStateCompleted {
+		t.Errorf("pushed final event = %T, want the completed status update", pusher.lastEvent())
+	}
+
+	// A new message on the completed task gets the terminal-state
+	// refusal, not busy: no execution of the resend is left stuck.
+	in3 := SendInput{TaskID: string(task.ID), ContextID: task.ContextID, Session: "s-1", Epoch: 1, Seq: 3, MessageID: "m-3", Text: "third"}
+	res3, err3 := c2.Send(ctxT(t), in3)
+	if err3 == nil || !errors.Is(err3, a2a.ErrUnsupportedOperation) {
+		t.Fatalf("new message after the completion = %T, %v, want the unsupported operation refusal", res3, err3)
+	}
+	wire3 := rec.wire()
+	if wire3.status != http.StatusBadRequest || !strings.Contains(wire3.body, `"reason":"UNSUPPORTED_OPERATION"`) {
+		t.Fatalf("new message wire = %d %s, want 400 unsupported operation", wire3.status, wire3.body)
+	}
+	if !strings.Contains(wire3.body, "terminal state") {
+		t.Errorf("new message body lacks the terminal state cause: %s", wire3.body)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-3"); got != 0 {
+		t.Errorf("ingress rows of the new message = %d, want 0 (the refusal is before the admission)", got)
 	}
 }
 
