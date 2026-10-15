@@ -19,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djalmajr/nau/internal/testutil/fakesoho"
 )
 
 const (
@@ -35,9 +37,11 @@ var (
 	nauBin string
 )
 
-// TestMain builds the binary once (into a temp dir removed after m.Run)
-// and runs the package.
+// TestMain lets the re-executed test binary act as the fake herdr-soho
+// of the forwarder test, then builds the binary once (into a temp dir
+// removed after m.Run) and runs the package.
 func TestMain(m *testing.M) {
+	fakesoho.Main()
 	dir, err := os.MkdirTemp("", "nau-identity-build-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "nau identity test: %v\n", err)
