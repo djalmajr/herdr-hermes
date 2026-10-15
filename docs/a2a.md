@@ -19,6 +19,8 @@ The agent card is public at `GET /.well-known/agent-card.json` and advertises ex
 
 A caller resumes an `input_required` task with a follow-up message on the **same task id and context id**; a terminal task is never restarted — a further message on it is refused by the SDK (`unsupported operation`), and the caller can cancel only a non-terminal task. A task belongs to the subject that created it and to the project it was admitted in: another subject sees `task not found`, and so does its own subject once that project is no longer in the subject's current grant — for every operation on the task (get, list, cancel, a continuation and the push-config create, get, list and delete), checked against the project stored with the task on each request, never against message metadata.
 
+A message on a task the caller can see that meets another execution or write of the same task — the task is parked awaiting the owner, a cancelation of it is in progress, or another process stored a newer version first — is answered `a2a: task busy, retry later` with HTTP 500 (status `INTERNAL`, reason `INTERNAL_ERROR`): nothing was admitted, written or fenced, so the same message (same message id, session, epoch and sequence) can be sent again later, and `nau a2a send` reports it as `unavailable` (exit 4). A task the caller cannot see is never answered busy: it is `task not found`. Every cancel of a task the caller cannot see, or of an id that does not exist, is answered with one HTTP 404 body (`TASK_NOT_FOUND`, the message `failed to cancel: cancelation failed: canceler setup failed: failed to load a task: task not found`), whether or not the task's execution is parked.
+
 ## Message correlation metadata
 
 The caller correlates every message with the message metadata:
