@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 
 	"github.com/djalmajr/nau/internal/a2acore"
@@ -265,4 +266,144 @@ func TestDuplicateResendInvisibleTaskStaysNotFound(t *testing.T) {
 	if strings.Contains(wire.body, string(task.ID)) {
 		t.Errorf("foreign resend body carries the task id: %s", wire.body)
 	}
+}
+
+// dupHoldBefore delegates to the real interceptor and, for the held
+// message id, waits after the real Before has run (its admission lookup
+// found nothing) until the test releases it, so the request reaches the
+// SDK only after another request admitted the same message.
+type dupHoldBefore struct {
+	*authInterceptor
+	messageID string
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+// Before implements a2asrv.CallInterceptor.
+func (g *dupHoldBefore) Before(ctx context.Context, callCtx *a2asrv.CallContext, req *a2asrv.Request) (context.Context, any, error) {
+	ctx, result, err := g.authInterceptor.Before(ctx, callCtx, req)
+	if p, ok := req.Payload.(*a2a.SendMessageRequest); ok && callCtx.Method() == "SendMessage" && p != nil && p.Message != nil && string(p.Message.ID) == g.messageID {
+		close(g.entered)
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			return ctx, nil, ctx.Err()
+		}
+	}
+	return ctx, result, err
+}
+
+// TestDuplicateResendPastInterceptorWindow pins the one window the
+// interceptor cannot close: a send whose admission lookup ran before
+// the first admission of the same message committed, and that reaches
+// the SDK only after that admission's execution ended (here, after the
+// owner's second question). The executor then answers the stored task
+// through the execution, the only answer the SDK accepts there: the
+// task keeps its state and is not failed, and no second ingress row or
+// delivery is made, but the task is stored again and its push configs
+// receive the current state once more.
+func TestDuplicateResendPastInterceptorWindow(t *testing.T) {
+	store, path := newTestStore(t)
+	auth := newTableAuth(testSubject("caller-1"))
+	routes := fakeRoutes{owner: "owner-ref-1"}
+	pusher := &dupPushSender{}
+	s := dupNewServer(t, store, auth, routes, pusher)
+	c := dialClient(t, serveServer(t, s).URL, auth, "caller-1")
+
+	task := sendTask(t, c, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateWorking)
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAsk, "dw-ask-1", "question 1")
+	if applied, refused, err := s.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply ask 1 = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateInputRequired)
+	waitLive(t, s, 0)
+
+	// A second server on the same store whose interceptor holds the m-2
+	// send right after its admission lookup.
+	s2 := dupNewServer(t, store, auth, routes, pusher)
+	hold := &dupHoldBefore{
+		authInterceptor: newAuthInterceptor(s2.cfg).withCapabilities(&s2.card.Capabilities),
+		messageID:       "m-2",
+		entered:         make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(hold.release)
+		}
+	})
+	s2.handler = a2asrv.NewHandler(
+		s2.executor,
+		a2asrv.WithTaskStore(scopedTaskStore{store: store}),
+		a2asrv.WithPushNotifications(store.PushConfigs(), s2.cfg.PushSender),
+		a2asrv.WithCapabilityChecks(&s2.card.Capabilities),
+		a2asrv.WithCallInterceptors(hold),
+		a2asrv.WithLogger(s2.cfg.Logger),
+	)
+	c2 := dialClient(t, serveServer(t, s2).URL, auth, "caller-1")
+
+	in := SendInput{TaskID: string(task.ID), ContextID: task.ContextID, Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-2", Text: "continuation"}
+	type answer struct {
+		res a2a.SendMessageResult
+		err error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		res, err := c2.Send(ctxT(t), in)
+		done <- answer{res, err}
+	}()
+	awaitSignal(t, "held send after its admission lookup", hold.entered)
+
+	// The same message is admitted through the first server, and the
+	// owner's second question ends that execution.
+	sendTask(t, c, in)
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateWorking)
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAsk, "dw-ask-2", "question 2")
+	if applied, refused, err := s.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply ask 2 = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateInputRequired)
+	waitLive(t, s, 0)
+
+	if _, err := c.client.CreateTaskPushConfig(ctxT(t), &a2a.PushConfig{TaskID: task.ID, URL: f1URL}); err != nil {
+		t.Fatalf("create push config before the release: %v", err)
+	}
+	ingressID := f1Count(t, path, `SELECT ingress_id FROM a2a_ingress WHERE message_id = ?`, "m-2")
+	deliveriesBefore := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID)
+	pushesBefore := pusher.count()
+
+	close(hold.release)
+	released = true
+	var ans answer
+	select {
+	case ans = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the held send did not answer within 10s of its release")
+	}
+	if ans.err != nil {
+		t.Fatalf("held send: %v", ans.err)
+	}
+	got, ok := ans.res.(*a2a.Task)
+	if !ok || got.ID != task.ID {
+		t.Fatalf("held send = %T %+v, want the same task", ans.res, ans.res)
+	}
+	if got.Status.State != a2a.TaskStateInputRequired {
+		t.Errorf("held send state = %s, want %s (the task keeps its state)", got.Status.State, a2a.TaskStateInputRequired)
+	}
+	tv, err := store.TaskView(ctxT(t), string(task.ID))
+	if err != nil || tv == nil || tv.State != a2acore.StateInputRequired {
+		t.Errorf("durable task after the held send = %+v, %v, want %q", tv, err, a2acore.StateInputRequired)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-2"); got != 1 {
+		t.Errorf("ingress rows of m-2 = %d, want 1 (no second admission)", got)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID); got != deliveriesBefore {
+		t.Errorf("deliveries of m-2 = %d, want %d (no second delivery)", got, deliveriesBefore)
+	}
+	if got := pusher.count() - pushesBefore; got != 1 {
+		t.Errorf("pushes caused by the held send = %d, want 1 (the current state sent once more)", got)
+	}
+	waitLive(t, s2, 0)
 }

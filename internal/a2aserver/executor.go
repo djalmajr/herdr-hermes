@@ -198,7 +198,9 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			// any execution (no write, no push); this branch is the
 			// defense for a resend that passes it before the first
 			// admission is stored, and this path still writes the task
-			// and sends its push. The stored task — the version the SDK
+			// and sends its push: an execution cannot answer without an
+			// event (with none the SDK waits forever, and an error fails
+			// the task). The stored task — the version the SDK
 			// loaded for this continuation, the same one its update is
 			// checked against — is the first event, so the resend never
 			// changes the task state. In a state that is final for the
