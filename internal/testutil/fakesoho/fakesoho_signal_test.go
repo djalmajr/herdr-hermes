@@ -4,7 +4,6 @@ package fakesoho
 
 import (
 	"bufio"
-	"os"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -91,12 +90,4 @@ func TestSignalAfterStartDelay(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestMain lets the re-executed copy of this test binary play the fake
-// role when it is installed as herdr-soho; running as the test binary it
-// just runs the tests.
-func TestMain(m *testing.M) {
-	Main()
-	os.Exit(m.Run())
 }
