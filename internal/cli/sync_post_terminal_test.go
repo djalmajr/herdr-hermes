@@ -121,20 +121,21 @@ func TestSyncPostTerminalTailDurableSkips(t *testing.T) {
 
 // TestSyncPostTerminalGraceOverSkips: a terminal job without a gap and
 // without a close tail is not queried once the post-terminal grace is
-// over: the age of the stored terminal record (or, when the state came
-// only from the trailer and no terminal record is stored, of the job's
-// terminal_seen_at) reaches syncPostTerminalGrace; the job's updated_at
-// no longer anchors the grace. The instants come from the injected clock,
-// never from the backend.
+// over: the age of the job's terminal_seen_at reaches
+// syncPostTerminalGrace; the ts of a stored terminal record and the
+// job's updated_at no longer anchor the grace. The instants come from
+// the injected clock, never from the backend.
 func TestSyncPostTerminalGraceOverSkips(t *testing.T) {
 	// More than syncPostTerminalGrace (1 h) before the test clock.
 	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	t.Run("terminal record older than the grace", func(t *testing.T) {
+	t.Run("anchor older than the grace", func(t *testing.T) {
 		exe, fakeDir := installFakeSoho(t, capsRule(capsJSON, 0))
 		cfgDir := t.TempDir()
 		setSohoConfig(t, cfgDir, exe, "machine-a")
-		s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{Now: func() time.Time { return old }})
+		// The terminal record is stamped with the fresh test clock: its
+		// ts no longer anchors the grace, only the old anchor does.
+		s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{Now: func() time.Time { return postTerminalTestNow() }})
 		if err != nil {
 			t.Fatalf("open state: %v", err)
 		}
@@ -143,6 +144,7 @@ func TestSyncPostTerminalGraceOverSkips(t *testing.T) {
 		}
 		err = s.UpdateJobs(func(js *outbox.Jobs) error {
 			js.Jobs["J1"].Estado = "done"
+			js.Jobs["J1"].TerminalSeenAt = old.Format(outbox.TSLayout)
 			return nil
 		})
 		if err != nil {
@@ -156,7 +158,7 @@ func TestSyncPostTerminalGraceOverSkips(t *testing.T) {
 			t.Fatalf("stdout = %q", stdout)
 		}
 		if n := len(eventsSinceArgs(t, fakeDir)); n != 0 {
-			t.Fatalf("events calls = %d, want 0 (the terminal record is older than the grace)", n)
+			t.Fatalf("events calls = %d, want 0 (the old anchor is over the grace even though the terminal record's ts is fresh)", n)
 		}
 	})
 

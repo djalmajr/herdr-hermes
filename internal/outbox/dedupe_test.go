@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 func jobEvent(seq int) json.RawMessage {
@@ -592,22 +591,23 @@ func typedEvent(seq int, tipo string) json.RawMessage {
 }
 
 // TestOutboxJobEventTail: JobEventTail reports, per job, whether a close
-// tail type is durable after the last stored terminal record and the ts
-// of that last terminal record, without writing: an empty outbox, a tail
-// that precedes a second terminal, another job's records, a non
-// job_event record and a record whose dados has no tipo.
+// tail record is durable with an event seq above the job's highest
+// terminal record's seq (any tail closes a job that has no terminal
+// record at all), without writing: an empty outbox, a tail that precedes
+// a second terminal, another job's records, a non job_event record and a
+// record whose dados has no tipo.
 func TestOutboxJobEventTail(t *testing.T) {
 	dir := t.TempDir()
 	s := openStore(t, dir)
-	// Empty outbox: no tail, no terminal.
-	hasTail, terminalTS, err := s.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
-	if err != nil || hasTail || terminalTS != "" {
-		t.Fatalf("empty outbox: hasTail=%v terminalTS=%q err=%v, want false,\"\",nil", hasTail, terminalTS, err)
+	// Empty outbox: no tail.
+	hasTail, err := s.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || hasTail {
+		t.Fatalf("empty outbox: hasTail=%v err=%v, want false,nil", hasTail, err)
 	}
 	// J1 stores a terminal at seq 1, a folder_retained at seq 2 and a
-	// second terminal at seq 3: the last terminal record is the terminal
-	// evidence and the folder_retained stored before it belongs to an
-	// earlier cycle, so it does not close the tail.
+	// second terminal at seq 3: the tail's event seq is below the
+	// highest terminal's, so it belongs to an earlier cycle and does not
+	// close the tail.
 	for _, ev := range []json.RawMessage{typedEvent(1, "terminal"), typedEvent(2, "folder_retained"), typedEvent(3, "terminal")} {
 		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", ev); err != nil {
 			t.Fatal(err)
@@ -626,18 +626,13 @@ func TestOutboxJobEventTail(t *testing.T) {
 	if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", json.RawMessage(`{"seq":4}`)); err != nil {
 		t.Fatal(err)
 	}
-	hasTail, terminalTS, err = s.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
-	if err != nil || hasTail || terminalTS == "" {
-		t.Fatalf("J1: hasTail=%v terminalTS=%q err=%v, want false,<ts>,nil (the tail before the last terminal does not close it)", hasTail, terminalTS, err)
+	hasTail, err = s.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || hasTail {
+		t.Fatalf("J1: hasTail=%v err=%v, want false,nil (the tail before the last terminal does not close it)", hasTail, err)
 	}
-	// The terminalTS is the ts the store assigned to the last terminal
-	// record, not the event's own ts.
-	if terminalTS != fixedNow().Format(TSLayout) {
-		t.Fatalf("J1 terminalTS = %q, want %q (the last record's ts, not the event ts)", terminalTS, fixedNow().Format(TSLayout))
-	}
-	hasTail, terminalTS, err = s.JobEventTail("J2", "terminal", []string{"folder_retained", "cleanup"})
-	if err != nil || !hasTail || terminalTS != "" {
-		t.Fatalf("J2: hasTail=%v terminalTS=%q err=%v, want true,\"\",nil (its cleanup is the tail, it has no terminal)", hasTail, terminalTS, err)
+	hasTail, err = s.JobEventTail("J2", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || !hasTail {
+		t.Fatalf("J2: hasTail=%v err=%v, want true,nil (its cleanup is the tail and it has no terminal)", hasTail, err)
 	}
 	// A read-only store answers without taking the lock, and the tail
 	// stays read-only: it wrote nothing.
@@ -646,9 +641,9 @@ func TestOutboxJobEventTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hasTail, terminalTS, err = ro.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
-	if err != nil || hasTail || terminalTS != fixedNow().Format(TSLayout) {
-		t.Fatalf("read-only J1: hasTail=%v terminalTS=%q err=%v, want false,<ts>,nil", hasTail, terminalTS, err)
+	hasTail, err = ro.JobEventTail("J1", "terminal", []string{"folder_retained", "cleanup"})
+	if err != nil || hasTail {
+		t.Fatalf("read-only J1: hasTail=%v err=%v, want false,nil", hasTail, err)
 	}
 	after := stateDirFiles(t, dir)
 	if len(before) != len(after) {
@@ -661,39 +656,74 @@ func TestOutboxJobEventTail(t *testing.T) {
 	}
 }
 
-// TestOutboxJobEventTailLastCycle: the terminal evidence is the job's LAST
-// stored terminal record (not the first) and a close tail closes the
-// current cycle only when it is stored after that last terminal: the
-// store clock advances per record, so the first and the last terminal's
-// record ts differ and the returned ts proves the last record won; a tail
-// stored before the last terminal belongs to the earlier cycle.
+// TestOutboxJobEventTailLastCycle: the terminal evidence is the job's
+// stored terminal record with the HIGHEST event seq (not the first), and
+// a close tail closes the current cycle only when its event seq is above
+// that highest terminal seq; a tail with the lower seq belongs to the
+// earlier cycle.
 func TestOutboxJobEventTailLastCycle(t *testing.T) {
 	dir := t.TempDir()
-	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	var step int
-	s, err := Open(dir, Options{Now: func() time.Time { return base.Add(time.Duration(step) * time.Minute) }})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	appendAt := func(seq int, tipo string) {
-		step++
+	s := openStore(t, dir)
+	appendEv := func(seq int, tipo string) {
 		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J3", typedEvent(seq, tipo)); err != nil {
 			t.Fatalf("append %s: %v", tipo, err)
 		}
 	}
-	appendAt(1, "terminal") // stored at base+1m
-	appendAt(2, "cleanup")  // a tail at base+2m, before the last terminal
-	appendAt(3, "terminal") // the current cycle's terminal at base+3m
-	wantTS := base.Add(3 * time.Minute).Format(TSLayout)
-	hasTail, terminalTS, err := s.JobEventTail("J3", "terminal", []string{"cleanup"})
-	if err != nil || hasTail || terminalTS != wantTS {
-		t.Fatalf("after the new terminal: hasTail=%v terminalTS=%q err=%v, want false,%q (the last terminal is the evidence and the earlier tail does not close it)", hasTail, terminalTS, err, wantTS)
+	appendEv(1, "terminal")
+	appendEv(2, "cleanup")  // a tail below the last terminal's seq
+	appendEv(3, "terminal") // the current cycle's terminal
+	hasTail, err := s.JobEventTail("J3", "terminal", []string{"cleanup"})
+	if err != nil || hasTail {
+		t.Fatalf("after the new terminal: hasTail=%v err=%v, want false,nil (the highest terminal is the evidence and the earlier tail does not close it)", hasTail, err)
 	}
-	appendAt(4, "cleanup") // a tail after the last terminal, at base+4m
-	hasTail, terminalTS, err = s.JobEventTail("J3", "terminal", []string{"cleanup"})
-	if err != nil || !hasTail || terminalTS != wantTS {
-		t.Fatalf("after the closing tail: hasTail=%v terminalTS=%q err=%v, want true,%q", hasTail, terminalTS, err, wantTS)
+	appendEv(4, "cleanup") // a tail above the highest terminal's seq
+	hasTail, err = s.JobEventTail("J3", "terminal", []string{"cleanup"})
+	if err != nil || !hasTail {
+		t.Fatalf("after the closing tail: hasTail=%v err=%v, want true,nil", hasTail, err)
 	}
+}
+
+// TestOutboxJobEventTailBySeqNotByPosition: the comparison uses the event
+// seq read from the record idempotency keys, never the file position, so
+// the out-of-order append the wake hook makes (latest event at once, the
+// gaps backfilled after) cannot hide a durable tail or fake one.
+func TestOutboxJobEventTailBySeqNotByPosition(t *testing.T) {
+	t.Run("tail stored first with the greater seq closes", func(t *testing.T) {
+		dir := t.TempDir()
+		s := openStore(t, dir)
+		// wake stores the close tail at once; the sync backfills the
+		// terminal afterwards, so the tail is physically stored first.
+		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", typedEvent(2, "cleanup")); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", typedEvent(1, "terminal")); err != nil {
+			t.Fatal(err)
+		}
+		hasTail, err := s.JobEventTail("J1", "terminal", []string{"cleanup"})
+		if err != nil || !hasTail {
+			t.Fatalf("hasTail=%v err=%v, want true,nil (the tail's event seq is above the terminal's, though it was stored first)", hasTail, err)
+		}
+	})
+	t.Run("tail stored last with the lower seq does not close", func(t *testing.T) {
+		dir := t.TempDir()
+		s := openStore(t, dir)
+		// wake stores the current cycle's terminal first; the sync
+		// backfills the earlier records, including the earlier cycle's
+		// tail, after it.
+		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", typedEvent(3, "terminal")); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", typedEvent(1, "terminal")); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.AppendJobEvent(testMaquina, testProjeto, "J1", typedEvent(2, "cleanup")); err != nil {
+			t.Fatal(err)
+		}
+		hasTail, err := s.JobEventTail("J1", "terminal", []string{"cleanup"})
+		if err != nil || hasTail {
+			t.Fatalf("hasTail=%v err=%v, want false,nil (the tail's event seq is below the highest terminal's, though it was stored last)", hasTail, err)
+		}
+	})
 }
 
 // stateDirFiles snapshots the state dir's files: name -> bytes.

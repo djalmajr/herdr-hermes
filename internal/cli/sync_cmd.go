@@ -41,11 +41,13 @@ func isSyncTerminal(state string) bool {
 }
 
 // syncSkipPostTerminal reports whether the gapless terminal job may be
-// skipped: a workspace_closed record of the job is durable in the outbox,
-// or the post-terminal grace is over. A read failure skips the job for
-// this run, like a cursor read failure.
+// skipped: a workspace_closed record of the job with an event seq above
+// the job's highest terminal record is durable in the outbox (any
+// workspace_closed closes a job that has no terminal record), or the
+// post-terminal grace counted from terminal_seen_at is over. A read
+// failure skips the job for this run, like a cursor read failure.
 func syncSkipPostTerminal(store *outbox.Store, env Env, j *outbox.Job, id string) bool {
-	hasTail, terminalTS, err := store.JobEventTail(id, jobapi.TypeTerminal, []string{jobapi.TypeWorkspaceClosed})
+	hasTail, err := store.JobEventTail(id, jobapi.TypeTerminal, []string{jobapi.TypeWorkspaceClosed})
 	if err != nil {
 		outbox.Friction(outbox.StateDir(env.ConfigDir), "sync", "job "+id+": "+err.Error())
 		return true
@@ -53,26 +55,22 @@ func syncSkipPostTerminal(store *outbox.Store, env Env, j *outbox.Job, id string
 	if hasTail {
 		return true
 	}
-	return syncPostTerminalExpired(env, j, terminalTS)
+	return syncPostTerminalExpired(env, j)
 }
 
 // syncPostTerminalExpired reports whether the post-terminal grace of a
-// gapless terminal job is over: the age of the job's stored terminal
-// record (or, when the state came only from the trailer and no terminal
-// record is stored, of the job's terminal_seen_at) reaches
-// syncPostTerminalGrace. The instant comes from the outbox record's ts or
-// the job's terminal_seen_at, never from the backend clock or the job's
-// updated_at; an unparseable or absent instant is not expired, so the job
-// keeps being queried.
-func syncPostTerminalExpired(env Env, j *outbox.Job, terminalTS string) bool {
-	instant := terminalTS
-	if instant == "" {
-		instant = j.TerminalSeenAt
-	}
-	if instant == "" {
+// gapless terminal job is over: the age of the job's terminal_seen_at
+// reaches syncPostTerminalGrace. The grace counts only from
+// terminal_seen_at, the instant the sync wrote with the env clock when
+// the job entered a terminal state (or rewrote an invalid value), never
+// from the ts of a stored terminal record, never from the backend clock
+// or the job's updated_at; an unparseable or absent instant is not
+// expired, so the job keeps being queried.
+func syncPostTerminalExpired(env Env, j *outbox.Job) bool {
+	if j.TerminalSeenAt == "" {
 		return false
 	}
-	stored, err := time.Parse(outbox.TSLayout, instant)
+	stored, err := time.Parse(outbox.TSLayout, j.TerminalSeenAt)
 	if err != nil {
 		return false
 	}

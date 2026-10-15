@@ -1008,9 +1008,9 @@ func TestSyncTerminalLegacyCursorStillSynced(t *testing.T) {
 }
 
 // TestSyncTerminalNoGapSyncedWithinGrace (control): a terminal job whose
-// stored events cover its recorded cursor (no gap) and whose terminal
-// record is fresh is still queried: the post-terminal grace keeps it open
-// until the close tail is durable.
+// stored events cover its recorded cursor (no gap) and whose anchor is
+// fresh is still queried: the post-terminal grace, counted from
+// terminal_seen_at, keeps it open until the close tail is durable.
 func TestSyncTerminalNoGapSyncedWithinGrace(t *testing.T) {
 	exe, fakeDir := installFakeSoho(t,
 		capsRule(capsJSON, 0),
@@ -1018,8 +1018,8 @@ func TestSyncTerminalNoGapSyncedWithinGrace(t *testing.T) {
 	)
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
-	// The records are stamped with the test clock, so the terminal
-	// record is fresh (within the post-terminal grace).
+	// The job's anchor is stamped with the test clock, so the grace is
+	// fresh (within the post-terminal grace).
 	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{Now: postTerminalTestNow})
 	if err != nil {
 		t.Fatalf("open state: %v", err)
@@ -1034,6 +1034,7 @@ func TestSyncTerminalNoGapSyncedWithinGrace(t *testing.T) {
 	}
 	err = s.UpdateJobs(func(js *outbox.Jobs) error {
 		js.Jobs["J1"].Estado = "done"
+		js.Jobs["J1"].TerminalSeenAt = postTerminalTestNow().Format(outbox.TSLayout)
 		return nil
 	})
 	if err != nil {

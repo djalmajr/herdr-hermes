@@ -16,12 +16,11 @@ func terminalExitLine(seq int, exit string) string {
 
 // TestSyncSecondTerminalGetsNewGrace: a job that terminated with a
 // blocking exit, came back with unblocked/running and terminated again
-// gets a fresh post-terminal grace anchored on the LAST stored terminal
-// record: the sync one minute after the second terminal still queries the
-// backend and stores the workspace_closed of the new cycle (the terminal
-// of the earlier cycle does not expire the new grace), and once the
-// workspace_closed is durable the next sync stops. Four records and four
-// queries in total.
+// gets a fresh post-terminal grace: the sync one minute after the second
+// terminal still queries the backend and stores the workspace_closed of
+// the new cycle (the terminal of the earlier cycle does not expire the
+// new grace), and once the workspace_closed is durable the next sync
+// stops. Four records and four queries in total.
 func TestSyncSecondTerminalGetsNewGrace(t *testing.T) {
 	exe, fakeDir := installFakeSoho(t,
 		capsRule(capsJSON, 0),
