@@ -15,17 +15,20 @@ import (
 )
 
 // syncTerminalStates are the trailer states that make a job terminal for
-// sync purposes: a terminal job is skipped by later syncs only while the
-// close tail is durable or the post-terminal grace is over.
+// sync purposes: a terminal job is skipped by later syncs only while a
+// workspace_closed record of the job is durable, the job is closed, or
+// the post-terminal grace is over.
 var syncTerminalStates = []string{
 	jobapi.StateDone, jobapi.StateFailed, jobapi.StateTimeout,
 	jobapi.StateCanceled, jobapi.StateCollected, jobapi.StateClosed,
 }
 
-// syncPostTerminalGrace bounds how long a terminal job without a gap and
-// without a durable close tail keeps being queried: a backend from before
-// the automatic close never emits folder_retained, and without the grace a
-// terminal job would be queried forever.
+// syncPostTerminalGrace bounds how long a gapless terminal job without a
+// recorded workspace_closed keeps being queried. With the automatic close
+// switched off the workspace_closed never comes, and the grace is what
+// ends the job; that is accepted. Without the grace such a terminal job
+// would be queried forever, and the loss is permanent because the
+// workspace_closed does not wake the dispatcher.
 const syncPostTerminalGrace = time.Hour
 
 func isSyncTerminal(state string) bool {
@@ -38,11 +41,11 @@ func isSyncTerminal(state string) bool {
 }
 
 // syncSkipPostTerminal reports whether the gapless terminal job may be
-// skipped: its close tail (a folder_retained or cleanup record) is
-// durable in the outbox, or the post-terminal grace is over. A read
-// failure skips the job for this run, like a cursor read failure.
+// skipped: a workspace_closed record of the job is durable in the outbox,
+// or the post-terminal grace is over. A read failure skips the job for
+// this run, like a cursor read failure.
 func syncSkipPostTerminal(store *outbox.Store, env Env, j *outbox.Job, id string) bool {
-	hasTail, terminalTS, err := store.JobEventTail(id, jobapi.TypeTerminal, []string{jobapi.TypeFolderRetained, jobapi.TypeCleanup})
+	hasTail, terminalTS, err := store.JobEventTail(id, jobapi.TypeTerminal, []string{jobapi.TypeWorkspaceClosed})
 	if err != nil {
 		outbox.Friction(outbox.StateDir(env.ConfigDir), "sync", "job "+id+": "+err.Error())
 		return true
@@ -56,14 +59,15 @@ func syncSkipPostTerminal(store *outbox.Store, env Env, j *outbox.Job, id string
 // syncPostTerminalExpired reports whether the post-terminal grace of a
 // gapless terminal job is over: the age of the job's stored terminal
 // record (or, when the state came only from the trailer and no terminal
-// record is stored, of the job's updated_at) exceeds
-// syncPostTerminalGrace. The instant comes from the outbox record's ts,
-// never from the backend clock; an unparseable or absent instant is not
-// expired, so the job keeps being queried.
+// record is stored, of the job's terminal_seen_at) reaches
+// syncPostTerminalGrace. The instant comes from the outbox record's ts or
+// the job's terminal_seen_at, never from the backend clock or the job's
+// updated_at; an unparseable or absent instant is not expired, so the job
+// keeps being queried.
 func syncPostTerminalExpired(env Env, j *outbox.Job, terminalTS string) bool {
 	instant := terminalTS
 	if instant == "" {
-		instant = j.UpdatedAt
+		instant = j.TerminalSeenAt
 	}
 	if instant == "" {
 		return false
@@ -72,7 +76,7 @@ func syncPostTerminalExpired(env Env, j *outbox.Job, terminalTS string) bool {
 	if err != nil {
 		return false
 	}
-	return env.Now().Sub(stored) > syncPostTerminalGrace
+	return env.Now().Sub(stored) >= syncPostTerminalGrace
 }
 
 // syncResult is the outcome of one sync run: the counts and the push step
@@ -149,11 +153,11 @@ func runSync(ctx context.Context, env Env, jobID string, pushOnly bool) (syncRes
 		// Gap evidence: a stored record above a hole, or a recorded
 		// cursor above what is stored. A closed job is skipped only when
 		// it has no gap; a terminal job is skipped only when it has no
-		// gap and the close tail is durable or the post-terminal grace
-		// is over (the automatic-close events come after the terminal
-		// event and must reach the outbox); with gap evidence either is
-		// synced like an open job (and keeps Closed as it is), so the
-		// missing records below the gap are never lost.
+		// gap and a workspace_closed record is durable or the
+		// post-terminal grace is over (the workspace_closed is the last
+		// automatic-close event and must reach the outbox); with gap
+		// evidence either is synced like an open job (and keeps Closed as
+		// it is), so the missing records below the gap are never lost.
 		gap := maxStored > prefix || j.LastEventSeq > prefix
 		if !gap && j.Closed {
 			continue
@@ -188,6 +192,17 @@ func runSync(ctx context.Context, env Env, jobID string, pushOnly bool) (syncRes
 			estado := res.Trailer.Estado
 			if err := store.UpdateJobs(func(js *outbox.Jobs) error {
 				if jj := js.Jobs[id]; jj != nil {
+					// terminal_seen_at is written once, on the first update
+					// that makes the job terminal, with the env clock, and
+					// cleared when the job stops being terminal: it anchors
+					// the post-terminal grace when the state came only from
+					// the trailer.
+					terminal := isSyncTerminal(estado)
+					if terminal && jj.TerminalSeenAt == "" {
+						jj.TerminalSeenAt = env.Now().Format(outbox.TSLayout)
+					} else if !terminal {
+						jj.TerminalSeenAt = ""
+					}
 					jj.Estado = estado
 					jj.UpdatedAt = env.Now().Format(outbox.TSLayout)
 				}

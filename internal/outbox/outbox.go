@@ -731,7 +731,13 @@ type Job struct {
 	Estado       string `json:"estado"`
 	CreatedAt    string `json:"created_at"`
 	UpdatedAt    string `json:"updated_at"`
-	Closed       bool   `json:"closed"`
+	// TerminalSeenAt is the instant (TSLayout) the sync first observed a
+	// terminal estado for the job and wrote it once; it anchors the
+	// post-terminal grace when the terminal state came only from the
+	// events trailer and no terminal record is stored. It is empty while
+	// the job is not terminal.
+	TerminalSeenAt string `json:"terminal_seen_at,omitempty"`
+	Closed         bool   `json:"closed"`
 }
 
 // Jobs is the jobs.json content.

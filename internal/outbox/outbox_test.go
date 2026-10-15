@@ -1098,3 +1098,39 @@ func TestOutboxFrictionCreatesMissingDir(t *testing.T) {
 		t.Fatalf("parent file changed: %v (%v)", pst.Mode(), err)
 	}
 }
+
+// TestJobTerminalSeenAtRoundTrip: the job's terminal_seen_at round-trips
+// through jobs.json, and omitempty keeps the key out of the stored job
+// while it carries no anchor.
+func TestJobTerminalSeenAtRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := openStore(t, dir)
+	if err := s.UpdateJobs(func(j *Jobs) error {
+		j.Jobs["J1"] = &Job{ID: "J1", Projeto: testProjeto, Estado: "done", TerminalSeenAt: fixedNow().Format(TSLayout)}
+		j.Jobs["J2"] = &Job{ID: "J2", Projeto: testProjeto, Estado: "running"}
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateJobs: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatalf("jobs.json: %v", err)
+	}
+	var stored Jobs
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatalf("jobs.json: %v", err)
+	}
+	if got := stored.Jobs["J1"].TerminalSeenAt; got != fixedNow().Format(TSLayout) {
+		t.Fatalf("terminal_seen_at = %q, want %q", got, fixedNow().Format(TSLayout))
+	}
+	if stored.Jobs["J2"].TerminalSeenAt != "" {
+		t.Fatalf("J2 terminal_seen_at = %q, want empty", stored.Jobs["J2"].TerminalSeenAt)
+	}
+	one, err := json.Marshal(stored.Jobs["J2"])
+	if err != nil {
+		t.Fatalf("marshal J2: %v", err)
+	}
+	if strings.Contains(string(one), "terminal_seen_at") {
+		t.Fatalf("stored J2 = %s, want no terminal_seen_at key (omitempty)", one)
+	}
+}
