@@ -48,6 +48,8 @@ type Rule struct {
 	StderrBytes []byte   `json:"stderr_bytes,omitempty"`
 	Code        int      `json:"code,omitempty"`
 	Delay       int      `json:"delay_ms,omitempty"`
+	// StartDelay, when non-zero, is that many ms applied before anything is written: it models a slow process start.
+	StartDelay int `json:"start_delay_ms,omitempty"`
 	// StdoutFirst writes the stdout first, then applies the delay,
 	// then the stderr and the exit; the default is delay, stdout,
 	// stderr, exit.
@@ -58,6 +60,14 @@ type Rule struct {
 	// bound that still ends with an ordinary exit code, as a Windows
 	// child does under TerminateProcess. Default behavior is unchanged.
 	ExitOnTerm int `json:"exit_on_term,omitempty"`
+	// WroteMarker, when non-empty, is a file path where the fake writes
+	// the instant (time.Now().UnixNano() as text) at which it finished
+	// writing its stdout, right after that write: a test that needs to
+	// tell "the child wrote before the bound" from "the child was too
+	// slow to start" reads the marker instead of guessing. With an empty
+	// path nothing is written and the rule's order of effects is
+	// unchanged.
+	WroteMarker string `json:"wrote_marker,omitempty"`
 	// HoldPipeMs, when non-zero, starts a copy of the fake before the
 	// rule runs that keeps the inherited stdout and stderr open for that
 	// many milliseconds: the pipes stay open (the pipe has no writer
@@ -255,17 +265,27 @@ func Main() {
 		// it in place; the plain path's order of effects is unchanged
 		// (nothing ran between the setup and the wait before either).
 		sig := installRuleSignal(rule)
+		// StartDelay runs under the same signal wait as the rule's
+		// delay, so a bound that expires inside it ends the child the
+		// same way one that expires inside the delay does; its wait is
+		// never the last one, so it leaves the signal channel registered
+		// for the rule's remaining wait.
+		if rule.StartDelay > 0 {
+			waitRuleSignal(rule, rule.StartDelay, sig, false)
+		}
 		if rule.StdoutFirst {
 			// The stdout write goes straight to the pipe (os.File has
 			// no user-space buffering), so the parent sees it before
 			// the delay; then stderr and the exit.
 			_, _ = os.Stdout.Write(stdoutData)
-			waitRuleSignal(rule, rule.Delay, sig)
+			writeWroteMarker(rule)
+			waitRuleSignal(rule, rule.Delay, sig, true)
 			_, _ = os.Stderr.Write(stderrData)
 			os.Exit(rule.Code)
 		}
-		waitRuleSignal(rule, rule.Delay, sig)
+		waitRuleSignal(rule, rule.Delay, sig, true)
 		_, _ = os.Stdout.Write(stdoutData)
+		writeWroteMarker(rule)
 		_, _ = os.Stderr.Write(stderrData)
 		os.Exit(rule.Code)
 	}
@@ -364,18 +384,36 @@ func installRuleSignal(rule Rule) chan os.Signal {
 // waitRuleSignal is the wait step of a rule's wait: it sleeps for ms
 // milliseconds, or (when ExitOnTerm is non-zero and the handler
 // installed by installRuleSignal fires) exits with that code on a
-// terminal signal (os.Interrupt, plus SIGTERM where it exists).
-func waitRuleSignal(rule Rule, ms int, ch chan os.Signal) {
+// terminal signal (os.Interrupt, plus SIGTERM where it exists). The
+// channel is stopped only when last is true and the wait completes:
+// the registration made once before the rule's first wait must stay in
+// place across an earlier wait, so a finished wait cannot leave the
+// channel dead for the rule's remaining ones.
+func waitRuleSignal(rule Rule, ms int, ch chan os.Signal, last bool) {
 	if rule.ExitOnTerm == 0 {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		return
 	}
-	defer signal.Stop(ch)
+	if last {
+		defer signal.Stop(ch)
+	}
 	select {
 	case <-ch:
 		os.Exit(rule.ExitOnTerm)
 	case <-time.After(time.Duration(ms) * time.Millisecond):
 	}
+}
+
+// writeWroteMarker records, at the rule's WroteMarker path, the instant
+// the rule finished writing its stdout: time.Now().UnixNano() as text,
+// written right after the stdout write. With an empty path it does
+// nothing, so a rule that does not ask for the marker keeps its
+// previous order of effects.
+func writeWroteMarker(rule Rule) {
+	if rule.WroteMarker == "" {
+		return
+	}
+	_ = os.WriteFile(rule.WroteMarker, []byte(strconv.FormatInt(time.Now().UnixNano(), 10)), 0o600)
 }
 
 func matches(argv []string, rule Rule) bool {
