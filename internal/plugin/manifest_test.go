@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -119,21 +120,23 @@ func TestManifest(t *testing.T) {
 		t.Fatal("manifest has no sections; the reader is not reading the file")
 	}
 
-	// Each expected section pair maps to its exact argv.
-	wantPairs := map[string]string{
-		"startup sync":             "nau plugin startup",
-		"events workspace-created": "nau plugin event",
-		"events workspace-closed":  "nau plugin event",
-		"events agent-status":      "nau plugin event",
-		"actions status":           "nau plugin bridge status",
-		"actions sync":             "nau plugin bridge sync",
+	// Each expected section pair maps to its exact argv, element by
+	// element: a joined string would accept "plugin bridge" as one
+	// argument, which the CLI rejects.
+	wantPairs := map[string][]string{
+		"startup sync":             {"nau", "plugin", "startup"},
+		"events workspace-created": {"nau", "plugin", "event"},
+		"events workspace-closed":  {"nau", "plugin", "event"},
+		"events agent-status":      {"nau", "plugin", "event"},
+		"actions status":           {"nau", "plugin", "bridge", "status"},
+		"actions sync":             {"nau", "plugin", "bridge", "sync"},
 	}
 	seenPairs := map[string]bool{}
 	for _, s := range m.sections {
 		if want, ok := wantPairs[s.name+" "+s.id]; ok {
 			seenPairs[s.name+" "+s.id] = true
-			if got := strings.Join(s.command, " "); got != want {
-				t.Errorf("[%s %s] command %q, want %q", s.name, s.id, got, want)
+			if !slices.Equal(s.command, want) {
+				t.Errorf("[%s %s] command %q, want %q", s.name, s.id, s.command, want)
 			}
 		}
 		if !sectionIDRe.MatchString(s.id) {
