@@ -31,6 +31,15 @@ const (
 	serveServeTimeout  = 10 * time.Second
 )
 
+// serveSweepInterval is the period of the ended-rows sweep: the serve
+// runs one sweep at the start and then one every period, whatever the
+// requests; the tests replace it with a short interval.
+var serveSweepInterval = 24 * time.Hour
+
+// serveListen opens the listener socket; the tests replace it to capture
+// the listener so they can close it and fail the serve on it.
+var serveListen = net.Listen
+
 // serveContext is the signal-bound context of the serve loop; the tests
 // replace it with a context they cancel.
 var serveContext = func() (context.Context, context.CancelFunc) {
@@ -202,21 +211,25 @@ func cmdServe(args []string, env Env) int {
 		pollS = n
 	}
 	opts := registry.Options{Now: env.Now}
+	// The deprecated count flags stay accepted for who already passes
+	// them: any positive integer is ignored, and the registry has no
+	// job or session count limit. A missing value is refused by the
+	// flag parse above; a non-integer or a value below 1 exits 2.
 	if f.maxJobsSet {
 		n, err := strconv.Atoi(f.maxJobs)
-		if err != nil || n < 1 || n > 1000 {
-			fail(env, 2, "serve: --max-jobs must be an integer between 1 and 1000")
+		if err != nil || n < 1 {
+			fail(env, 2, "serve: --max-jobs must be a positive integer")
 			return 2
 		}
-		opts.MaxJobs = n
+		_, _ = fmt.Fprintln(env.Stderr, env.program()+": serve: --max-jobs is deprecated and ignored: the registry has no job count limit")
 	}
 	if f.maxSessionsSet {
 		n, err := strconv.Atoi(f.maxSessions)
-		if err != nil || n < 1 || n > 1000 {
-			fail(env, 2, "serve: --max-sessions must be an integer between 1 and 1000")
+		if err != nil || n < 1 {
+			fail(env, 2, "serve: --max-sessions must be a positive integer")
 			return 2
 		}
-		opts.MaxSessions = n
+		_, _ = fmt.Fprintln(env.Stderr, env.program()+": serve: --max-sessions is deprecated and ignored: the registry has no session count limit")
 	}
 	if f.retentionSet {
 		n, err := strconv.Atoi(f.retentionDays)
@@ -233,7 +246,7 @@ func cmdServe(args []string, env Env) int {
 		_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "serve: registry database unavailable"}))
 		return 4
 	}
-	ln, err := net.Listen("tcp", listen)
+	ln, err := serveListen("tcp", listen)
 	if err != nil {
 		_ = store.Close()
 		_, _ = fmt.Fprintln(env.Stderr, env.program()+": serve:", err)
@@ -262,6 +275,10 @@ func cmdServe(args []string, env Env) int {
 	// The poll loop gets its own context so a failed listener also stops
 	// it, and the store is closed only after the loop has returned.
 	pollCtx, stopPoll := context.WithCancel(ctx)
+	// The sweep gets its own context too: every exit of the serve
+	// cancels it before the join below, so a failed listener closes the
+	// store without an external cancellation.
+	sweepCtx, stopSweep := context.WithCancel(ctx)
 	var polling sync.WaitGroup
 	if len(machines) > 0 {
 		poller := registry.Poller{
@@ -275,6 +292,27 @@ func cmdServe(args []string, env Env) int {
 			servePollLoop(pollCtx, stderrW, env.program(), store, machines, time.Duration(pollS)*time.Second, poller)
 		}()
 	}
+
+	// The periodic sweep of the ended rows: one round at the start and
+	// then one every serveSweepInterval, whatever the requests. A failed
+	// round writes one line, without path or key, and the serve keeps
+	// serving; the loop ends with its own context, which every exit of
+	// the serve cancels before waiting for it, and serve waits for it
+	// before closing the store, so no goroutine is left behind.
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		for {
+			if err := store.SweepEnded(env.Now()); err != nil {
+				_, _ = fmt.Fprintf(stderrW, "%s: serve: sweep failed\n", env.program())
+			}
+			select {
+			case <-sweepCtx.Done():
+				return
+			case <-time.After(serveSweepInterval):
+			}
+		}
+	}()
 
 	maquinas := machines
 	if maquinas == nil {
@@ -309,12 +347,18 @@ func cmdServe(args []string, env Env) int {
 		code = 4
 	}
 	stopPoll()
+	// This is the single exit of the serve, whatever made it leave the
+	// loop (signal, listener failure or a logged shutdown error): cancel
+	// the sweep before waiting for it, and close the store only after it
+	// has returned.
+	stopSweep()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), serveServeTimeout)
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		_, _ = fmt.Fprintf(stderrW, "%s: serve: shutdown: %v\n", env.program(), err)
 	}
 	shutdownCancel()
 	polling.Wait()
+	<-sweepDone
 	_ = store.Close()
 	return code
 }

@@ -56,26 +56,30 @@ const (
 	MaxEndedRetention = 30 * 24 * time.Hour
 
 	// Admission caps: what the registry admits before it refuses.
-	MaxNodes = 64
-	// MaxJobs is the total retained rows of the jobs kind (active plus
-	// ended): the jobs budget default and ceiling.
-	MaxJobs = 1000
-	// MaxSessions is the total retained rows of the sessions kind (active
-	// plus ended): the sessions budget default and ceiling.
-	MaxSessions = 1000
+	MaxNodes    = 64
 	MaxClaims   = 1000
 	MaxPolicies = 1000
 	MaxFolders  = 1000
 
-	// MaxInventoryBytes bounds a full inventory answer: with every table
-	// at its cap and every kept value at its length bound and fully
-	// escaped, the JSON stays under it. The jobs client reads up to it.
+	// HighCountWarn is the retained total of the jobs and sessions kinds
+	// (active plus ended, every row the registry keeps) over which serve
+	// logs one high-count warn line with the counts only, at most one
+	// per 24 h of the store clock while the total stays above it, and
+	// again when it crosses back after dropping to or below it: a signal
+	// that the inventory may grow toward the bound below, never a limit
+	// the registry enforces.
+	HighCountWarn = 10000
+
+	// MaxInventoryBytes bounds what the jobs client reads of a full
+	// inventory answer: an inventory larger than it fails the client.
+	// The registry no longer caps the jobs and sessions row counts, so
+	// the high-count warn is the advance signal for the bound, not a
+	// guarantee of it.
 	MaxInventoryBytes = 256 << 20
 
 	// MaxWaits is the total stored pane waits (the waits table), across
 	// every node. The waits the jobs derive from their events are not
-	// rows of that table; they are bounded by the jobs and sessions
-	// budgets.
+	// rows of that table; there is at most one per waiting job.
 	MaxWaits = 1000
 	// MaxPolledStringBytes bounds every string a poll stores, in UTF-8
 	// bytes, the truncation marker included.
@@ -163,15 +167,6 @@ type Options struct {
 	EventsPerJob int
 	// OnlineWindow; DefaultOnlineWindow when zero or negative.
 	OnlineWindow time.Duration
-	// MaxJobs is the total retained rows of the jobs kind (active plus
-	// ended), a positive integer 1..MaxJobs; MaxJobs when zero. A value
-	// outside the range makes Open fail with an ErrInvalid wrap.
-	MaxJobs int
-	// MaxSessions is the total retained rows of the sessions kind (active
-	// plus ended), a positive integer 1..MaxSessions; MaxSessions when
-	// zero. A value outside the range makes Open fail with an ErrInvalid
-	// wrap.
-	MaxSessions int
 	// EndedRetention is how long an ended row is retained before the
 	// sweep removes it: whole days, 7..30; DefaultEndedRetention when
 	// zero. A value outside the range, or not a whole number of days,

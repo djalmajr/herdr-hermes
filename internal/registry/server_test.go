@@ -30,6 +30,8 @@ type fakeBackend struct {
 	ingestFn        func(rec outbox.Record) (bool, error)
 	lastRec         outbox.Record
 	gotIngest       bool
+	healthFn        func() (HealthCounts, error)
+	gotHealth       bool
 	invFn           func(f Filter) (Inventory, error)
 	lastFilter      Filter
 	gotInv          bool
@@ -64,6 +66,16 @@ func (b *fakeBackend) Ingest(rec outbox.Record) (bool, error) {
 		return b.ingestFn(rec)
 	}
 	return true, nil
+}
+
+func (b *fakeBackend) HealthCounts() (HealthCounts, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.gotHealth = true
+	if b.healthFn != nil {
+		return b.healthFn()
+	}
+	return HealthCounts{}, nil
 }
 
 func (b *fakeBackend) Inventory(f Filter) (Inventory, error) {
@@ -310,8 +322,9 @@ func TestHandler(t *testing.T) {
 		if w.Code != 200 {
 			t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
 		}
-		if w.Body.String() != fmt.Sprintf(`{"status":"ok","schema":%d}`, SchemaVersion)+"\n" {
-			t.Errorf("body = %q", w.Body.String())
+		want := fmt.Sprintf(`{"status":"ok","schema":%d,"counts":{"jobs":{"total":0,"active":0,"ended":0,"protected_ended":0},"sessions":{"total":0,"active":0,"ended":0,"protected_ended":0}}}`, SchemaVersion) + "\n"
+		if w.Body.String() != want {
+			t.Errorf("body = %q, want %q", w.Body.String(), want)
 		}
 		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
 			t.Errorf("Content-Type = %q, want application/json", ct)

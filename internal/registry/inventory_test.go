@@ -376,17 +376,21 @@ func TestTwoNodeInventory(t *testing.T) {
 // TestInventoryWorstCaseBound: a math model, not a measurement of a
 // stored database: one measured row of each table, with every kept value
 // at its length bound and made of characters JSON escapes to six bytes,
-// multiplied by the table's cap, stays under MaxInventoryBytes, the most
-// the jobs client reads. The worst strings are at the byte limit: such a
+// multiplied by the table's reference count, stays under MaxInventoryBytes, the most
+// the jobs client reads. The jobs and sessions kinds have no row cap
+// (DJA-275), so the model uses the reference populations (1000 rows
+// each) and an inventory larger than the bound fails the jobs client,
+// the high-count warn being the advance signal, not a guarantee. The
+// worst strings are at the byte limit: such a
 // value is wider, escaped, than any truncated value (whose 76-byte marker
 // is ASCII), so the model uses at-limit control characters and checks one
 // truncated value is not wider. The jobs list holds the active rows of
-// both budget kinds (the poll workspaces are inside the jobs budget). The
-// modeled state is MaxJobs jobs-kind rows, per row the larger of the
+// both kinds (the poll workspaces are the jobs kind). The
+// modeled state is refJobs jobs-kind rows, per row the larger of the
 // event-bearing row (its full event ring plus a workspace_id at
 // MaxPolledStringBytes, taken through ApplyPoll of a job-<id> workspace
 // of the same job) and the worst hm- workspace row (label and id at the
-// bound), each with its wait; MaxSessions sessions-kind rows at their
+// bound), each with its wait; refSessions sessions-kind rows at their
 // field bounds; MaxWaits pane waits, each with the pane id and the name
 // at MaxPolledPaneBytes and a workspace id resolving to a ws: key at the
 // bound; and MaxNodes nodes, the measured one with its poll_status at
@@ -397,6 +401,8 @@ func TestTwoNodeInventory(t *testing.T) {
 // path with hostile inputs), so a uniform worst case would size a state
 // that cannot exist.
 func TestInventoryWorstCaseBound(t *testing.T) {
+	const refJobs = 1000
+	const refSessions = 1000
 	s := openStore(t)
 	// A value at its byte limit of control characters is the worst
 	// escaped width; a truncated value of the same limit is narrower.
@@ -527,8 +533,8 @@ func TestInventoryWorstCaseBound(t *testing.T) {
 		jobsRow = h
 	}
 	total := 1024 +
-		MaxJobs*(jobsRow+size(*jobWait)) +
-		MaxSessions*(size(sessRow)+size(*jobWait)) +
+		refJobs*(jobsRow+size(*jobWait)) +
+		refSessions*(size(sessRow)+size(*jobWait)) +
 		MaxPolicies*size(inv.Politicas[0]) +
 		MaxFolders*size(inv.Pastas[0]) +
 		MaxClaims*size(inv.Claims[0]) +
