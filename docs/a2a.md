@@ -59,6 +59,7 @@ Refusal codes (every refusal is deterministic and carries one of these):
 - `unknown_task`: no such task (or the task belongs to another subject).
 - `decision_conflict`: a decision id was reused with different content.
 - `invalid_decision`: the decision id, kind, text or actor is not acceptable.
+- `not_a_recipient`: a reply came from a pane that is neither the planned owner or guardian of the task nor the current recipient of the project; nothing is recorded.
 
 ## Owner and guardian delivery
 
@@ -102,7 +103,7 @@ nau a2a reply --task <id> (--answer | --ask | --decline) [--decision-id <id>] [-
 - `cancel` cancels a non-terminal `--task` and prints `{"status":"ok","task":…}`.
 - `inbox` lists the tasks of this machine (newest update first) with their delivery states and pending decisions; `--project` and `--state` filter. It is read-only, never creates a missing database (it prints an empty list), and never shows message text.
 - `show` prints `{"status":"ok","task":…,"item":…,"decisions":[…]}`: the task with its full history — the message text appears only as JSON data here — plus the inbox item and the recorded decisions. An unknown task, or a missing database, exits 3 without creating the file.
-- `reply` records the owner or guardian decision on a `working` task: `--answer` completes it (the text as the artifact), `--ask` moves it to `input_required` (the text as the question back), `--decline` rejects it (the text as the reason). It prints `{"status":"recorded","decision":…}` (or `"duplicate"` for the same decision id and content), exit 2 with `{"status":"refused","motivo":"<code>"}` on a refusal, exit 3 for an unknown task. It never applies the decision itself: a running `serve` applies it (locally or out of band) and `reply` never claims the task changed.
+- `reply` records the owner or guardian decision on a `working` task: `--answer` completes it (the text as the artifact), `--ask` moves it to `input_required` (the text as the question back), `--decline` rejects it (the text as the reason). It prints `{"status":"recorded","decision":…}` (or `"duplicate"` for the same decision id and content), exit 2 with `{"status":"refused","motivo":"<code>"}` on a refusal, exit 3 for an unknown task. It never applies the decision itself: a running `serve` applies it (locally or out of band) and `reply` never claims the task changed. Inside Herdr (with `HERDR_PANE_ID` set) it records the pane reference (`local/<HERDR_PANE_ID>`, as-is when the value already carries the `local/` prefix) as the decision's `actor` and refuses with `not_a_recipient` a pane that is neither the planned owner or guardian of the task nor the current recipient of the project, writing nothing; outside Herdr it records `actor: local` and runs no such check. A recipient registered by the agent name (rather than the pane reference) is compared with the agent name of the pane that answers, resolved on the local Herdr with `herdr agent get`; when the resolution fails and the name is needed, the command exits 4 and nothing is recorded.
 
 ## Authentication
 
@@ -141,3 +142,4 @@ A subscription is bound to the recorded reference, never to a token, because Nau
 - The sequence fence is per (subject, session), and every caller of the loopback local operator is the same subject: independent local callers must use distinct session ids, or they fence each other.
 - A push subscription is re-checked against the owner and guardian routing before each push, never against the token that created it: revoking a token alone does not end it (see Push subscriptions).
 - A resend of the same message is answered before any execution only when its admission is already stored: a send whose admission lookup ran before the first admission of the same message committed gets the busy answer (the task keeps its state, the message is not admitted again, and the answer writes nothing and sends no push), and the next resend of that message is answered with the stored task, without running it.
+- The reply check identifies the pane through `HERDR_PANE_ID`, which any process can set, so it guards against a reply from the wrong agent, not against a local user with database access; a sandbox that does not pass `HERDR_*` to the agent makes its replies look like the operator's.

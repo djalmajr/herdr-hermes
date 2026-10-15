@@ -25,6 +25,13 @@ type Env struct {
 	// ProgramNau.
 	Program string
 	Getenv  func(string) string
+	// PaneAgentName resolves the agent name of a pane of the local
+	// Herdr (`herdr agent get <pane>`): the name of the agent of the
+	// pane, or "" when the pane has no agent; an error means the
+	// identity could not be resolved. Nil uses the default: the herdr
+	// binary of the PATH, run with the Environ of this Env under a
+	// 10 s bound.
+	PaneAgentName func(ctx context.Context, pane string) (string, error)
 	// Environ returns the exact environment of the nau process;
 	// forwarded subprocesses get this environment and nothing else. The
 	// API key is never in it because it is never put there.
@@ -57,6 +64,9 @@ func EnvFromOS() Env {
 		Environ: os.Environ,
 		Now:     time.Now,
 		Sleep:   sleepCtx,
+		PaneAgentName: func(ctx context.Context, pane string) (string, error) {
+			return paneAgentName(ctx, os.Environ(), pane)
+		},
 	}
 	if cfg, err := os.UserConfigDir(); err == nil && cfg != "" {
 		env.ConfigDir = filepath.Join(cfg, "herdr-hermes")

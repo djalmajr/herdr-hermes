@@ -973,7 +973,7 @@ func cmdA2AReply(args []string, env Env) int {
 	defer func() { _ = store.Close() }()
 	// The task must exist: reply never creates anything, and the stored
 	// decisions answer the duplicate before the write.
-	_, _, decisions, err := store.Show(context.Background(), task)
+	_, item, decisions, err := store.Show(context.Background(), task)
 	if err != nil {
 		if errors.Is(err, a2a.ErrTaskNotFound) {
 			return notFound()
@@ -993,12 +993,94 @@ func cmdA2AReply(args []string, env Env) int {
 			return 0
 		}
 	}
+	// Inside Herdr (HERDR_PANE_ID set) the reply records the pane
+	// reference as the actor and is refused with not_a_recipient when the
+	// pane is not a recipient of the task: one of the planned deliveries
+	// or, when not planned, the current routing, so a re-registered owner
+	// may answer. A recipient registered by the agent name of the local
+	// Herdr is compared with the agent name of the pane that answers
+	// (herdr agent get), resolved only when the pane reference is not a
+	// recipient and some recipient carries the agent-name pattern; the
+	// actor stays the pane reference, never the name. Outside Herdr the
+	// actor is "local" and no check runs.
+	actor := "local"
+	if paneID := env.Getenv("HERDR_PANE_ID"); paneID != "" {
+		pane := paneID
+		ref := paneID
+		if strings.HasPrefix(paneID, "local/") {
+			pane = strings.TrimPrefix(paneID, "local/")
+		} else {
+			ref = "local/" + paneID
+		}
+		actor = ref
+		// The recipients of the task: the planned deliveries and, when the
+		// pane is not among them, the current routing.
+		planned, err := store.TaskRecipientRefs(context.Background(), task)
+		if err != nil {
+			_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a reply:", err)
+			_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a reply: registry database unavailable"}))
+			return 4
+		}
+		recipients := append([]string(nil), planned...)
+		recipient := a2aReplyInRefs(recipients, ref)
+		if !recipient {
+			// The planned deliveries do not include the pane: the current
+			// routing is read, only then (a read-only open, like the serve
+			// opens it), so a routing change after the admission is what
+			// lets a new owner answer.
+			ro, err := outbox.Open(outbox.StateDir(env.ConfigDir), outbox.Options{Now: env.Now, ReadOnly: true})
+			if err != nil {
+				_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a reply:", err)
+				_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a reply: routing unavailable"}))
+				return 4
+			}
+			plan, err := a2acore.Route(a2aNotifyRoutes{ob: ro, now: env.Now}, item.Project, "")
+			if err != nil {
+				_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a reply:", err)
+				_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a reply: routing unavailable"}))
+				return 4
+			}
+			for _, p := range plan {
+				recipients = append(recipients, p.Ref)
+			}
+			recipient = a2aReplyInRefs(recipients, ref)
+		}
+		if !recipient {
+			// The pane reference is not a recipient: a recipient registered
+			// by the agent name is compared with the agent name of the pane
+			// that answers, resolved on the local Herdr only then, and only
+			// when some recipient carries the agent-name pattern. A pane
+			// without an agent has no name and is refused; a failed
+			// resolution writes nothing and exits 4.
+			if a2aReplyAnyAgentName(recipients) {
+				resolve := env.PaneAgentName
+				if resolve == nil {
+					environ := childEnviron(env)
+					resolve = func(ctx context.Context, pane string) (string, error) {
+						return paneAgentName(ctx, environ, pane)
+					}
+				}
+				name, err := resolve(context.Background(), pane)
+				if err != nil {
+					_, _ = fmt.Fprintln(env.Stderr, env.program()+": a2a reply:", err)
+					_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "unavailable", Motivo: "a2a reply: pane identity unavailable"}))
+					return 4
+				}
+				recipient = name != "" && a2aReplyInRefs(recipients, name)
+			}
+		}
+		if !recipient {
+			_, _ = fmt.Fprintf(env.Stderr, "%s: a2a reply: refused: %s\n", env.program(), a2acore.RefuseNotARecipient)
+			_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(errorLine{Status: "refused", Motivo: a2acore.RefuseNotARecipient}))
+			return 2
+		}
+	}
 	d := a2acore.Decision{
 		ID:     decisionID,
 		TaskID: task,
 		Kind:   kind,
 		Text:   text,
-		Actor:  "local",
+		Actor:  actor,
 	}
 	stored, refusal, err := store.RecordDecision(context.Background(), d, env.Now())
 	if err != nil {
@@ -1024,4 +1106,26 @@ func cmdA2AReply(args []string, env Env) int {
 		Decision *a2acore.Decision `json:"decision"`
 	}{"recorded", &stored}))
 	return 0
+}
+
+// a2aReplyInRefs reports whether want is one of the recipient refs.
+func a2aReplyInRefs(refs []string, want string) bool {
+	for _, r := range refs {
+		if r == want {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aReplyAnyAgentName reports whether any recipient ref is a local
+// agent name: only then is the agent name of the answering pane
+// resolved and compared.
+func a2aReplyAnyAgentName(refs []string) bool {
+	for _, r := range refs {
+		if notify.AgentNamePattern.MatchString(r) {
+			return true
+		}
+	}
+	return false
 }
