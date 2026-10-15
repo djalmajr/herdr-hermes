@@ -6,7 +6,7 @@
 // dispatcher pull. Errors from this package never contain the key or the
 // Authorization header.
 //
-// TODO(herdr-hermes): verify the dispatcher receiver contract (path,
+// TODO(nau): verify the dispatcher receiver contract (path,
 // response codes) once it exists.
 package push
 

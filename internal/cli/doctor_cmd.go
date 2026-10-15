@@ -107,10 +107,10 @@ func doctorOutboxCounts(env Env) doctorOutbox {
 }
 
 // wakeHookConfigured runs `herdr-soho config` with HERDR_SOHO_NOWRITE=1 in
-// the child environment and classifies the job_wake_cmd value: "true" when
-// it starts with "nau wake" or "herdr-hermes wake", "false" when the
-// output is parseable but shows no such hook, "unknown" on a non-zero
-// exit or unparseable output.
+// the child environment and classifies the job_wake_cmd value: "true"
+// when the trimmed value's first field is "nau" or "herdr-hermes" and its
+// second field is exactly "wake", "false" when the output is parseable but
+// shows no such hook, "unknown" on a non-zero exit or unparseable output.
 func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string {
 	environ := childEnviron(env)
 	// The child gets HERDR_SOHO_NOWRITE=1; any inherited value is replaced
@@ -143,10 +143,11 @@ func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string
 
 // parseWakeHook classifies the `herdr-soho config` output. A line whose
 // first whitespace-separated field is job_wake_cmd decides the result:
-// true when its value starts with "nau wake" or "herdr-hermes wake" (the
-// two program names, with the same prefix semantics), false otherwise.
-// Output with no such line is false when it is parseable as key-value
-// lines and unknown otherwise.
+// true when the trimmed value's first field is the program name (nau or
+// herdr-hermes) and its second field is exactly wake; fields after the
+// second, extra whitespace and the source column are allowed. The rest of
+// the output must be parseable as key-value lines for the result to be
+// false; otherwise it is unknown.
 func parseWakeHook(output string) string {
 	parseable := false
 	for _, line := range strings.Split(output, "\n") {
@@ -156,8 +157,8 @@ func parseWakeHook(output string) string {
 		}
 		parseable = true
 		if fields[0] == "job_wake_cmd" {
-			value := strings.TrimSpace(line[len(fields[0]):])
-			if strings.HasPrefix(value, ProgramNau+" wake") || strings.HasPrefix(value, ProgramHerdrHermes+" wake") {
+			value := strings.Fields(line[len(fields[0]):])
+			if len(value) >= 2 && (value[0] == ProgramNau || value[0] == ProgramHerdrHermes) && value[1] == "wake" {
 				return "true"
 			}
 			return "false"

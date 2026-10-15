@@ -12,21 +12,21 @@ import (
 // goldenJobEventLine is the exact rendered line for a blocked job event of
 // job-1 (seq 3) with the full registry: owner first, details via the job
 // events command (seq-1) and the optional ack.
-const goldenJobEventLine = "[herdr-hermes] notification=nf84db8188697ced41e18 class=blocked role=owner job=job-1 project=example-org/example-repo event=blocked seq=3 escalation=blocked | details: herdr-hermes job events --id job-1 --since 2 (or the local outbox: herdr-hermes outbox) | optional ack: herdr-hermes notify ack nf84db8188697ced41e18 --role owner"
+const goldenJobEventLine = "[herdr-hermes] notification=nf84db8188697ced41e18 class=blocked role=owner job=job-1 project=example-org/example-repo event=blocked seq=3 escalation=blocked | details: nau job events --id job-1 --since 2 (or the local outbox: nau outbox) | optional ack: nau notify ack nf84db8188697ced41e18 --role owner"
 
 // goldenAgentStatusLine is the exact rendered line for the first blocked
 // transition of pane w1:p2 in workspace w1, watched for job-1.
-const goldenAgentStatusLine = "[herdr-hermes] notification=n61995c5190f08fad90af class=agent_blocked role=owner job=job-1 project=example-org/example-repo pane=w1:p2 workspace=w1 status=blocked escalation=blocked | details: inspect pane w1:p2 | optional ack: herdr-hermes notify ack n61995c5190f08fad90af --role owner"
+const goldenAgentStatusLine = "[herdr-hermes] notification=n61995c5190f08fad90af class=agent_blocked role=owner job=job-1 project=example-org/example-repo pane=w1:p2 workspace=w1 status=blocked escalation=blocked | details: inspect pane w1:p2 | optional ack: nau notify ack n61995c5190f08fad90af --role owner"
 
 // goldenAgentDoneLine is the exact rendered line for the first done
 // transition of pane w1:p2 in workspace w1, watched for job-1: no
 // escalation token, details via the pane.
-const goldenAgentDoneLine = "[herdr-hermes] notification=ne4a2d04fd150d99e9710 class=agent_done role=owner job=job-1 project=example-org/example-repo pane=w1:p2 workspace=w1 status=done | details: inspect pane w1:p2 | optional ack: herdr-hermes notify ack ne4a2d04fd150d99e9710 --role owner"
+const goldenAgentDoneLine = "[herdr-hermes] notification=ne4a2d04fd150d99e9710 class=agent_done role=owner job=job-1 project=example-org/example-repo pane=w1:p2 workspace=w1 status=done | details: inspect pane w1:p2 | optional ack: nau notify ack ne4a2d04fd150d99e9710 --role owner"
 
 // goldenWorkspaceLine is the exact rendered line for the opened
 // transition (N=1) of job workspace w2 (job-1) with the full registry:
 // details via the job status command and the outbox hint.
-const goldenWorkspaceLine = "[herdr-hermes] notification=n103ac05f9abaf550d1e8 class=workspace_opened role=owner job=job-1 project=example-org/example-repo workspace=w2 | details: herdr-hermes job status --id job-1 (or the local outbox: herdr-hermes outbox) | optional ack: herdr-hermes notify ack n103ac05f9abaf550d1e8 --role owner"
+const goldenWorkspaceLine = "[herdr-hermes] notification=n103ac05f9abaf550d1e8 class=workspace_opened role=owner job=job-1 project=example-org/example-repo workspace=w2 | details: nau job status --id job-1 (or the local outbox: nau outbox) | optional ack: nau notify ack n103ac05f9abaf550d1e8 --role owner"
 
 func TestRenderGoldenJobEvent(t *testing.T) {
 	in := JobEventInput{
@@ -224,7 +224,7 @@ func TestRenderSegments(t *testing.T) {
 			t.Errorf("raise line has token %q: %s", tok, line)
 		}
 	}
-	if !strings.HasSuffix(line, "optional ack: herdr-hermes notify ack "+raiser.ID+" --role owner") {
+	if !strings.HasSuffix(line, "optional ack: nau notify ack "+raiser.ID+" --role owner") {
 		t.Errorf("raise line lacks the ack suffix: %s", line)
 	}
 
@@ -251,7 +251,7 @@ func TestRenderSegments(t *testing.T) {
 		t.Fatalf("ProjectWorkspace: %v", err)
 	}
 	line = Render(nw, nw.Deliveries[0])
-	if !strings.Contains(line, "details: herdr-hermes job status --id job-1 (or the local outbox: herdr-hermes outbox)") {
+	if !strings.Contains(line, "details: nau job status --id job-1 (or the local outbox: nau outbox)") {
 		t.Errorf("workspace line lacks the job status details: %s", line)
 	}
 	if !strings.Contains(line, "workspace=w2") {
@@ -297,7 +297,7 @@ func TestRenderSegments(t *testing.T) {
 		t.Errorf("line keeps a zero seq token: %s", line)
 	}
 	// The id is a valid pattern and the first role is real: the ack stays.
-	if !strings.HasSuffix(line, "optional ack: herdr-hermes notify ack "+manual.ID+" --role owner") {
+	if !strings.HasSuffix(line, "optional ack: nau notify ack "+manual.ID+" --role owner") {
 		t.Errorf("line lacks the ack suffix: %s", line)
 	}
 }
