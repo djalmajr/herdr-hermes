@@ -25,7 +25,7 @@ const (
 // ok is false when raw is not a JSON object or carries no non-empty string
 // label.
 //
-// TODO(herdr-hermes): verify the HERDR_PLUGIN_EVENT_JSON shape for
+// TODO(nau): verify the HERDR_PLUGIN_EVENT_JSON shape for
 // workspace.created and workspace.closed against a real Herdr.
 func ParseEvent(raw string) (label, workspaceID string, ok bool) {
 	var obj map[string]json.RawMessage

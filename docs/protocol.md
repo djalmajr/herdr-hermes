@@ -96,7 +96,7 @@ with exit 0, 40, 41 or 42 according to the push outcome; on a non-zero outcome t
 {"herdr_soho":{"found":true,"capabilities":"{...}","ephemeral_job":true,"job_events":true},"machine_label":true,"dispatcher_url":true,"key_configured":false,"wake_hook":"true","outbox":{"ultimo_seq":N,"entregue_seq":M,"pendentes":K}}
 ```
 
-`capabilities` is the raw `herdr-soho capabilities --json` line or null. `wake_hook` is `true` when the `herdr-soho` configuration carries a `job_wake_cmd` that starts with `nau wake` or `herdr-hermes wake`, `false` when a parseable configuration has a different value or none, and `unknown` when the configuration cannot be read or parsed. `doctor` exits 43 when `herdr-soho` is missing or lacks either capability, else 0.
+`capabilities` is the raw `herdr-soho capabilities --json` line or null. `wake_hook` is `true` when the `herdr-soho` configuration carries a `job_wake_cmd` whose first field is `nau` or `herdr-hermes` and whose second field is exactly `wake`, `false` when a parseable configuration has a different value or none, and `unknown` when the configuration cannot be read or parsed. `doctor` exits 43 when `herdr-soho` is missing or lacks either capability, else 0.
 
 ## Plugin
 

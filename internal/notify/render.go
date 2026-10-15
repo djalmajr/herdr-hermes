@@ -88,7 +88,7 @@ func Render(n *Notification, d Delivery) string {
 		line += " | " + seg
 	}
 	if notificationIDPattern.MatchString(n.ID) && len(d.Roles) > 0 && inList(d.Roles[0], renderRoles) {
-		line += " | optional ack: herdr-hermes notify ack " + n.ID + " --role " + d.Roles[0]
+		line += " | optional ack: nau notify ack " + n.ID + " --role " + d.Roles[0]
 	}
 	return line
 }
@@ -102,7 +102,7 @@ func detailsSegment(n *Notification) string {
 	switch n.SourceKind {
 	case SourceJobEvent:
 		if jobapi.ValidID(n.JobID) && n.EventSeq > 0 {
-			return "details: herdr-hermes job events --id " + n.JobID + " --since " + strconv.FormatInt(n.EventSeq-1, 10) + " (or the local outbox: herdr-hermes outbox)"
+			return "details: nau job events --id " + n.JobID + " --since " + strconv.FormatInt(n.EventSeq-1, 10) + " (or the local outbox: nau outbox)"
 		}
 	case SourceAgentStatus:
 		if PanePattern.MatchString(n.Pane) {
@@ -110,7 +110,7 @@ func detailsSegment(n *Notification) string {
 		}
 	case SourceWorkspace:
 		if jobapi.ValidID(n.JobID) {
-			return "details: herdr-hermes job status --id " + n.JobID + " (or the local outbox: herdr-hermes outbox)"
+			return "details: nau job status --id " + n.JobID + " (or the local outbox: nau outbox)"
 		}
 	}
 	return ""

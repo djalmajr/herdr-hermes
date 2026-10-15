@@ -203,24 +203,51 @@ func TestDoctorWakeHook(t *testing.T) {
 	}
 }
 
-// TestDoctorWakeHookBothProgramNames: the wake hook check accepts both
-// program names (nau wake and herdr-hermes wake) with the same prefix
-// semantics it had for the old name, and still classifies other values.
-func TestDoctorWakeHookBothProgramNames(t *testing.T) {
+// TestDoctorWakeHookExactValue: the wake hook is accepted only when the
+// trimmed value's first field is the program name (nau or herdr-hermes)
+// and its second field is exactly wake; later fields, extra whitespace
+// and the source column are allowed. Both identities are covered, with
+// the brief's six accepted and seven rejected examples and their mirrors.
+func TestDoctorWakeHookExactValue(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		row  string
-		want string
+		name  string
+		value string
+		want  string
 	}{
-		{"nauWake", "job_wake_cmd        nau wake                         file", "true"},
-		{"herdrHermesWake", "job_wake_cmd        herdr-hermes wake                    file", "true"},
-		{"nauDashNotASpace", "job_wake_cmd        nau-wake                         file", "false"},
-		{"otherCmd", "job_wake_cmd        other-cmd wake                   file", "false"},
+		// Accepted.
+		{"nauWake", "nau wake", "true"},
+		{"herdrHermesWake", "herdr-hermes wake", "true"},
+		{"nauWakeExtraArgs", "nau wake --extra x", "true"},
+		{"nauWakeTripleSpace", "nau   wake", "true"},
+		{"nauWakeTab", "nau\twake", "true"},
+		{"nauWakePadded", "  nau wake  ", "true"},
+		{"herdrHermesWakeExtraArgs", "herdr-hermes wake --extra x", "true"},
+		{"herdrHermesWakeTripleSpace", "herdr-hermes   wake", "true"},
+		{"herdrHermesWakeTab", "herdr-hermes\twake", "true"},
+		{"herdrHermesWakePadded", "  herdr-hermes wake  ", "true"},
+		// Rejected.
+		{"nauWakeup", "nau wakeup", "false"},
+		{"herdrHermesWakeup", "herdr-hermes wakeup", "false"},
+		{"nauWakeboard", "nau wakeboard", "false"},
+		{"herdrHermesWakeboard", "herdr-hermes wakeboard", "false"},
+		{"nauwakeGlued", "nauwake", "false"},
+		{"herdrHermeswakeGlued", "herdr-hermeswake", "false"},
+		{"nauOnly", "nau", "false"},
+		{"herdrHermesOnly", "herdr-hermes", "false"},
+		{"wakeOnly", "wake", "false"},
+		{"nauDashNotASpace", "nau-wake", "false"},
+		{"otherCmdWake", "other-cmd wake", "false"},
+		{"absolutePathNau", "/usr/local/bin/nau wake", "false"},
+		{"absolutePathHerdrHermes", "/usr/local/bin/herdr-hermes wake", "false"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// The raw config line carries the exact value between the key
+			// and the source column, including any of its own spaces or
+			// tabs.
+			row := "job_wake_cmd        " + tc.value + "   file"
 			exe, _ := installFakeSoho(t,
 				capsRule(capsJSON, 0),
-				fakesoho.Rule{Argv: []string{"config"}, Stdout: configTable(tc.row), Code: 0},
+				fakesoho.Rule{Argv: []string{"config"}, Stdout: configTable(row), Code: 0},
 			)
 			cfgDir := t.TempDir()
 			setSohoConfig(t, cfgDir, exe, "machine-a")
