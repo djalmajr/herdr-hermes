@@ -132,15 +132,16 @@ func loopbackOrigin(o string) bool {
 // task, so the caller gets the fixed busy text and not the SDK
 // internal text.
 type authInterceptor struct {
-	auth  a2acore.Authenticator
-	authz a2acore.Authorizer
-	tasks scopedTaskStore
-	caps  *a2a.AgentCapabilities
+	auth   a2acore.Authenticator
+	authz  a2acore.Authorizer
+	tasks  scopedTaskStore
+	caps   *a2a.AgentCapabilities
+	limits a2acore.Limits
 }
 
 // newAuthInterceptor builds the interceptor of one server.
 func newAuthInterceptor(cfg Config) *authInterceptor {
-	return &authInterceptor{auth: cfg.Auth, authz: cfg.Authz, tasks: scopedTaskStore{store: cfg.Store}}
+	return &authInterceptor{auth: cfg.Auth, authz: cfg.Authz, tasks: scopedTaskStore{store: cfg.Store}, limits: cfg.Limits}
 }
 
 // withCapabilities sets the capabilities the server advertises, the
@@ -325,6 +326,23 @@ func (i *authInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContex
 				}
 				if admitted == string(p.Message.TaskID) {
 					return ctx, stored.Task, nil
+				}
+			}
+			// A continuation that will be refused is answered here, before any
+			// SDK execution: the pre-evaluation runs the same rules in the same
+			// order as the executor's path (Evaluate, the awaiting-caller gate,
+			// the fence) without writing, so a predicted refusal is answered
+			// with the stored task and nothing is stored (task, history,
+			// ingress, fence, delivery) and no push goes out. A terminal task
+			// is not pre-evaluated (the SDK refuses it with unsupported
+			// operation, unchanged) and a predicted admission follows the usual
+			// path: the executor keeps its checks as the defense for the race
+			// between this read and the admission.
+			if callCtx.Method() == "SendMessage" {
+				if refusal, err := i.preEvaluate(ctx, subject, stored, p.Message); err != nil {
+					return ctx, nil, err
+				} else if refusal != nil {
+					return ctx, earlyRefusalResponse(stored, refusal.Code), nil
 				}
 			}
 		}

@@ -181,11 +181,12 @@ func TestCancelNotFoundTextParkedMatchesIdle(t *testing.T) {
 }
 
 // TestContentionVisibleParkedIsBusy: a permitted continuation on a
-// visible parked task is answered with the exact stable busy body,
-// writes nothing (the store snapshot and the live count are unchanged)
-// and the same message id resent after the parked execution is gone is
-// admitted as the same task: the busy send admitted nothing and fenced
-// nothing.
+// visible parked task is answered by the interceptor's pre-evaluation
+// with the stored task and the refusal (the task is not awaiting the
+// caller), writes nothing (the store snapshot and the live count are
+// unchanged) and the same message id resent after the parked execution
+// is gone is admitted as the same task: the refusal admitted nothing
+// and fenced nothing.
 func TestContentionVisibleParkedIsBusy(t *testing.T) {
 	f := pcSetup(t)
 	secretID := string(f.secret.ID)
@@ -196,23 +197,30 @@ func TestContentionVisibleParkedIsBusy(t *testing.T) {
 		Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-2", Text: "ct continuation",
 	}
 	res, err := f.cA.Send(ctxT(t), in)
-	if err == nil || !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
-		t.Fatalf("visible parked continuation = %+v, %v, want the internal error %q", res, err, taskBusyText)
+	if err != nil {
+		t.Fatalf("visible parked continuation = %v, want the stored task with the refusal", err)
+	}
+	got, ok := res.(*a2a.Task)
+	if !ok {
+		t.Fatalf("visible parked continuation = %T, want *a2a.Task", res)
+	}
+	if got.Status.State != a2a.TaskStateWorking {
+		t.Errorf("state = %s, want working", got.Status.State)
+	}
+	if got.Metadata[a2acore.MetaRefusal] != a2acore.RefuseNotAwaitingCaller {
+		t.Errorf("task metadata = %v, want the refusal code %s", got.Metadata, a2acore.RefuseNotAwaitingCaller)
 	}
 	wire := f.recA.wire()
-	if wire.status != http.StatusInternalServerError {
-		t.Fatalf("busy status = %d (%s), want 500", wire.status, wire.body)
+	if wire.status != http.StatusOK {
+		t.Fatalf("refusal status = %d (%s), want 200", wire.status, wire.body)
 	}
-	if got := strings.TrimSpace(pcNorm(wire.body)); got != ctBusyBody {
-		t.Fatalf("busy body = %s, want %s", got, ctBusyBody)
-	}
-	for _, leak := range []string{secretID, f.secret.ContextID, "org/secret", "in progress", "concurrent modification", "exec ctx"} {
+	for _, leak := range []string{"in progress", "concurrent modification", "exec ctx"} {
 		if strings.Contains(wire.body, leak) {
-			t.Errorf("busy body carries %q: %s", leak, wire.body)
+			t.Errorf("refusal body carries %q: %s", leak, wire.body)
 		}
 	}
 	if after := pcSnapshot(t, f.e, secretID); after != before {
-		t.Errorf("store changed by the busy send:\n before %+v\n after  %+v", before, after)
+		t.Errorf("store changed by the refusal send:\n before %+v\n after  %+v", before, after)
 	}
 	if n := f.e.srv.LiveExecutions(); n != 1 {
 		t.Errorf("live executions = %d, want 1 (the parked one is untouched)", n)

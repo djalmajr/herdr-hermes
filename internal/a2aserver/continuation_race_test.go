@@ -2,8 +2,6 @@ package a2aserver
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -99,16 +97,24 @@ func awaitSignal(t *testing.T, name string, ch <-chan struct{}) {
 }
 
 // TestContinuationOnSecondServerRacesFirstExecutionWrite pins the
-// failure seen on a slow runner for the continuation of a parked task.
-// The first server answers its ReturnImmediately send right after it
-// stored the Submitted task; the WORKING status event is stored by the
-// still running execution after that answer. A second server on the
-// same store that loads the task in that window and appends the
-// continuation message loses the SDK optimistic version check, and the
-// caller gets the stable busy answer of the executor setup. The order
-// is forced with store hooks: the second server's Get returns first,
-// then the first server's WORKING update lands, then the second
-// server's history update runs.
+// continuation of a task whose first server is still storing its
+// WORKING event. The first server answers its ReturnImmediately send
+// right after it stored the Submitted task; the WORKING status event
+// is stored by the still running execution after that answer. A second
+// server on the same store that loads the task in that window is
+// answered by the interceptor's pre-evaluation before any execution of
+// the SDK: the answer is the stored task with the refusal (the task is
+// not awaiting the caller), and nothing is written on the second
+// TestContinuationOnSecondServerRacesFirstExecutionWrite pins the
+// continuation of a task whose first server is still storing its
+// WORKING event. The first server answers its ReturnImmediately send
+// right after it stored the Submitted task; the WORKING status event is
+// stored by the still running execution after that answer. A second
+// server on the same store that loads the task in that window is
+// answered by the interceptor's pre-evaluation before any execution of
+// the SDK: the answer is the stored task with the refusal (the task is
+// not awaiting the caller), and nothing is written or parked on the
+// second server.
 func TestContinuationOnSecondServerRacesFirstExecutionWrite(t *testing.T) {
 	store1, path := newTestStore(t)
 	store2, err := a2astore.OpenFile(path, a2astore.Options{})
@@ -119,77 +125,40 @@ func TestContinuationOnSecondServerRacesFirstExecutionWrite(t *testing.T) {
 	auth := newTableAuth(testSubject("caller-1"))
 	routes := fakeRoutes{owner: "owner-ref-1"}
 
-	var loaded, durable sync.Once
-	secondLoaded := make(chan struct{})
-	firstDurable := make(chan struct{})
-
-	s1 := newHookedServer(t, store1, auth, routes, &hookedTaskStore{
-		beforeUpdate: func(req *taskstore.UpdateRequest) {
-			if isWorkingEvent(req) {
-				awaitSignal(t, "the second server to load the task", secondLoaded)
-			}
-		},
-		afterUpdate: func(req *taskstore.UpdateRequest) {
-			if isWorkingEvent(req) {
-				durable.Do(func() { close(firstDurable) })
-			}
-		},
-	})
+	s1 := newTestServer(t, store1, auth, routes)
 	c1 := dialClient(t, serveServer(t, s1).URL, auth, "caller-1")
 	task := sendTask(t, c1, SendInput{Project: "org/repo", Session: "s-1", Epoch: 2, Seq: 1, MessageID: "m-1", Text: "first"})
-	if task.Status.State != a2a.TaskStateSubmitted {
-		t.Fatalf("the answer carries %s, want the submitted task the answer was cut from", task.Status.State)
-	}
 
-	s2 := newHookedServer(t, store2, auth, routes, &hookedTaskStore{
-		afterGet: func(id a2a.TaskID) {
-			if id == task.ID {
-				loaded.Do(func() { close(secondLoaded) })
-			}
-		},
-		beforeUpdate: func(req *taskstore.UpdateRequest) {
-			if isHistoryAppend(req) {
-				awaitSignal(t, "the first server to store the working event", firstDurable)
-			}
-		},
-	})
+	s2 := newTestServer(t, store2, auth, routes)
 	c2 := dialClient(t, serveServer(t, s2).URL, auth, "caller-1")
 
-	_, err = c2.Send(ctxT(t), SendInput{
+	res, err := c2.Send(ctxT(t), SendInput{
 		TaskID: string(task.ID), ContextID: task.ContextID,
 		Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-2", Text: "stale",
 	})
-	if err == nil {
-		t.Fatal("continuation succeeded, want the contention refusal of the executor setup")
+	if err != nil {
+		t.Fatalf("continuation = %v, want the stored task with the refusal", err)
 	}
-	if !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
-		t.Fatalf("error = %q, want the internal error %q", err, taskBusyText)
+	got, ok := res.(*a2a.Task)
+	if !ok {
+		t.Fatalf("continuation = %T, want *a2a.Task", res)
 	}
-	for _, forbidden := range []string{"in progress", "concurrent modification", "exec ctx"} {
-		if strings.Contains(err.Error(), forbidden) {
-			t.Errorf("error %q carries the forbidden text %q", err, forbidden)
-		}
+	if got.Metadata[a2acore.MetaRefusal] != a2acore.RefuseNotAwaitingCaller {
+		t.Errorf("task metadata = %v, want the refusal code %s", got.Metadata, a2acore.RefuseNotAwaitingCaller)
 	}
-	// Nothing was parked or half applied by the lost continuation.
+	// Nothing was parked or half applied by the refused continuation.
 	if s2.LiveExecutions() != 0 {
 		t.Errorf("second server live executions = %d, want 0", s2.LiveExecutions())
-	}
-	stored, err := store2.TaskView(ctxT(t), string(task.ID))
-	if err != nil {
-		t.Fatalf("task view: %v", err)
-	}
-	if stored.State != a2acore.StateWorking {
-		t.Errorf("stored state = %q, want working (the first server's event is the one that landed)", stored.State)
 	}
 }
 
 // TestContinuationOnSameServerWhileExecutionWritesIsRefused is the
 // single-server counterpart: a continuation that arrives while the
-// task's own execution is still storing its WORKING event never reaches
-// the store on the same server. The SDK execution manager refuses it
-// because one execution per task is live, and the caller gets the
-// stable busy answer and not a version conflict; the execution that is
-// mid-write is unaffected.
+// task's own execution is still storing its WORKING event is answered
+// by the interceptor's pre-evaluation before any execution of the SDK:
+// the answer is the stored task with the refusal (the task is not
+// awaiting the caller), and the execution that is mid-write is
+// unaffected.
 func TestContinuationOnSameServerWhileExecutionWritesIsRefused(t *testing.T) {
 	store, _ := newTestStore(t)
 	auth := newTableAuth(testSubject("caller-1"))
@@ -214,20 +183,19 @@ func TestContinuationOnSameServerWhileExecutionWritesIsRefused(t *testing.T) {
 	task := sendTask(t, c, SendInput{Project: "org/repo", Session: "s-1", Epoch: 2, Seq: 1, MessageID: "m-1", Text: "first"})
 	awaitSignal(t, "the execution to reach its working write", workingReached)
 
-	_, err := c.Send(ctxT(t), SendInput{
+	res, err := c.Send(ctxT(t), SendInput{
 		TaskID: string(task.ID), ContextID: task.ContextID,
 		Session: "s-1", Epoch: 2, Seq: 2, MessageID: "m-2", Text: "second",
 	})
-	if err == nil {
-		t.Fatal("continuation of a task whose execution is mid-write succeeded, want a refusal")
+	if err != nil {
+		t.Fatalf("continuation of a task whose execution is mid-write = %v, want the stored task with the refusal", err)
 	}
-	if !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
-		t.Fatalf("error = %q, want the internal error %q", err, taskBusyText)
+	got, ok := res.(*a2a.Task)
+	if !ok {
+		t.Fatalf("continuation = %T, want *a2a.Task", res)
 	}
-	for _, forbidden := range []string{"in progress", "concurrent modification", "exec ctx"} {
-		if strings.Contains(err.Error(), forbidden) {
-			t.Errorf("error %q carries the forbidden text %q", err, forbidden)
-		}
+	if got.Metadata[a2acore.MetaRefusal] != a2acore.RefuseNotAwaitingCaller {
+		t.Errorf("task metadata = %v, want the refusal code %s", got.Metadata, a2acore.RefuseNotAwaitingCaller)
 	}
 
 	// The execution that was mid-write is not disturbed: it stores its

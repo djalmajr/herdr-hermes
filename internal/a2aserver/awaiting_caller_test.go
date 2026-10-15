@@ -1,7 +1,6 @@
 package a2aserver
 
 import (
-	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -14,16 +13,12 @@ import (
 
 // TestContinuationRefusedNotAwaitingCaller proves the awaiting-caller
 // gate through the A2A client: the second continuation of a working
-// task is refused not_awaiting_caller — the task keeps its working
-// state, nothing is admitted (no ingress row, no second delivery to
-// the owner, the fence stands) — whatever the first continuation's
-// execution is still alive (the SDK's stable busy answer, the
-// executor never runs) or not (a new server on the same store runs
-// the executor and yields the refusal, which parks). The SDK appends
-// the continuation's message to the task history when it loads the
-// execution context, before the executor runs, so the refused message
-// is present in the history as data; the store-level effect of the
-// refusal is what this test pins.
+// task is refused not_awaiting_caller by the interceptor's
+// pre-evaluation — the task keeps its working state, nothing is
+// admitted (no ingress row, no second delivery to the owner, the
+// fence stands) and the message is not written to the history —
+// whatever the first continuation's execution is still alive or not.
+// The store-level effect of the refusal is what this test pins.
 func TestContinuationRefusedNotAwaitingCaller(t *testing.T) {
 	store, path := newTestStore(t)
 	store2, err := a2astore.OpenFile(path, a2astore.Options{})
@@ -74,19 +69,28 @@ func TestContinuationRefusedNotAwaitingCaller(t *testing.T) {
 	deliveriesBefore := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries`)
 
 	// Case 1: the first continuation's execution is still alive on the
-	// first server. The SDK refuses the second continuation before the
-	// executor runs and the caller gets the stable busy answer.
+	// first server. The interceptor's pre-evaluation refuses the second
+	// continuation before any execution of the SDK: the answer is the
+	// stored task with the refusal, and nothing is written or parked.
 	rec := &pcRecorder{}
 	cBusy, err := Dial(ctxT(t), ts.URL, staticCredential{value: auth.token("caller-1")}, &http.Client{Timeout: 10 * time.Second, Transport: rec})
 	if err != nil {
 		t.Fatalf("dial the busy client: %v", err)
 	}
 	t.Cleanup(func() { cBusy.Close() })
-	if res, err := cBusy.Send(ctxT(t), second); err == nil || !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
-		t.Fatalf("second continuation with a live execution = %T, %v, want the internal error %q", res, err, taskBusyText)
+	res1, err := cBusy.Send(ctxT(t), second)
+	if err != nil {
+		t.Fatalf("second continuation with a live execution = %v, want the stored task with the refusal", err)
 	}
-	if wire := rec.wire(); wire.status != http.StatusInternalServerError {
-		t.Errorf("busy case status = %d (%s), want 500", wire.status, wire.body)
+	got1, ok := res1.(*a2a.Task)
+	if !ok {
+		t.Fatalf("second continuation = %T, want *a2a.Task", res1)
+	}
+	if wire := rec.wire(); wire.status != http.StatusOK {
+		t.Errorf("refusal case status = %d (%s), want 200 (the task answers, not an error)", wire.status, wire.body)
+	}
+	if got1.Metadata[a2acore.MetaRefusal] != a2acore.RefuseNotAwaitingCaller {
+		t.Errorf("task metadata = %v, want the refusal code %s", got1.Metadata, a2acore.RefuseNotAwaitingCaller)
 	}
 
 	// Case 2: no live execution of the second continuation — a new
@@ -119,9 +123,8 @@ func TestContinuationRefusedNotAwaitingCaller(t *testing.T) {
 	if got.Status.Message == nil || got.Status.Message.Parts[0].Text() != "refused: not_awaiting_caller" {
 		t.Errorf("status message = %+v, want the fixed refusal text", got.Status.Message)
 	}
-	// The refusal parks on the second server, as every refused
-	// continuation of a working task does.
-	waitLive(t, s2, 1)
+	// The refusal is answered in the interceptor and parks nothing.
+	waitLive(t, s2, 0)
 
 	// Nothing was written by the admission of either case: no ingress
 	// row and no second delivery to the owner, and the fence did not
