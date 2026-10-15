@@ -26,7 +26,7 @@ jobs:
       GOMAXPROCS: 2
       CGO_ENABLED: 1
       CHECK_REPO: ${{ github.repository }}
-      CHECK_SHA: ${{ github.sha }}
+      CHECK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Check out the exact commit
         shell: pwsh
@@ -51,12 +51,12 @@ jobs:
           if (-not $toolcache) { throw "Go is not on PATH and the runner toolcache is unset" }
           $exe = if ($IsWindows) { 'go.exe' } else { 'go' }
           $bin = Get-ChildItem (Join-Path $toolcache 'go') -Directory |
-            Where-Object { $_.Name -match '^1\.25\.\d+$' } |
+            Where-Object { $_.Name -match '^1\.(2[5-9]|[3-9]\d)\.\d+$' } |
             Sort-Object { [version]$_.Name } -Descending |
             ForEach-Object { Join-Path $_.FullName "$arch/bin" } |
             Where-Object { Test-Path (Join-Path $_ $exe) } |
             Select-Object -First 1
-          if (-not $bin) { throw "Go is not on PATH and a native Go 1.25 toolcache entry was not found" }
+          if (-not $bin) { throw "Go is not on PATH and a native Go 1.25 or newer toolcache entry was not found (GOTOOLCHAIN=auto then selects the go.mod toolchain)" }
           Add-Content -Path $env:GITHUB_PATH -Value $bin
       - name: Formatting and vet
         shell: pwsh

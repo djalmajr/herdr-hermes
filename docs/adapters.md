@@ -4,7 +4,7 @@ Nau is a universal messaging and registry core. The core is neutral: it owns the
 
 ## Core
 
-The neutral core is the `nau` CLI and its state directory: the durable outbox with its gapless `seq`, the current-state registry with the pre-dispatch check, the native notifications with their ledger, the dispatcher-side routing and the local job bookkeeping. The core has no boundary of its own; every boundary belongs to one adapter, so adding an adapter does not change the core.
+The neutral core is the `nau` CLI and its state directory: the durable outbox with its gapless `seq`, the current-state registry with the pre-dispatch check, the native notifications with their ledger, the dispatcher-side routing and the local job bookkeeping. The A2A agent (`nau a2a`, see [`a2a.md`](a2a.md)) is a protocol endpoint of the core: it records incoming messages durably in the registry database and reaches the owner through the notifications, so its notices travel over the Herdr boundary like every other notification. The core has no boundary of its own; every boundary belongs to one adapter, so adding an adapter does not change the core.
 
 ## Hermes
 

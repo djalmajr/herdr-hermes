@@ -117,6 +117,33 @@ func equalStringSlice(a, b []string) bool {
 	return true
 }
 
+// sameChildEnv reports whether a recorded child environment is exactly
+// want: the same entries, each exactly once, nothing added. Elsewhere
+// the order must match too; on Windows only the set is compared,
+// because the standard library sorts the environment block by name
+// before CreateProcess, as Windows requires.
+func sameChildEnv(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	seen := make(map[string]bool, len(got))
+	for _, kv := range got {
+		if seen[kv] {
+			return false
+		}
+		seen[kv] = true
+	}
+	if runtime.GOOS != "windows" {
+		return equalStringSlice(got, want)
+	}
+	for _, kv := range want {
+		if !seen[kv] {
+			return false
+		}
+	}
+	return true
+}
+
 // runRouteEnv runs Run with a hermetic env whose child environment is
 // exactly childEnv, like the notify flow tests do.
 func runRouteEnv(t *testing.T, dir string, childEnv []string, args ...string) (string, string, int) {
@@ -733,7 +760,7 @@ func TestRouteNoSecretPropagation(t *testing.T) {
 			}
 			env = kept
 		}
-		if !equalStringSlice(env, fakeChildEnv) {
+		if !sameChildEnv(env, fakeChildEnv) {
 			t.Errorf("call %d env = %v, want exactly %v", i, env, fakeChildEnv)
 		}
 		for _, a := range c.Argv {

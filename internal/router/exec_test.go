@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -109,8 +110,17 @@ func TestExecChildEnvExact(t *testing.T) {
 		}
 		env = kept
 	}
-	if len(env) != 2 || env[0] != environ[0] || env[1] != environ[1] {
-		t.Errorf("child env = %v, want exactly %v", env, environ)
+	// Elsewhere the order must match; on Windows the standard library
+	// sorts the environment block by name before CreateProcess, as
+	// Windows requires, so only the exact set is compared there. Either
+	// way every entry appears exactly once and nothing is added.
+	want := environ
+	if runtime.GOOS == "windows" {
+		env = slices.Sorted(slices.Values(env))
+		want = slices.Sorted(slices.Values(environ))
+	}
+	if !slices.Equal(env, want) {
+		t.Errorf("child env = %v, want exactly %v", calls[0].Env, environ)
 	}
 }
 

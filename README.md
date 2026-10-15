@@ -21,7 +21,7 @@ Status: under development. Nothing here is stable yet.
 
 ## Install
 
-With Go 1.25 or newer, from a checkout of the module `github.com/djalmajr/nau`:
+With Go 1.26 or newer, from a checkout of the module `github.com/djalmajr/nau`:
 
 ```text
 go build -o <dir>/nau ./cmd/nau
@@ -50,6 +50,7 @@ The binary must be on your `PATH`; the optional plugin also needs it on the Herd
 Every command prints exactly one JSON line on stdout and its diagnostics on stderr, with these exceptions: `help` and `nau` (or the deprecated `herdr-hermes`) run with no arguments print the plain-text usage on stdout and exit 0; `outbox` prints one JSON line per record and then the trailer line; and the forwarded `job` subcommands copy the stdout of `herdr-soho job` unchanged, which for `job events` is JSON lines and a trailer line. On bad usage the usage text goes to stderr and stdout still carries one JSON error line. The exit codes are `0`, `2`, `3`, `4`, `40`, `41`, `42`, `43`, `44` (`44` is the `jobs check` pre-dispatch refusal: duplicate work or a hold).
 
 - `job <sub> [args]` — forward a dispatcher-facing job subcommand to `herdr-soho` (`start`, `status`, `wait`, `events`, `collect`, `amend`, `send`, `ack`, `cancel`, `close`, `list`), applying the contract input limits first.
+- `a2a <sub>` — the A2A agent of this machine (see [`docs/a2a.md`](docs/a2a.md)): `serve` runs an A2A v1.0 agent on a loopback address that accepts messages about a project as data to evaluate and queues identifiers-only notices for the project owner, `card`, `send`, `get` and `cancel` are its client, and `inbox`, `show` and `reply` let the owner list, read and decide on the waiting tasks locally.
 - `wake` — read one job event on stdin, record it in the outbox and attempt one push (configured as the `herdr-soho` wake hook).
 - `sync [--job <id>] [--push-only]` — pull new job events for the tracked jobs into the outbox and push the pending records.
 - `push` — push the pending outbox records to the dispatcher.
