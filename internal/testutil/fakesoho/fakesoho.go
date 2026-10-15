@@ -6,8 +6,10 @@
 package fakesoho
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,7 +34,27 @@ const (
 	// into the pipe-holder role: it keeps the inherited stdout and
 	// stderr open for the millisecond count in the next argument.
 	pipeHolderMarker = "-fakesoho-pipe-holder"
+	// warmMarker is the argv marker for Install's one-off warm run of the
+	// installed copy: it makes the copy exit 0 at once, before any other
+	// role is detected, so the slow first run of a fresh executable
+	// happens outside the tests' measurements.
+	warmMarker = "-fakesoho-warm"
+	// lockHolderMarker is the argv marker that routes a re-exec'd copy of
+	// the test binary into the lock-holder role: it takes the lock on the
+	// next argument and holds it until it is killed, so a lock test can
+	// exercise a process that dies while holding the lock.
+	lockHolderMarker = "-fakesoho-lock-holder"
 )
+
+// lockWait bounds how long a contended lock waits for the lock to be
+// free; a lock test may shorten it and restore it.
+var lockWait = 5 * time.Second
+
+// lockHolderUnlock keeps the lock-holder role's unlock closure (and the
+// file behind it) reachable for the life of the re-exec'd process, so
+// the file's finalizer cannot close the descriptor and drop the lock;
+// the system releases the lock with the process.
+var lockHolderUnlock func()
 
 // Rule is one scripted response. Argv matches the process argv (the
 // arguments after the executable), exactly or as a prefix; Call, when
@@ -124,6 +146,13 @@ func Install(t testing.TB, dir string, rules ...Rule) (exePath string) {
 	if err := os.WriteFile(filepath.Join(dir, scriptName), b, 0o600); err != nil {
 		t.Fatalf("fakesoho: write script: %v", err)
 	}
+	// Warm the installed copy once before returning its path: the first
+	// run of a fresh executable can be slow (on a Windows node the
+	// system scan of a new executable takes tens of seconds), and that
+	// cost must not land inside a test's deadline measurement. The warm
+	// run exits 0 without reading the script, stdin or the call log, so
+	// it leaves no trace in the log.
+	warmRun(t, exePath)
 	if hold := maxHoldPipeMs(rules); hold > 0 {
 		// A pipe holder runs a copy of the installed executable for up to
 		// hold ms after the fake exits, and Windows refuses to delete a
@@ -144,6 +173,30 @@ func maxHoldPipeMs(rules []Rule) int {
 		}
 	}
 	return hold
+}
+
+// warmRun runs the installed copy once with the warm marker as its only
+// argument, bounded at 120s with a 1s kill grace; it fails the test when
+// the copy does not exit 0 in time, with the exit code and the combined
+// output. The copy gets no stdin and keeps the test process' environment.
+func warmRun(t testing.TB, exePath string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, exePath, warmMarker)
+	cmd.WaitDelay = time.Second
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	code := -1
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code = exitErr.ExitCode()
+	}
+	if err != nil {
+		t.Fatalf("fakesoho: warm run %s: %v, exit %d, output %q", exePath, err, code, out.String())
+	}
 }
 
 // removeAllWithin removes dir, retrying while a file in it is still in use,
@@ -199,10 +252,43 @@ func ReadCalls(dir string) ([]Call, error) {
 // returns at once. Call it first from the package TestMain; it exits the
 // re-executed process after dispatching the rule.
 func Main() {
+	// Warm run: Install runs the installed copy once with this marker so
+	// the slow first run of a fresh executable happens outside the tests'
+	// measurements. Checked first, before the pipe-holder marker and the
+	// fake-role detection: the warm run exits 0 without reading the
+	// script, stdin or the call log.
+	if len(os.Args) == 2 && os.Args[1] == warmMarker {
+		os.Exit(0)
+	}
+	// Lock-holder role: a copy of this test binary re-executed by a lock
+	// test; it takes the lock on the path in argv, prints "locked" and
+	// holds it until it is killed, so a test can exercise the lock a dead
+	// process leaves behind (or does not). Checked before the pipe-holder
+	// marker.
+	if len(os.Args) == 3 && os.Args[1] == lockHolderMarker {
+		// The closure is parked in the package variable so the file (and
+		// its lock) stays open until the process is killed; a discarded
+		// closure would let the file's finalizer close the descriptor and
+		// drop the lock at once.
+		var err error
+		if lockHolderUnlock, err = lock(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "fakesoho: %v\n", err)
+			os.Exit(126)
+		}
+		fmt.Fprintln(os.Stdout, "locked")
+		// Hold the lock until the test kills this process; the system
+		// releases it with the process. The sleeps keep a timer pending,
+		// so the runtime's deadlock check (a main goroutine blocked
+		// without a timer is a fatal "all goroutines are asleep" error
+		// and would kill the holder, dropping the lock) does not fire.
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
 	// Pipe-holder role: a copy of this binary started by a rule's
 	// HoldPipeMs; it keeps the inherited stdout and stderr open for the
-	// millisecond count in argv and exits. Checked first, before the
-	// fake-role detection.
+	// millisecond count in argv and exits. Checked before the fake-role
+	// detection.
 	if len(os.Args) == 3 && os.Args[1] == pipeHolderMarker {
 		if ms, err := strconv.Atoi(os.Args[2]); err == nil && ms > 0 {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
