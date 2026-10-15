@@ -262,13 +262,21 @@ func TestParkedContinuationInvisibleIsTaskNotFound(t *testing.T) {
 	}
 
 	// Restoring the grant makes the original task visible again; the
-	// owner then gets the stable busy answer for the parked task.
+	// owner then gets the stored task with the refusal for the working
+	// parked task (the pre-evaluation answers it before any execution).
 	f.pcRestore()
 	if got, err := f.cA.Get(ctxT(t), secretID); err != nil || got.ID != f.secret.ID {
 		t.Fatalf("get after restore = %+v, %v", got, err)
 	}
-	if _, err := pcContinue(t, f.cA, f.recA, secretID, f.secret.ContextID, "pc-restored"); err == nil || err.Error() != taskBusyText {
-		t.Errorf("continuation after restore err = %v, want %q", err, taskBusyText)
+	res, err := pcContinue(t, f.cA, f.recA, secretID, f.secret.ContextID, "pc-restored")
+	if err != nil {
+		t.Errorf("continuation after restore err = %v, want the stored task with the refusal", err)
+	}
+	if res.status != http.StatusOK {
+		t.Errorf("continuation after restore status = %d (%s), want 200", res.status, res.body)
+	}
+	if !strings.Contains(res.body, a2acore.RefuseNotAwaitingCaller) {
+		t.Errorf("continuation after restore body %s lacks the refusal code", res.body)
 	}
 	waitLive(t, f.e.srv, 1)
 }
@@ -296,9 +304,9 @@ func TestParkedContinuationStoreFailureIsFixedServerError(t *testing.T) {
 }
 
 // TestParkedContinuationVisibleIsBusy: the controls on the same kind
-// of fixture: a still-granted parked task gets the stable busy answer
-// (status and reason of the SDK refusal, the fixed busy message) and a
-// still-granted task is readable.
+// of fixture: a still-granted working parked task is answered by the
+// pre-evaluation with the stored task and the refusal (the task is not
+// awaiting the caller) and a still-granted task is readable.
 func TestParkedContinuationVisibleIsBusy(t *testing.T) {
 	f := pcSetup(t)
 	public := sendTask(t, f.cA, idfxSend("org/public", "s-2", "m-2"))
@@ -309,17 +317,14 @@ func TestParkedContinuationVisibleIsBusy(t *testing.T) {
 		t.Fatalf("get of the still-granted task = %+v, %v", got, err)
 	}
 	got, err := pcContinue(t, f.cA, f.recA, string(public.ID), public.ContextID, "pc-public")
-	if err == nil || !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
-		t.Fatalf("visible parked continuation err = %v, want the internal error %q", err, taskBusyText)
+	if err != nil {
+		t.Fatalf("visible parked continuation err = %v, want the stored task with the refusal", err)
 	}
-	if got.status != http.StatusInternalServerError {
-		t.Errorf("visible parked continuation status = %d (%s), want 500", got.status, got.body)
+	if got.status != http.StatusOK {
+		t.Errorf("visible parked continuation status = %d (%s), want 200", got.status, got.body)
 	}
-	if b := strings.TrimSpace(pcNorm(got.body)); b != ctBusyBody {
-		t.Errorf("visible parked continuation body = %s, want %s", b, ctBusyBody)
-	}
-	if errors.Is(err, a2a.ErrTaskNotFound) {
-		t.Errorf("visible parked continuation is task not found: %v", err)
+	if !strings.Contains(got.body, a2acore.RefuseNotAwaitingCaller) {
+		t.Errorf("visible parked continuation body %s lacks the refusal code", got.body)
 	}
 	waitLive(t, f.e.srv, 2)
 }

@@ -431,10 +431,11 @@ func TestRefusedContinuationOfWorkingTaskParks(t *testing.T) {
 	ts2 := serveServer(t, s2)
 	c2 := dialClient(t, ts2.URL, auth, "caller-1")
 
-	// A continuation to the WORKING task: refused not_awaiting_caller
-	// (the awaiting-caller gate stands before the fence), but the task
-	// stays working, the refusal code is in the status-event metadata
-	// and the execution parks.
+	// A continuation to the WORKING task is refused by the
+	// interceptor's pre-evaluation (the awaiting-caller gate stands
+	// before the fence): the answer is the stored task with the refusal
+	// in the metadata and a fixed status message, and nothing is
+	// written or parked.
 	res, err := c2.Send(ctxT(t), SendInput{
 		TaskID: string(task.ID), ContextID: task.ContextID,
 		Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-2", Text: "stale",
@@ -455,8 +456,8 @@ func TestRefusedContinuationOfWorkingTaskParks(t *testing.T) {
 	if got.Status.Message == nil || got.Status.Message.Parts[0].Text() != "refused: not_awaiting_caller" {
 		t.Errorf("status message = %+v, want the refusal text", got.Status.Message)
 	}
-	if s2.LiveExecutions() != 1 {
-		t.Errorf("live executions = %d, want 1 (the refused continuation parks)", s2.LiveExecutions())
+	if s2.LiveExecutions() != 0 {
+		t.Errorf("live executions = %d, want 0 (the early refusal parks nothing)", s2.LiveExecutions())
 	}
 
 	// A later owner decision is applied live.
