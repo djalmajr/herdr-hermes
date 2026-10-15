@@ -59,11 +59,18 @@ func (o ownerRefConfigs) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.P
 // nothing durable: the config stays, the task is not failed, and a
 // later event is sent again once the routing grants the project again.
 type pushGate struct {
-	inner      push.Sender
-	configs    *a2astore.PushConfigStore
-	routes     a2acore.RouteSource
-	authz      a2acore.Authorizer
-	logger     *slog.Logger
+	inner   push.Sender
+	configs *a2astore.PushConfigStore
+	routes  a2acore.RouteSource
+	authz   a2acore.Authorizer
+	logger  *slog.Logger
+	// sendLogger is the logger attached to the context before the
+	// send is delegated to the inner sender: its handler wraps the
+	// server logger's handler and replaces the value of every error
+	// attribute by the fixed classification of the error, because the
+	// sender's error text carries the webhook URL, or parts of it, and
+	// the URL may carry a secret.
+	sendLogger *slog.Logger
 	suppressed atomic.Int64
 }
 
@@ -75,7 +82,14 @@ func newPushGate(inner push.Sender, configs *a2astore.PushConfigStore, routes a2
 	if logger == nil {
 		logger = slog.New(discardHandler{})
 	}
-	return &pushGate{inner: inner, configs: configs, routes: routes, authz: authz, logger: logger}
+	return &pushGate{
+		inner:      inner,
+		configs:    configs,
+		routes:     routes,
+		authz:      authz,
+		logger:     logger,
+		sendLogger: newPushSafeLogger(logger),
+	}
 }
 
 // SendPush implements push.Sender: it passes the send to the wrapped
@@ -125,13 +139,16 @@ func (g *pushGate) SendPush(ctx context.Context, config *a2a.PushConfig, event a
 		g.authz.Authorize(subject, a2acore.ActionPush, owner.Project) != nil {
 		return g.suppress(ctx, string(config.TaskID), pushReasonNotGranted)
 	}
-	// The SDK sender logs through the logger attached to the context
-	// (slog.Default() without one): attach the server logger so the
-	// push log of the live and the out-of-band sends both reach the
-	// Config.Logger and never the process default (which would write
-	// the send error, with the URL of the webhook, to stderr in plain
-	// text).
-	ctx = log.AttachLogger(ctx, g.logger)
+	// The SDK sender logs the send error through the logger attached
+	// to the context (slog.Default() without one): attach the safe
+	// send logger — the server logger with the error attributes
+	// replaced by their fixed classification, because the error text
+	// carries the webhook URL, or parts of it, and the URL may carry a
+	// secret — so the push log of the live and the out-of-band sends
+	// both reach the Config.Logger and never the process default
+	// (which would write the send error, with the URL of the webhook,
+	// to stderr in plain text).
+	ctx = log.AttachLogger(ctx, g.sendLogger)
 	return g.inner.SendPush(ctx, config, event)
 }
 

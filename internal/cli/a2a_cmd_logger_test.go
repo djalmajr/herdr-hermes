@@ -8,14 +8,21 @@ package cli
 // without a recorded owner reference (saved without a stamp, like a
 // legacy row) and a pending answer decision: the serve's decision loop
 // applies the decision out of band and the gate suppresses the final
-// push with no_owner_reference.
+// push with no_owner_reference. The round-3 cases: a failed push send
+// is logged on stderr with only the fixed classification of the
+// error — never the error text, which carries the webhook URL or
+// parts of it — for the SSRF guard's refusal (out of band) and for
+// the invalid URL forms (out of band and live).
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,6 +59,17 @@ const (
 	a2a337bDecision = "d-337b"
 	a2a337bURL      = "http://127.0.0.1:9/hook/secret-canary-337"
 	a2a337bAnswer   = "the dja337b recorded answer"
+)
+
+// The DJA-337 round-3 invalid-URL cases: the store accepts any
+// non-empty URL, and the SDK sender's error of the failed send carries
+// the URL or parts of it — the canary after the quote in the malformed
+// form, the whole path in the schemeless form. Neither may reach the
+// output; the failure is logged with the fixed classification only.
+const (
+	a2a337cMalformedURL = `http://127.0.0.1:9/"/secret-canary-337%zz`
+	a2a337cSchemeless   = "127.0.0.1:9/hook/secret-canary-337"
+	a2a337cCanary       = "secret-canary-337"
 )
 
 // a2a337Fixture seeds the serve database with the DJA-337 suppression
@@ -104,7 +122,70 @@ func a2a337Fixture(t *testing.T, cfgDir string, sec a2acore.SecretProvider) stri
 // test-owned context, the fake sender, the shared secret provider and
 // the fast loop intervals, and returns the output buffers once the
 // serving line is printed.
-func startA2A337Serve(t *testing.T, cfgDir string, sec a2acore.SecretProvider) (exitCh chan int, cancel func(), out, errb *testLockedBuffer) {
+// a2a337WakeErr is the test-owned stderr writer of the DJA-337 serve
+// tests: it forwards every write to the shared locked buffer and
+// wakes the wait on every write (the plSender.waitFor pattern of
+// internal/a2aserver), so a wait on a serve-written result needs no
+// sleep. The write count and the wake channel move under one lock, so
+// a write before or after the waiter's grab is never lost: a write
+// that finished before the grab shows up as a fresh count, and a
+// write after the grab closes the channel the waiter blocks on.
+type a2a337WakeErr struct {
+	inner *testLockedBuffer
+	mu    sync.Mutex
+	wake  chan struct{}
+	// writes is the write count so far; lastWoken is the count the
+	// wait last consumed.
+	writes, lastWoken int
+}
+
+// Write implements io.Writer.
+func (b *a2a337WakeErr) Write(p []byte) (int, error) {
+	n, err := b.inner.Write(p)
+	b.mu.Lock()
+	b.writes++
+	if b.wake != nil {
+		close(b.wake)
+	}
+	b.wake = make(chan struct{})
+	b.mu.Unlock()
+	return n, err
+}
+
+// waitWoken blocks until a write the wait has not consumed yet
+// happened or the deadline passes: the wait rechecks its condition
+// after the wake, and the deadline bounds it.
+func (b *a2a337WakeErr) waitWoken(t *testing.T, deadline time.Time) {
+	t.Helper()
+	timeout := time.Until(deadline)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		b.mu.Lock()
+		if b.wake == nil {
+			b.wake = make(chan struct{})
+		}
+		fresh, wake := b.writes > b.lastWoken, b.wake
+		b.mu.Unlock()
+		if fresh {
+			b.mu.Lock()
+			b.lastWoken = b.writes
+			b.mu.Unlock()
+			return
+		}
+		select {
+		case <-wake:
+			b.mu.Lock()
+			b.lastWoken = b.writes
+			b.mu.Unlock()
+			return
+		case <-timer.C:
+			t.Fatalf("no stderr write within %v (buffer %q)", timeout, b.inner.snapshot())
+		}
+	}
+}
+
+func startA2A337Serve(t *testing.T, cfgDir string, sec a2acore.SecretProvider) (exitCh chan int, cancel func(), out, errb *testLockedBuffer, wake *a2a337WakeErr) {
 	t.Helper()
 	out = &testLockedBuffer{}
 	errb = &testLockedBuffer{}
@@ -129,7 +210,20 @@ func startA2A337Serve(t *testing.T, cfgDir string, sec a2acore.SecretProvider) (
 		c()
 	})
 	exitCh = make(chan int, 1)
-	env := a2aTestEnv(t, cfgDir, out, errb)
+	// The serve's stderr is the test-owned writer that wakes the wait
+	// on every write (no sleep to synchronize the test with the
+	// serve's logs); it forwards to the shared locked buffer.
+	wake = &a2a337WakeErr{inner: errb}
+	env := Env{
+		Stdin:     strings.NewReader(""),
+		Stdout:    out,
+		Stderr:    wake,
+		Getenv:    getenvFor(false),
+		Environ:   func() []string { return fakeChildEnv },
+		ConfigDir: cfgDir,
+		Now:       func() time.Time { return serveFixedNow },
+		Sleep:     sleepCtx,
+	}
 	go func() {
 		exitCh <- cmdA2A([]string{"serve", "--listen", "127.0.0.1:0"}, env)
 	}()
@@ -145,7 +239,7 @@ func startA2A337Serve(t *testing.T, cfgDir string, sec a2acore.SecretProvider) (
 	if start.Status != "serving" || start.Listen == "" || start.DB == "" {
 		t.Fatalf("serving line = %q, want status serving with a listen address and a db path", line)
 	}
-	return exitCh, c, out, errb
+	return exitCh, c, out, errb, wake
 }
 
 // a2a337bFixture seeds the serve database with the DJA-337 round-2
@@ -202,7 +296,7 @@ func TestA2AServeMasksPushURLInStderr(t *testing.T) {
 	cfgDir := t.TempDir()
 	a2aRegisterNotify(t, cfgDir)
 	a2a337bFixture(t, cfgDir)
-	exitCh, cancel, out, errb := startA2A337Serve(t, cfgDir, nil)
+	exitCh, cancel, out, errb, _ := startA2A337Serve(t, cfgDir, nil)
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -221,11 +315,13 @@ func TestA2AServeMasksPushURLInStderr(t *testing.T) {
 	if rec["msg"] != "push sending failed" {
 		t.Fatalf("record = %v, want msg %q", rec, "push sending failed")
 	}
-	// The URL is masked and the canary of the hook path never appears.
-	stderr := errb.snapshot()
-	if !strings.Contains(stderr, "<url>") {
-		t.Fatalf("stderr %q lacks the masked <url>", stderr)
+	// The gate's push logger classifies the SSRF guard's refusal (a
+	// transport error): the fixed class, never the error text, which
+	// carries the URL — the canary of the hook path never appears.
+	if rec["error"] != "push endpoint unreachable" {
+		t.Fatalf("record error = %v, want the fixed classification %q", rec["error"], "push endpoint unreachable")
 	}
+	stderr := errb.snapshot()
 	for _, banned := range []string{a2a337bURL, "secret-canary-337", a2a337bAnswer} {
 		if strings.Contains(stderr, banned) {
 			t.Fatalf("stderr carries %q (%q)", banned, stderr)
@@ -258,7 +354,7 @@ func TestA2AServeLogsSuppressedPushOnStderr(t *testing.T) {
 	a2aRegisterNotify(t, cfgDir)
 	sec := a2acore.NewMemorySecrets()
 	db := a2a337Fixture(t, cfgDir, sec)
-	exitCh, cancel, out, errb := startA2A337Serve(t, cfgDir, sec)
+	exitCh, cancel, out, errb, wake := startA2A337Serve(t, cfgDir, sec)
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -311,7 +407,11 @@ func TestA2AServeLogsSuppressedPushOnStderr(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("decision state = %q and task state = %q, want applied and completed", dstate, tstate)
 		}
-		time.Sleep(10 * time.Millisecond)
+		// The serve writes the suppression record to stderr after the
+		// apply commit, so the stderr writer wakes this wait on the
+		// write that carries the committed state: no sleep, the
+		// deadline bounds the wait.
+		wake.waitWoken(t, deadline)
 	}
 	// Exactly one stderr line (the JSON record, no text lines) and
 	// none of the fixture values in it.
@@ -331,5 +431,170 @@ func TestA2AServeLogsSuppressedPushOnStderr(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `"status":"serving"`) {
 		t.Fatalf("stdout = %q, want the serving line", stdout)
+	}
+}
+
+// a2a337CheckFailedPushRecord asserts the stderr of one failed push
+// send: exactly one JSON record — the sender's message at ERROR level
+// with the fixed classification of the failure — and none of the
+// banned values (the URL or the canary) anywhere in the stderr.
+func a2a337CheckFailedPushRecord(t *testing.T, errb *testLockedBuffer, wantClass string, banned ...string) {
+	t.Helper()
+	line := errb.nextLine(t, 10*time.Second)
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		t.Fatalf("first stderr line %q is not JSON: %v", line, err)
+	}
+	if rec["msg"] != "push sending failed" || rec["level"] != "ERROR" {
+		t.Fatalf("record = %v, want the ERROR record msg %q", rec, "push sending failed")
+	}
+	if rec["error"] != wantClass {
+		t.Fatalf("record error = %v, want the fixed classification %q", rec["error"], wantClass)
+	}
+	stderr := errb.snapshot()
+	for _, banned := range banned {
+		if strings.Contains(stderr, banned) {
+			t.Fatalf("stderr carries %q (the error text must not reach the log): %s", banned, stderr)
+		}
+	}
+	if n := strings.Count(stderr, "\n"); n != 1 {
+		t.Fatalf("stderr has %d line(s), want exactly the one JSON record (%q)", n, stderr)
+	}
+}
+
+// a2a337LiveSend posts one live send with the push config URL to the
+// served message:send endpoint and returns the HTTP status: the SDK
+// saves the config before the run and the working push passes the
+// gate (the local operator's configs are always sent).
+func a2a337LiveSend(t *testing.T, listen, webhook string) int {
+	t.Helper()
+	req := &a2a.SendMessageRequest{
+		Message: &a2a.Message{
+			ID:    "m-337c",
+			Role:  a2a.MessageRoleUser,
+			Parts: a2a.ContentParts{a2a.NewTextPart(a2a337bAnswer)},
+			Metadata: map[string]any{
+				a2acore.MetaProject: "org/example",
+				a2acore.MetaJob:     "job-337c",
+				a2acore.MetaSession: "s-337c",
+				a2acore.MetaEpoch:   float64(1),
+				a2acore.MetaSeq:     float64(1),
+			},
+		},
+		Config: &a2a.SendMessageConfig{
+			ReturnImmediately: true,
+			PushConfig:        &a2a.PushConfig{URL: webhook},
+		},
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal send request: %v", err)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post("http://"+listen+"/message:send", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("message:send: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
+}
+
+// TestA2AServeInvalidPushURLOutOfBand proves the round-3 out-of-band
+// path: the push config URL is invalid (the malformed form with the
+// canary after the quote, and the schemeless form with the canary in
+// the path), so the SDK sender fails to create the request; the serve
+// applies the pending decision out of band and the failure is logged
+// on stderr with only the fixed classification invalid push URL —
+// never the URL or the canary.
+func TestA2AServeInvalidPushURLOutOfBand(t *testing.T) {
+	for name, webhook := range map[string]string{
+		"malformed":  a2a337cMalformedURL,
+		"schemeless": a2a337cSchemeless,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfgDir := t.TempDir()
+			a2aRegisterNotify(t, cfgDir)
+			db := a2a337bFixture(t, cfgDir)
+			// Re-save the same config with the invalid URL: the store
+			// accepts any non-empty URL.
+			s, err := a2astore.OpenFile(db, a2astore.Options{})
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			if _, err := s.PushConfigs().Save(context.Background(), a2a337bTask, &a2a.PushConfig{
+				ID:  a2a337bConfig,
+				URL: webhook,
+			}); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			exitCh, cancel, out, errb, _ := startA2A337Serve(t, cfgDir, nil)
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-exitCh:
+				case <-time.After(15 * time.Second):
+				}
+			})
+			// The decision loop applies the decision out of band and
+			// the final push fails at the request creation.
+			a2a337CheckFailedPushRecord(t, errb, "invalid push URL", webhook, a2a337cCanary)
+			stdout := out.snapshot()
+			if n := strings.Count(stdout, "\n"); n != 1 {
+				t.Fatalf("stdout has %d line(s), want exactly the serving line (%q)", n, stdout)
+			}
+			if !strings.Contains(stdout, `"status":"serving"`) {
+				t.Fatalf("stdout = %q, want the serving line", stdout)
+			}
+		})
+	}
+}
+
+// TestA2AServeInvalidPushURLLive proves the round-3 live path: a live
+// send carries a push config with the invalid URL (the malformed form
+// with the canary after the quote, and the schemeless form with the
+// canary in the path); the SDK saves the config before the run, the
+// working push fails at the request creation and is logged on stderr
+// with only the fixed classification invalid push URL — never the URL
+// or the canary — while the send still answers HTTP 200 (a push
+// failure does not fail the send).
+func TestA2AServeInvalidPushURLLive(t *testing.T) {
+	for name, webhook := range map[string]string{
+		"malformed":  a2a337cMalformedURL,
+		"schemeless": a2a337cSchemeless,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfgDir := t.TempDir()
+			a2aRegisterNotify(t, cfgDir)
+			exitCh, cancel, out, errb, _ := startA2A337Serve(t, cfgDir, nil)
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-exitCh:
+				case <-time.After(15 * time.Second):
+				}
+			})
+			var serving struct {
+				Listen string `json:"listen"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimSpace(out.snapshot())), &serving); err != nil {
+				t.Fatalf("serving line %q is not JSON: %v", out.snapshot(), err)
+			}
+			// The live send with the invalid push config URL: the
+			// working push fails at the request creation.
+			if status := a2a337LiveSend(t, serving.Listen, webhook); status != http.StatusOK {
+				t.Fatalf("message:send answered HTTP %d, want 200 (a push failure does not fail the send)", status)
+			}
+			a2a337CheckFailedPushRecord(t, errb, "invalid push URL", webhook, a2a337cCanary)
+			stdout := out.snapshot()
+			if n := strings.Count(stdout, "\n"); n != 1 {
+				t.Fatalf("stdout has %d line(s), want exactly the serving line (%q)", n, stdout)
+			}
+			if !strings.Contains(stdout, `"status":"serving"`) {
+				t.Fatalf("stdout = %q, want the serving line", stdout)
+			}
+		})
 	}
 }
