@@ -125,3 +125,22 @@ func TestLockWhileHolderAlive(t *testing.T) {
 	}
 	unlock()
 }
+
+// TestLockReleaseThenReacquire: an explicit unlock by a live process
+// releases the lock at once, so the same process takes it again within
+// the short bound. A lock released only when its process dies would
+// time out here, which the two process tests above cannot see.
+func TestLockReleaseThenReacquire(t *testing.T) {
+	oldLockWait := lockWait
+	lockWait = 500 * time.Millisecond
+	defer func() { lockWait = oldLockWait }()
+	path := filepath.Join(t.TempDir(), "lock")
+	for i := 1; i <= 3; i++ {
+		start := time.Now()
+		unlock, err := lock(path)
+		if err != nil {
+			t.Fatalf("lock #%d after an unlock: %v (after %s)", i, err, time.Since(start))
+		}
+		unlock()
+	}
+}
