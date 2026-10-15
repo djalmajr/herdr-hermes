@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
@@ -45,18 +46,18 @@ func (s *Store) PushConfigs() *PushConfigStore {
 //
 // The order protects the committed config: the new handles are put
 // first, outside the transaction (when the credentials Put fails the
-// token handle just put is deleted); then one transaction reads the
-// previous row's handles and upserts the row; when the transaction or
-// its commit fails, only the handles this call just put are deleted
-// (a failed compensation delete is joined to the returned error), so the
-// previous row and its handles stay intact and usable. Only after the
-// commit are the previous row's handles deleted from the provider. A
-// failure of that last cleanup is an error, not a success (the config
-// is stored, the error says so and keeps the cause, and the obsolete
-// handle stays in the provider): the provider has no transactional
-// delete and the store keeps no durable list of obsolete handles, so
-// that window is the declared limit of a provider whose Delete can fail
-// (the native in-memory provider never fails it).
+// token handle just put is compensated); then one transaction reads the
+// previous row's handles, upserts the row and schedules the obsolete
+// handles in the cleanup ledger. When the transaction or its commit
+// fails, only the handles this call just put are compensated (a failed
+// compensation delete schedules them too, so the next drain retries
+// them), so the previous row and its handles stay intact and usable.
+// Only after the commit are the obsolete handles deleted from the
+// provider, through the cleanup drain restricted to them. A failure of
+// that drain is an error, not a success (the config is stored, the error
+// says so and keeps the cause wrapped in ErrSecretCleanupPending): the
+// failed handles stay in the ledger and in the provider and are retried
+// by the next drain.
 func (p *PushConfigStore) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.PushConfig) (*a2a.PushConfig, error) {
 	if cfg == nil || cfg.URL == "" {
 		return nil, a2a.ErrInvalidParams
@@ -81,14 +82,19 @@ func (p *PushConfigStore) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.
 	if cfg.Auth != nil && cfg.Auth.Credentials != "" {
 		handle, err := p.s.secrets.Put(ctx, cfg.Auth.Credentials)
 		if err != nil {
-			return nil, joinCleanup(err, p.deleteHandles(ctx, tokenRef))
+			// The token handle just put is orphaned: the compensation
+			// deletes it and, when the delete fails, schedules it in
+			// the cleanup ledger for the next drain.
+			return nil, p.compensateCreate(ctx, err, tokenRef)
 		}
 		credsRef = handle
 		scheme = cfg.Auth.Scheme
 	}
 	// 2. The previous handles and the upsert, in one transaction.
 	var oldToken, oldCreds sql.NullString
+	var obsolete []string
 	err := p.s.tx(ctx, func(tx *sql.Tx) error {
+		obsolete = nil
 		err := tx.QueryRow(`SELECT token_ref, credentials_ref FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`,
 			string(taskID), id).Scan(&oldToken, &oldCreds)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -100,20 +106,25 @@ func (p *PushConfigStore) Save(ctx context.Context, taskID a2a.TaskID, cfg *a2a.
 			ON CONFLICT(task_id, config_id) DO UPDATE SET url = excluded.url, auth_scheme = excluded.auth_scheme,
 			token_ref = excluded.token_ref, credentials_ref = excluded.credentials_ref`,
 			string(taskID), id, cfg.URL, nullStr(scheme), nullStr(tokenRef), nullStr(credsRef), nowTS)
-		return err
+		if err != nil {
+			return err
+		}
+		for _, old := range []sql.NullString{oldToken, oldCreds} {
+			if old.Valid && old.String != tokenRef && old.String != credsRef {
+				obsolete = append(obsolete, old.String)
+			}
+		}
+		// The obsolete handles enter the cleanup ledger in the same
+		// transaction that replaces the row.
+		return scheduleHandleCleanup(tx, p.s.now(), obsolete...)
 	})
 	if err != nil {
 		// 3. Nothing committed: only the handles of this call go away.
-		return nil, joinCleanup(err, p.deleteHandles(ctx, tokenRef, credsRef))
+		return nil, p.compensateCreate(ctx, err, tokenRef, credsRef)
 	}
-	// 4. Committed: the previous handles are obsolete.
-	var obsolete []string
-	for _, old := range []sql.NullString{oldToken, oldCreds} {
-		if old.Valid && old.String != tokenRef && old.String != credsRef {
-			obsolete = append(obsolete, old.String)
-		}
-	}
-	if derr := p.deleteHandles(ctx, obsolete...); derr != nil {
+	// 4. Committed: the previous handles are obsolete; the drain
+	// restricted to them deletes them from the provider now.
+	if _, _, derr := p.s.drainRestricted(ctx, p.s.now(), secretCleanupBatch, obsolete...); derr != nil {
 		return nil, fmt.Errorf("a2astore: push config stored; deleting an obsolete secret handle failed: %w", derr)
 	}
 	out := &a2a.PushConfig{Tenant: cfg.Tenant, TaskID: taskID, ID: id, URL: cfg.URL, Token: cfg.Token}
@@ -141,13 +152,25 @@ func (p *PushConfigStore) deleteHandles(ctx context.Context, handles ...string) 
 	return errors.Join(errs...)
 }
 
-// joinCleanup is err, joined with the failure of its compensation when
-// there is one.
-func joinCleanup(err, cleanup error) error {
-	if cleanup == nil {
-		return err
+// compensateCreate is the compensation of the creation paths: a Put
+// whose row never commits leaves the handles this call just put
+// orphaned. It deletes them and, when a delete fails, schedules them in
+// the cleanup ledger in a small transaction of their own, so the next
+// drain retries them. It returns the original error, joined with the
+// compensation failures when there are any, and a canceled context does
+// not stop it, like the other post-outcome cleanups.
+func (p *PushConfigStore) compensateCreate(ctx context.Context, original error, handles ...string) error {
+	delErr := p.deleteHandles(ctx, handles...)
+	if delErr == nil {
+		return original
 	}
-	return errors.Join(err, cleanup)
+	serr := p.s.tx(context.WithoutCancel(ctx), func(tx *sql.Tx) error {
+		return scheduleHandleCleanup(tx, p.s.now(), handles...)
+	})
+	if serr != nil {
+		return errors.Join(original, delErr, serr)
+	}
+	return errors.Join(original, delErr)
 }
 
 // Get retrieves one push config of a committed task, resolving its
@@ -221,18 +244,18 @@ func (p *PushConfigStore) UnavailableCount(ctx context.Context, taskID a2a.TaskI
 
 // Delete removes one push config and then deletes its secret handles.
 // The order protects the stored config: one transaction reads the row's
-// handles and deletes the row; the provider handles are deleted only
-// after the commit succeeded, so a failed statement, a failed commit or a
-// canceled request leaves the row and its handles intact and usable (no
-// handle is touched). A missing row is a no-op returning nil. After the
-// commit the row and its refs are gone: a failed provider delete is an
-// error (the config is deleted, the error says so and keeps the cause)
-// and the handle whose delete failed stays in the provider, unreferenced,
-// because the store keeps no durable ledger of handles; a retry does not
-// clean it (the second Delete finds no row and is a no-op returning nil).
-// That window is the declared limit of a provider whose Delete can fail
-// (the native in-memory provider never fails it); a canceled request
-// context does not stop the cleanup after the commit.
+// handles, deletes the row and schedules the handles in the cleanup
+// ledger; the provider handles are deleted only after the commit
+// succeeded, so a failed statement, a failed commit or a canceled
+// request leaves the row and its handles intact and usable (no handle
+// is touched). A missing row is a no-op returning nil. After the commit
+// the row and its refs are gone and the drain restricted to them deletes
+// the handles from the provider: a failed provider delete is an error
+// (the config is deleted, the error says so and keeps the cause wrapped
+// in ErrSecretCleanupPending) and the failed handle stays in the ledger
+// and in the provider until the next drain; a retry does not clean it
+// (the second Delete finds no row and is a no-op returning nil). A
+// canceled request context does not stop the cleanup after the commit.
 func (p *PushConfigStore) Delete(ctx context.Context, taskID a2a.TaskID, configID string) error {
 	var refs []string
 	err := p.s.tx(ctx, func(tx *sql.Tx) error {
@@ -250,12 +273,12 @@ func (p *PushConfigStore) Delete(ctx context.Context, taskID a2a.TaskID, configI
 			return err
 		}
 		refs = validRefs(tokenRef, credsRef)
-		return nil
+		return scheduleHandleCleanup(tx, p.s.now(), refs...)
 	})
 	if err != nil {
 		return err
 	}
-	if derr := p.deleteHandles(ctx, refs...); derr != nil {
+	if _, _, derr := p.s.drainRestricted(ctx, p.s.now(), secretCleanupBatch, refs...); derr != nil {
 		return fmt.Errorf("a2astore: push config deleted; deleting a secret handle failed: %w", derr)
 	}
 	return nil
@@ -263,10 +286,12 @@ func (p *PushConfigStore) Delete(ctx context.Context, taskID a2a.TaskID, configI
 
 // DeleteAll removes every push config of one task and then deletes their
 // secret handles, in the same order and with the same limit as Delete:
-// the rows go in one transaction, the provider handles only after the
-// commit succeeded, and a failed provider delete after the commit is an
-// error saying the configs were deleted (the failed handle stays in the
-// provider and a retry, finding no row, does not clean it).
+// the rows go in one transaction that also schedules the handles in the
+// cleanup ledger, the provider handles only after the commit succeeded,
+// and a failed provider delete after the commit is an error saying the
+// configs were deleted (the failed handles stay in the ledger and in the
+// provider until the next drain; a retry, finding no row, does not clean
+// them).
 func (p *PushConfigStore) DeleteAll(ctx context.Context, taskID a2a.TaskID) error {
 	var refs []string
 	err := p.s.tx(ctx, func(tx *sql.Tx) error {
@@ -292,12 +317,12 @@ func (p *PushConfigStore) DeleteAll(ctx context.Context, taskID a2a.TaskID) erro
 			return err
 		}
 		refs = stored
-		return nil
+		return scheduleHandleCleanup(tx, p.s.now(), refs...)
 	})
 	if err != nil {
 		return err
 	}
-	if derr := p.deleteHandles(ctx, refs...); derr != nil {
+	if _, _, derr := p.s.drainRestricted(ctx, p.s.now(), secretCleanupBatch, refs...); derr != nil {
 		return fmt.Errorf("a2astore: push configs deleted; deleting a secret handle failed: %w", derr)
 	}
 	return nil
@@ -315,16 +340,17 @@ func validRefs(handles ...sql.NullString) []string {
 }
 
 // DiscardUncommitted deletes the pending push configs of taskID (rows
-// first, in one transaction, then their secret handles) and returns how
-// many rows it deleted. When the task has an a2a_tasks row it changes
-// nothing and returns 0, so a committed task's configs are never touched.
-// The handles are destroyed only after the commit succeeded: on a
-// transaction error it returns 0 and the error and touches no handle, so
-// a later Create of the task still finds a usable config. When the
-// commit succeeded and deleting a handle failed it returns the committed
-// row count together with an error saying the configs were discarded and
-// keeping the cause; the failed handle stays in the provider, unreferenced
-// (the row is gone and the store keeps no durable ledger of handles).
+// first, in one transaction that also schedules their handles in the
+// cleanup ledger) and returns how many rows it deleted. When the task
+// has an a2a_tasks row it changes nothing and returns 0, so a committed
+// task's configs are never touched. The handles are destroyed only
+// after the commit succeeded: on a transaction error it returns 0 and
+// the error and touches no handle, so a later Create of the task still
+// finds a usable config. When the commit succeeded and a handle delete
+// fails it returns the committed row count together with an error saying
+// the configs were discarded and keeping the cause wrapped in
+// ErrSecretCleanupPending; the failed handle stays in the ledger and in
+// the provider until the next drain.
 func (p *PushConfigStore) DiscardUncommitted(ctx context.Context, taskID a2a.TaskID) (int, error) {
 	var deleted int
 	var handles []string
@@ -341,7 +367,7 @@ func (p *PushConfigStore) DiscardUncommitted(ctx context.Context, taskID a2a.Tas
 		if err != nil {
 			return err
 		}
-		count, refs, err := p.s.deletePushRows(tx, rows)
+		count, refs, err := p.s.deletePushRows(tx, p.s.now(), rows)
 		if err != nil {
 			return err
 		}
@@ -351,7 +377,7 @@ func (p *PushConfigStore) DiscardUncommitted(ctx context.Context, taskID a2a.Tas
 	if err != nil {
 		return 0, err
 	}
-	if derr := p.deleteHandles(ctx, handles...); derr != nil {
+	if _, _, derr := p.s.drainRestricted(ctx, p.s.now(), secretCleanupBatch, handles...); derr != nil {
 		return deleted, fmt.Errorf("a2astore: pending push configs discarded; deleting a secret handle failed: %w", derr)
 	}
 	return deleted, nil
@@ -389,17 +415,21 @@ func pendingPushRows(tx *sql.Tx, where string, args ...any) ([]pendingPush, erro
 	return out, nil
 }
 
-// deletePushRows deletes the rows inside the caller's transaction and
-// returns how many it deleted together with their token and credentials
-// handles. It never calls the SecretProvider: the caller destroys the
-// handles only after the transaction committed.
-func (s *Store) deletePushRows(tx *sql.Tx, rows []pendingPush) (int, []string, error) {
+// deletePushRows deletes the rows inside the caller's transaction,
+// schedules their handles in the cleanup ledger in the same
+// transaction, and returns how many it deleted together with their token
+// and credentials handles. It never calls the SecretProvider: the
+// caller drains the ledger only after the transaction committed.
+func (s *Store) deletePushRows(tx *sql.Tx, now time.Time, rows []pendingPush) (int, []string, error) {
 	var handles []string
 	for _, r := range rows {
 		if _, err := tx.Exec(`DELETE FROM a2a_push_configs WHERE task_id = ? AND config_id = ?`, r.taskID, r.configID); err != nil {
 			return 0, nil, err
 		}
 		handles = append(handles, validRefs(r.token, r.creds)...)
+	}
+	if err := scheduleHandleCleanup(tx, now, handles...); err != nil {
+		return 0, nil, err
 	}
 	return len(rows), handles, nil
 }

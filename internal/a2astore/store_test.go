@@ -164,8 +164,8 @@ func TestOpenFreshCreatesBothSchemas(t *testing.T) {
 	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'a2a_%'`).Scan(&tables); err != nil {
 		t.Fatalf("tables: %v", err)
 	}
-	if tables != 7 {
-		t.Fatalf("a2a tables after reopen = %d, want 7", tables)
+	if tables != 8 {
+		t.Fatalf("a2a tables after reopen = %d, want 8", tables)
 	}
 	var version2 int
 	if err := s2.db.QueryRow(`PRAGMA user_version`).Scan(&version2); err != nil {

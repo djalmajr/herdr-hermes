@@ -322,17 +322,22 @@ func (s *Store) Release(ctx context.Context, c a2acore.DeliveryClaim) error {
 // than grace and whose task never committed (a crash between the
 // admission and the task write), and returns how many it marked. In the
 // same transaction it deletes the rows of the pending push configs
-// whose task has no a2a_tasks row and whose creation
-// stamp is older than now minus grace (a stamp that does not parse counts
-// as older); they are not part of the returned count. The provider
-// handles of those configs are destroyed only after the transaction
-// committed: on a transaction error it returns 0 and the error and touches
-// no handle, so a later Create of the task still finds a usable config.
-// When the commit succeeded and deleting a handle failed it returns the
-// committed count of marked deliveries together with an error saying the
-// recovery committed and keeping the cause; the failed handle stays in the
-// provider, unreferenced (the row is gone and the store keeps no durable
-// ledger of handles).
+// whose task has no a2a_tasks row and whose creation stamp is older than
+// now minus grace (a stamp that does not parse counts as older); they
+// are not part of the returned count, and their handles are scheduled in
+// the cleanup ledger in the same transaction. The handles are deleted
+// from the provider only after the transaction committed, through the
+// cleanup drain restricted to them: on a transaction error it returns 0
+// and the error and touches no handle (nothing is scheduled), so a later
+// Create of the task still finds a usable config. When the commit
+// succeeded and a handle delete failed it returns the committed count of
+// marked deliveries together with an error saying the recovery committed
+// and keeping the cause wrapped in ErrSecretCleanupPending; the failed
+// handles stay in the ledger and in the provider and are retried by the
+// next recovery. The old pendings of earlier recoveries are drained too;
+// their provider failures never become an error of this recovery, they
+// are counted only (a SQL failure of that drain, not wrapped in the
+// sentinel, still refuses).
 func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Duration) (int, error) {
 	cutoff := now.Add(-grace).Unix()
 	var marked int
@@ -364,7 +369,7 @@ func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Durat
 				stale = append(stale, r)
 			}
 		}
-		_, refs, err := s.deletePushRows(tx, stale)
+		_, refs, err := s.deletePushRows(tx, now, stale)
 		if err != nil {
 			return err
 		}
@@ -374,8 +379,20 @@ func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Durat
 	if err != nil {
 		return 0, err
 	}
-	if derr := s.PushConfigs().deleteHandles(ctx, handles...); derr != nil {
+	// Committed: the discarded configs' handles are in the cleanup
+	// ledger; the drain restricted to them deletes them from the
+	// provider now. A failure keeps the committed count and returns an
+	// error saying the recovery committed (the sentinel separates it
+	// from a transaction failure, which the caller still refuses).
+	if _, _, derr := s.drainRestricted(ctx, now, secretCleanupBatch, handles...); derr != nil {
 		return marked, fmt.Errorf("a2astore: held deliveries recovered; deleting a secret handle of a discarded pending push config failed: %w", derr)
+	}
+	// No failure of the fresh handles: the old pendings of earlier
+	// recoveries are drained too. A provider failure of one of them
+	// never becomes an error of this recovery: it is counted only and
+	// retried by the next recovery.
+	if _, _, derr := s.DrainSecretCleanup(ctx, now, secretCleanupBatch); derr != nil && !errors.Is(derr, ErrSecretCleanupPending) {
+		return marked, fmt.Errorf("a2astore: held deliveries recovered; draining the old secret cleanup pendings failed: %w", derr)
 	}
 	return marked, nil
 }

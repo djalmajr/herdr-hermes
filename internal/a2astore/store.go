@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -41,6 +42,19 @@ const tsLayout = "2006-01-02T15:04:05-07:00"
 // schema this build must refuse.
 const a2aSchema = 1
 
+// secretCleanupBatch is the default (and the startup recovery's) limit
+// of one DrainSecretCleanup round.
+const secretCleanupBatch = 100
+
+// ErrSecretCleanupPending is the sentinel of a secret handle deletion
+// that is still pending in the durable cleanup ledger: the operation
+// that removed the reference committed, and the provider deletion is
+// retried by the next drain (the startup recovery repeats it). It is
+// wrapped in the cleanup error and tested with errors.Is, so a caller
+// can separate a cleanup-only failure (which does not stop the serve)
+// from a transaction failure (which still refuses it).
+var ErrSecretCleanupPending = errors.New("a2astore: secret handle deletion pending")
+
 // a2aDDL is the additive schema, created with CREATE TABLE IF NOT EXISTS
 // in one transaction on every open. It never touches the registry tables
 // or the registry PRAGMA user_version.
@@ -55,6 +69,7 @@ CREATE TABLE IF NOT EXISTS a2a_deliveries(delivery_id INTEGER PRIMARY KEY AUTOIN
 CREATE INDEX IF NOT EXISTS a2a_deliveries_due ON a2a_deliveries(state, next_attempt_unix);
 CREATE TABLE IF NOT EXISTS a2a_decisions(decision_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, actor TEXT NOT NULL, state TEXT NOT NULL, refusal TEXT, recorded TEXT NOT NULL, recorded_seq INTEGER NOT NULL, applied TEXT);
 CREATE TABLE IF NOT EXISTS a2a_push_configs(task_id TEXT NOT NULL, config_id TEXT NOT NULL, url TEXT NOT NULL, auth_scheme TEXT, token_ref TEXT, credentials_ref TEXT, created TEXT NOT NULL, PRIMARY KEY(task_id, config_id));
+CREATE TABLE IF NOT EXISTS a2a_secret_cleanup(handle TEXT PRIMARY KEY, scheduled TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_attempt TEXT);
 `
 
 // Options configures OpenFile.
@@ -221,6 +236,148 @@ func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 // text column and its *_unix companion.
 func stamp(t time.Time) (string, int64) {
 	return t.Format(tsLayout), t.Unix()
+}
+
+// scheduleHandleCleanup inserts every non-empty handle into the durable
+// secret cleanup ledger inside the caller's transaction (INSERT OR
+// IGNORE: a handle already pending keeps its first scheduled instant).
+// It never stores a secret value or a provider error message: the
+// ledger holds only the opaque handle, which was referenced in
+// a2a_push_configs until the same transaction removed it.
+func scheduleHandleCleanup(tx *sql.Tx, now time.Time, handles ...string) error {
+	scheduled, _ := stamp(now)
+	for _, h := range handles {
+		if h == "" {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO a2a_secret_cleanup(handle, scheduled, attempts, last_attempt)
+			VALUES(?, ?, 0, NULL)`, h, scheduled); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DrainSecretCleanup drains the durable secret cleanup ledger: it reads
+// up to limit rows (a limit at or below zero uses secretCleanupBatch)
+// ordered by scheduled then handle and asks the SecretProvider to
+// delete each handle with a context that cannot be canceled, like the
+// other post-commit cleanups. A successful delete removes the row; a
+// failed one increments attempts and stores last_attempt. err is the
+// SQL failure when the SQL itself failed, or the provider failures
+// wrapped in ErrSecretCleanupPending when any delete failed; nil when
+// the round left nothing pending. A Delete of a handle the provider no
+// longer knows is not an error per the provider contract, so a repeated
+// drain is idempotent.
+func (s *Store) DrainSecretCleanup(ctx context.Context, now time.Time, limit int) (deleted, failed int, err error) {
+	return s.drainSecretCleanup(ctx, now, limit, nil)
+}
+
+// drainRestricted drains only the handles given, in the same order and
+// with the same contract as DrainSecretCleanup; it is a no-op when no
+// handle is given, so a path that scheduled nothing never drains the
+// old pendings of other operations.
+func (s *Store) drainRestricted(ctx context.Context, now time.Time, limit int, handles ...string) (deleted, failed int, err error) {
+	names := []string{}
+	for _, h := range handles {
+		if h != "" {
+			names = append(names, h)
+		}
+	}
+	if len(names) == 0 {
+		return 0, 0, nil
+	}
+	return s.drainSecretCleanup(ctx, now, limit, names)
+}
+
+// drainSecretCleanup is the drain core: when handles is empty it drains
+// the whole ledger, otherwise only the given handles.
+func (s *Store) drainSecretCleanup(ctx context.Context, now time.Time, limit int, handles []string) (deleted, failed int, err error) {
+	if limit <= 0 {
+		limit = secretCleanupBatch
+	}
+	query := `SELECT handle FROM a2a_secret_cleanup ORDER BY scheduled ASC, handle ASC LIMIT ?`
+	args := []any{}
+	for _, h := range handles {
+		if h != "" {
+			args = append(args, h)
+		}
+	}
+	if len(args) > 0 {
+		in := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
+		query = `SELECT handle FROM a2a_secret_cleanup WHERE handle IN (` + in + `) ORDER BY scheduled ASC, handle ASC LIMIT ?`
+	}
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return 0, 0, err
+	}
+	var pend []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		pend = append(pend, h)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+	if len(pend) == 0 {
+		return 0, 0, nil
+	}
+	// The provider calls run outside any SQL transaction, with a
+	// context that cannot be canceled; the results are applied in one
+	// small transaction, so a crash between the two leaves the ledger
+	// intact and the next drain converges (a delete of an already-gone
+	// handle is not an error).
+	delCtx := context.WithoutCancel(ctx)
+	var (
+		gone    []string
+		kept    []string
+		delErrs []error
+	)
+	for _, h := range pend {
+		if err := s.secrets.Delete(delCtx, h); err == nil {
+			gone = append(gone, h)
+		} else {
+			kept = append(kept, h)
+			delErrs = append(delErrs, err)
+		}
+	}
+	aerr := s.tx(delCtx, func(tx *sql.Tx) error {
+		nowTS, _ := stamp(now)
+		for _, h := range gone {
+			if _, err := tx.Exec(`DELETE FROM a2a_secret_cleanup WHERE handle = ?`, h); err != nil {
+				return err
+			}
+		}
+		for _, h := range kept {
+			if _, err := tx.Exec(`UPDATE a2a_secret_cleanup SET attempts = attempts + 1, last_attempt = ? WHERE handle = ?`,
+				nowTS, h); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if aerr != nil {
+		return 0, 0, aerr
+	}
+	if len(kept) > 0 {
+		return len(gone), len(kept), fmt.Errorf("%w: %w", ErrSecretCleanupPending, errors.Join(delErrs...))
+	}
+	return len(gone), 0, nil
+}
+
+// PendingSecretCleanup counts the handles whose provider deletion is
+// still pending in the durable cleanup ledger: only the count, never a
+// handle, a secret or a provider message.
+func (s *Store) PendingSecretCleanup(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM a2a_secret_cleanup`).Scan(&n)
+	return n, err
 }
 
 // nullStr is a nullable column value: "" is stored as NULL.
