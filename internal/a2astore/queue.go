@@ -30,7 +30,11 @@ const reservedTasksSQL = `SELECT COUNT(DISTINCT task_id) FROM a2a_ingress
 // duplicate check on (subject, message id) — a duplicate whose task
 // committed returns that task, one whose task never committed is re-
 // pointed at the new task and its deliveries are reset to held —, the
-// per (subject, session) fence (CheckFence), the limits of a new task
+// awaiting-caller gate of a continuation (it is admitted only on a
+// task in input_required, the state that awaits the caller's answer;
+// a task without a row is refused unknown_task, and a refusal writes
+// nothing and does not move the fence), the per (subject, session)
+// fence (CheckFence), the limits of a new task
 // (MaxTasksPerContext of the context, then MaxOpenTasks of the store:
 // the committed non-terminal tasks plus the live reservations, that is
 // the new-task admissions younger than repointGrace whose task is not
@@ -83,7 +87,26 @@ func (s *Store) Admit(ctx context.Context, a a2acore.Admission) (a2acore.AdmitRe
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		// 2. Fence.
+		// 2. Awaiting caller: a continuation is admitted only while the
+		// task awaits the caller's answer (input_required); the
+		// duplicate above stands before this gate, and a refusal writes
+		// nothing (no ingress row, no delivery, the fence stands).
+		if !a.NewTask {
+			var state string
+			err := tx.QueryRow(`SELECT state FROM a2a_tasks WHERE task_id = ?`, a.TaskID).Scan(&state)
+			if errors.Is(err, sql.ErrNoRows) {
+				res = a2acore.AdmitResult{Refusal: &a2acore.Refusal{Code: a2acore.RefuseUnknownTask, Detail: "no such task"}}
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if state != a2acore.StateInputRequired {
+				res = a2acore.AdmitResult{Refusal: &a2acore.Refusal{Code: a2acore.RefuseNotAwaitingCaller, Detail: "the task is not awaiting the caller"}}
+				return nil
+			}
+		}
+		// 3. Fence.
 		var prev a2acore.FenceState
 		var epoch, lastSeq int64
 		err = tx.QueryRow(`SELECT epoch, last_seq FROM a2a_fences WHERE subject = ? AND session = ?`,
@@ -98,7 +121,7 @@ func (s *Store) Admit(ctx context.Context, a a2acore.Admission) (a2acore.AdmitRe
 			res = a2acore.AdmitResult{Refusal: refusal}
 			return nil
 		}
-		// 3. The limits of a new task.
+		// 4. The limits of a new task.
 		if a.NewTask {
 			var contextTasks int
 			if err := tx.QueryRow(`SELECT COUNT(*) FROM (
@@ -126,7 +149,7 @@ func (s *Store) Admit(ctx context.Context, a a2acore.Admission) (a2acore.AdmitRe
 				return nil
 			}
 		}
-		// 4. The fresh admission.
+		// 5. The fresh admission.
 		now := s.now()
 		nowTS, nowUnix := stamp(now)
 		insert, err := tx.Exec(`INSERT INTO a2a_ingress(subject, message_id, task_id, context_id, project, job, session, epoch, seq, new_task, text_bytes, received, received_unix)
