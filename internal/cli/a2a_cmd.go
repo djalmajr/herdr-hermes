@@ -420,6 +420,12 @@ func cmdA2AServe(args []string, env Env) int {
 		BaseURL:      "http://" + ln.Addr().String(),
 		Version:      version,
 		Now:          env.Now,
+		// The warnings of the agent (the push gate's suppression among
+		// them) go to stderr as JSON records at the WARN level and
+		// above; stdout keeps the JSON status lines. Every URL of a
+		// record is masked as <url> before it is written: a webhook URL
+		// can carry a secret in the path or the query.
+		Logger: a2aServeLogger(env.Stderr),
 	})
 	if err != nil {
 		_ = ln.Close()

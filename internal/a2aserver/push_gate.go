@@ -9,6 +9,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
+	"github.com/a2aproject/a2a-go/v2/log"
 
 	"github.com/djalmajr/nau/internal/a2acore"
 	"github.com/djalmajr/nau/internal/a2astore"
@@ -124,6 +125,13 @@ func (g *pushGate) SendPush(ctx context.Context, config *a2a.PushConfig, event a
 		g.authz.Authorize(subject, a2acore.ActionPush, owner.Project) != nil {
 		return g.suppress(ctx, string(config.TaskID), pushReasonNotGranted)
 	}
+	// The SDK sender logs through the logger attached to the context
+	// (slog.Default() without one): attach the server logger so the
+	// push log of the live and the out-of-band sends both reach the
+	// Config.Logger and never the process default (which would write
+	// the send error, with the URL of the webhook, to stderr in plain
+	// text).
+	ctx = log.AttachLogger(ctx, g.logger)
 	return g.inner.SendPush(ctx, config, event)
 }
 
