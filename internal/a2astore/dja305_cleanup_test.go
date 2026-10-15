@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -426,6 +427,47 @@ func TestDJA305OldPendingDrainedAfterFreshFailure(t *testing.T) {
 		t.Fatalf("the fresh handle is gone from the provider, want still live")
 	}
 	requireDja305NoSecretInA2ATables(t, s, "after the mixed recovery", dja305Canary)
+}
+
+// TestDJA305RecoverHeldMixedSQLIsFatal proves the mixed failure
+// classification: when the fresh drain fails at the provider and the
+// old drain fails with a SQL error, RecoverHeld returns only the SQL
+// error (wrapped with its context), not the sentinel and not the
+// provider cause, so the caller refuses the start like a transaction
+// failure; the fresh error is discarded without loss because its
+// handles stay in the durable ledger and the count is still readable.
+func TestDJA305RecoverHeldMixedSQLIsFatal(t *testing.T) {
+	s, clk, sec, _, fresh := dja305RecoverEnv(t)
+	sec.failDeleteOf(fresh)
+	// a deterministic local SQL failure of the old drain: the trigger
+	// aborts the update that brings the fresh handle to attempts 2
+	// (the restricted drain already brought it to 1).
+	dja305Exec(t, s, `CREATE TRIGGER dja305_abort_second BEFORE UPDATE OF attempts ON a2a_secret_cleanup WHEN NEW.attempts=2 BEGIN SELECT RAISE(ABORT, 'dja305 mixed SQL failure'); END`)
+	marked, err := s.RecoverHeld(context.Background(), clk.Now(), 5*time.Minute)
+	if marked != 1 {
+		t.Fatalf("RecoverHeld returned %d with the error, want the committed count 1", marked)
+	}
+	if errors.Is(err, ErrSecretCleanupPending) {
+		t.Fatalf("the mixed failure still carries the cleanup sentinel, want the fatal SQL error alone: %v", err)
+	}
+	if errors.Is(err, errDja305Delete) || strings.Contains(err.Error(), "deleting a secret handle") {
+		t.Fatalf("the fresh provider failure was not discarded: %v", err)
+	}
+	if !strings.Contains(err.Error(), "draining the old secret cleanup pendings failed") {
+		t.Fatalf("the error lost the old drain context: %v", err)
+	}
+	if !strings.Contains(err.Error(), "dja305 mixed SQL failure") {
+		t.Fatalf("the error lost the SQL cause: %v", err)
+	}
+	// the discarded fresh error loses nothing: its handle keeps its
+	// ledger row (the aborted attempt rolled back) and the count is
+	// still readable.
+	if row := dja305LedgerRow(t, s, fresh); !row.found || row.attempts != 1 {
+		t.Fatalf("the fresh handle row = %+v, want the row with attempts 1 (retryable)", row)
+	}
+	if pending, cerr := s.PendingSecretCleanup(context.Background()); cerr != nil || pending != 1 {
+		t.Fatalf("PendingSecretCleanup = %d, %v, want 1 and no error", pending, cerr)
+	}
 }
 
 // TestDJA305DrainRetryConverges proves acceptance 2 and the [retry]
@@ -884,6 +926,72 @@ func TestDJA305DrainKeepsReferencedHandle(t *testing.T) {
 	}
 	if n := sec.deletedOf(env.oldCredsRef); n != 0 {
 		t.Fatalf("provider deletes of the credentials handle = %d, want 0", n)
+	}
+}
+
+// TestDJA305DrainReferenceBindingFullBatch proves the batch binding of
+// the depth defense: the reference query binds the full handle list to
+// each IN block (the list followed by the list again), so a handle
+// that still appears in token_ref or credentials_ref is kept from the
+// provider no matter its position in a batch of two or more handles
+// and its row leaves the cleanup table, while the unreferenced
+// handles of the same batch are still deleted from the provider.
+func TestDJA305DrainReferenceBindingFullBatch(t *testing.T) {
+	ctx := context.Background()
+	for _, size := range []int{2, 3} {
+		for _, col := range []string{"token_ref", "credentials_ref"} {
+			for _, pos := range []int{0, size - 1} {
+				t.Run(fmt.Sprintf("%s size=%d pos=%d", col, size, pos), func(t *testing.T) {
+					clk := &clock{t: testNow}
+					sec := newDja305Secrets()
+					env := newPushEnv(t, sec)
+					var ref string
+					switch col {
+					case "token_ref":
+						ref = env.oldTokenRef
+						// only one matching row: the other reference is
+						// out of the batch and would not mask a wrong
+						// binding.
+						dja305Exec(t, env.s, `UPDATE a2a_push_configs SET credentials_ref = NULL`)
+					default:
+						ref = env.oldCredsRef
+						dja305Exec(t, env.s, `UPDATE a2a_push_configs SET token_ref = NULL`)
+					}
+					// the batch: size-1 unreferenced handles plus the
+					// referenced one at position pos; distinct scheduled
+					// instants fix the batch order.
+					base := testNow.Add(-time.Hour)
+					handles := make([]string, size)
+					for i := range handles {
+						handles[i] = fmt.Sprintf("dja305-unref-%d", i)
+						sec.insert(handles[i], fmt.Sprintf("dja305-unref-value-%d", i))
+					}
+					handles[pos] = ref
+					for i, h := range handles {
+						dja305Exec(t, env.s, `INSERT INTO a2a_secret_cleanup(handle, scheduled) VALUES(?, ?)`,
+							h, base.Add(time.Duration(i)*time.Minute).Format(tsLayout))
+					}
+					deleted, failed, derr := env.s.DrainSecretCleanup(ctx, clk.Now(), 100)
+					if deleted != size || failed != 0 || derr != nil {
+						t.Fatalf("drain = %d/%d, %v, want %d/0 and no error", deleted, failed, derr, size)
+					}
+					if !sec.isLive(ref) {
+						t.Fatalf("the referenced handle %s was deleted from the provider, want kept", ref)
+					}
+					if n := sec.deletedOf(ref); n != 0 {
+						t.Fatalf("provider deletes of the referenced handle = %d, want 0", n)
+					}
+					for _, h := range handles {
+						if h != ref && sec.isLive(h) {
+							t.Fatalf("the unreferenced handle %s is still live in the provider, want deleted", h)
+						}
+						if row := dja305LedgerRow(t, env.s, h); row.found {
+							t.Fatalf("the handle %s row is still in the table: %+v", h, row)
+						}
+					}
+				})
+			}
+		}
 	}
 }
 

@@ -334,11 +334,17 @@ func (s *Store) drainSecretCleanup(ctx context.Context, now time.Time, limit int
 	// Defense in depth against imported or corrupted state: a handle
 	// that still appears in a2a_push_configs (token_ref or
 	// credentials_ref) came back into use, so it is not deleted from the
-	// provider and its ledger row is removed, counted as resolved.
+	// provider and its ledger row is removed, counted as resolved. The
+	// two IN blocks each bind the full handle list (the arguments are
+	// the list followed by the list again), so every handle of the
+	// batch is checked against both columns no matter its position.
 	refIn := strings.TrimSuffix(strings.Repeat("?,", len(pend)), ",")
 	refArgs := make([]any, 0, 2*len(pend))
 	for _, h := range pend {
-		refArgs = append(refArgs, h, h)
+		refArgs = append(refArgs, h)
+	}
+	for _, h := range pend {
+		refArgs = append(refArgs, h)
 	}
 	referenced := map[string]bool{}
 	refRows, rerr := s.db.Query(`SELECT token_ref, credentials_ref FROM a2a_push_configs WHERE token_ref IN (`+refIn+`) OR credentials_ref IN (`+refIn+`)`, refArgs...)

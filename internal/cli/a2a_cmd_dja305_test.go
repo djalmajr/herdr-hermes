@@ -360,3 +360,81 @@ func TestDJA305ServeTransactionFailureStillExits4(t *testing.T) {
 		t.Fatalf("provider deletes = %d, want 0 (no handle was touched)", n)
 	}
 }
+
+// TestDJA305ServeMixedSQLExits4 proves the mixed failure end to end:
+// with the fresh deletions failing at the provider and the old drain
+// failing with a SQL error, the serve refuses the start with exit 4
+// and the unavailable line, like a transaction failure, and neither a
+// handle nor the provider's error text reaches stdout or stderr.
+func TestDJA305ServeMixedSQLExits4(t *testing.T) {
+	cfgDir := t.TempDir()
+	a2aRegisterNotify(t, cfgDir)
+	sec := newDja305ServeSecrets()
+	tok, creds := a2aDja305Fixture(t, cfgDir, sec)
+	sec.failDeleteOf(tok)
+	sec.failDeleteOf(creds)
+	// a deterministic local SQL failure of the old drain at startup:
+	// the trigger aborts the update that brings a fresh handle to
+	// attempts 2 (the restricted drain already brought it to 1).
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(outbox.StateDir(cfgDir), "registry.db")))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TRIGGER dja305_abort_second BEFORE UPDATE OF attempts ON a2a_secret_cleanup WHEN NEW.attempts=2 BEGIN SELECT RAISE(ABORT, 'dja305 mixed SQL failure'); END`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("install the trigger: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+	// run the serve with the test-owned context and the fake sender so
+	// a started serve (the defect) is stopped and never spawns a
+	// subprocess; the fixed refusal exits before serving.
+	out := &testLockedBuffer{}
+	errbuf := &testLockedBuffer{}
+	sender := &fakeA2ASender{script: map[string][]notify.SendResult{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	origCtx := a2aServeContext
+	a2aServeContext = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
+	origSender := newA2aNoticeSender
+	newA2aNoticeSender = func(string, []string) notify.Sender { return sender }
+	origDeliver := a2aDefaultDeliverInterval
+	a2aDefaultDeliverInterval = 50 * time.Millisecond
+	origDecision := a2aDecisionInterval
+	a2aDecisionInterval = 50 * time.Millisecond
+	origSecrets := a2aServeSecrets
+	a2aServeSecrets = sec
+	t.Cleanup(func() {
+		a2aServeContext = origCtx
+		newA2aNoticeSender = origSender
+		a2aDefaultDeliverInterval = origDeliver
+		a2aDecisionInterval = origDecision
+		a2aServeSecrets = origSecrets
+		cancel()
+	})
+	env := a2aTestEnv(t, cfgDir, out, errbuf)
+	exitCh := make(chan int, 1)
+	go func() {
+		exitCh <- cmdA2A([]string{"serve", "--listen", "127.0.0.1:0"}, env)
+	}()
+	select {
+	case exit := <-exitCh:
+		if exit != 4 {
+			t.Fatalf("serve exit = %d, want 4 (stdout %q stderr %q)", exit, out.snapshot(), errbuf.snapshot())
+		}
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-exitCh
+		t.Fatalf("serve started despite the SQL failure in the old drain; want startup exit 4")
+	}
+	const want = `{"status":"unavailable","motivo":"a2a serve: registry database unavailable"}`
+	if got := out.snapshot(); got != want+"\n" {
+		t.Fatalf("stdout = %q, want exactly the unavailable line %q", got, want)
+	}
+	// no handle and no provider error text in the output.
+	for _, banned := range []string{tok, creds, errDja305ServeDelete.Error()} {
+		if strings.Contains(out.snapshot(), banned) || strings.Contains(errbuf.snapshot(), banned) {
+			t.Fatalf("a handle or the provider error text reached the output (stdout %q stderr %q)", out.snapshot(), errbuf.snapshot())
+		}
+	}
+}

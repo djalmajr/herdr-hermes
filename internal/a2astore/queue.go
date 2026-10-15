@@ -337,8 +337,8 @@ func (s *Store) Release(ctx context.Context, c a2acore.DeliveryClaim) error {
 // next recovery. The old pendings of earlier recoveries are drained
 // too, whether or not the fresh drain failed; their provider failures
 // never become an error of this recovery, they are counted only (a SQL
-// failure of that drain is returned joined in the error, not wrapped in
-// the sentinel, and still refuses the start).
+// failure of that drain is returned alone, discarding the fresh error,
+// not wrapped in the sentinel, and still refuses the start).
 func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Duration) (int, error) {
 	cutoff := now.Add(-grace).Unix()
 	var marked int
@@ -394,10 +394,16 @@ func (s *Store) RecoverHeld(ctx context.Context, now time.Time, grace time.Durat
 	// or not the fresh handles failed. A provider failure of an old
 	// handle never becomes an error of this recovery: it is counted
 	// only and retried by the next recovery. A SQL failure of that
-	// drain is returned joined in the error, not wrapped in the
-	// sentinel, so a broken database still refuses the start.
+	// drain is returned alone, not wrapped in the sentinel, so a
+	// broken database still refuses the start.
 	if _, _, derr := s.DrainSecretCleanup(ctx, now, secretCleanupBatch); derr != nil && !errors.Is(derr, ErrSecretCleanupPending) {
-		freshErr = errors.Join(freshErr, fmt.Errorf("a2astore: held deliveries recovered; draining the old secret cleanup pendings failed: %w", derr))
+		// A SQL failure of the old drain is fatal on its own and takes
+		// precedence over the fresh provider failure: only this error
+		// is returned. The fresh error is discarded without loss: its
+		// handles are already in the durable cleanup ledger and are
+		// retried by the next recovery. It is also why the provider's
+		// error text never reaches the caller's stderr on this path.
+		return marked, fmt.Errorf("a2astore: held deliveries recovered; draining the old secret cleanup pendings failed: %w", derr)
 	}
 	return marked, freshErr
 }
