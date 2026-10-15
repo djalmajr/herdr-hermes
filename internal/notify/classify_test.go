@@ -91,6 +91,7 @@ func TestProjectJobEventTable(t *testing.T) {
 		{"terminal exit 22 number", 16, jobapi.TypeTerminal, `,"refs":{"exit":22}`, ClassFailed, []string{EscFailed}, intPtr(22)},
 		{"terminal exit other value", 17, jobapi.TypeTerminal, `,"refs":{"exit":5}`, ClassTerminal, nil, intPtr(5)},
 		{"timeout warning", 18, jobapi.TypeTimeoutWarning, "", ClassTimeoutWarning, nil, nil},
+		{"blocked warning", 29, jobapi.TypeBlockedWarning, "", ClassBlockedWarning, nil, nil},
 		{"review verdict", 19, jobapi.TypeReviewVerdict, "", ClassReviewVerdict, nil, nil},
 		{"pr opened", 20, jobapi.TypePrOpened, "", ClassPROpened, nil, nil},
 		{"decision global", 21, jobapi.TypeDecision, `,"escopo":"global"`, ClassDecision, []string{EscCrossProject}, nil},
@@ -159,7 +160,7 @@ func TestProjectJobEventTable(t *testing.T) {
 }
 
 // TestProjectJobEventAllTipos: every contract tipo is exercised; only the
-// eight notifiable tipos project, the rest return nil, false, nil.
+// notifiable tipos project, the rest return nil, false, nil.
 func TestProjectJobEventAllTipos(t *testing.T) {
 	notifiable := map[string]bool{
 		jobapi.TypeQuestion:       true,
@@ -167,6 +168,7 @@ func TestProjectJobEventAllTipos(t *testing.T) {
 		jobapi.TypeFailure:        true,
 		jobapi.TypeTerminal:       true,
 		jobapi.TypeTimeoutWarning: true,
+		jobapi.TypeBlockedWarning: true,
 		jobapi.TypeReviewVerdict:  true,
 		jobapi.TypePrOpened:       true,
 		jobapi.TypeDecision:       true,
@@ -194,6 +196,71 @@ func TestProjectJobEventAllTipos(t *testing.T) {
 	n, ok, err := ProjectJobEvent(unknown, fullRegistry(), fixedNow)
 	if ok || n != nil || err != nil {
 		t.Fatalf("unknown tipo: ok = %v, n = %v, err = %v; want nil, false, nil", ok, n, err)
+	}
+}
+
+// TestProjectJobEventBlockedWarning: a blocked_warning event projects with
+// its own class and no escalation, exactly like timeout_warning: the
+// recipients are the owner and the orchestrator (no escalation, so no
+// coordinator), and every rendered line carries class= and
+// event=blocked_warning, never a "?" placeholder.
+func TestProjectJobEventBlockedWarning(t *testing.T) {
+	in := JobEventInput{
+		OutboxSeq: 1,
+		Projeto:   "example-org/example-repo",
+		JobID:     "job-1",
+		Event:     eventJSON(29, jobapi.TypeBlockedWarning, ""),
+	}
+	n, ok, err := ProjectJobEvent(in, fullRegistry(), fixedNow)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !ok || n == nil {
+		t.Fatalf("ok = %v, n = %v; want projected", ok, n)
+	}
+	if n.Class != ClassBlockedWarning {
+		t.Errorf("class = %q, want %q", n.Class, ClassBlockedWarning)
+	}
+	wantEscs(t, n.Escalations)
+	if n.EventTipo != jobapi.TypeBlockedWarning || n.EventSeq != 29 {
+		t.Errorf("event = %q/%d, want blocked_warning/29", n.EventTipo, n.EventSeq)
+	}
+	if len(n.Deliveries) != 2 {
+		t.Fatalf("deliveries = %d, want 2 (owner, orchestrator): %+v", len(n.Deliveries), n.Deliveries)
+	}
+	if n.Deliveries[0].Ref != "local/w1:p3" || n.Deliveries[0].State != StatePending {
+		t.Errorf("owner delivery = %+v, want pending local/w1:p3", n.Deliveries[0])
+	}
+	if n.Deliveries[1].Ref != "owner-agent" || n.Deliveries[1].State != StatePending {
+		t.Errorf("orchestrator delivery = %+v, want pending owner-agent", n.Deliveries[1])
+	}
+	for i, d := range n.Deliveries {
+		line := Render(n, d)
+		if !strings.Contains(line, "class=blocked_warning") {
+			t.Errorf("delivery %d line lacks class=blocked_warning: %s", i, line)
+		}
+		if !strings.Contains(line, "event=blocked_warning") {
+			t.Errorf("delivery %d line lacks event=blocked_warning: %s", i, line)
+		}
+		if strings.Contains(line, "=?") {
+			t.Errorf("delivery %d line has a placeholder: %s", i, line)
+		}
+	}
+}
+
+// TestProjectJobEventHeldUncertainCheckpointNotProjected: control_held and
+// delivery_uncertain never project (the blocked or question of the same
+// block already wakes the dispatcher, and the request stays recorded in
+// the outbox); checkpoint stays routine, as before.
+func TestProjectJobEventHeldUncertainCheckpointNotProjected(t *testing.T) {
+	for _, tipo := range []string{jobapi.TypeControlHeld, jobapi.TypeDeliveryUncertain, jobapi.TypeCheckpoint} {
+		tipo := tipo
+		t.Run(tipo, func(t *testing.T) {
+			n, ok, err := ProjectJobEvent(JobEventInput{OutboxSeq: 1, Projeto: "example-org/example-repo", JobID: "job-1", Event: eventJSON(1, tipo, "")}, fullRegistry(), fixedNow)
+			if err != nil || ok || n != nil {
+				t.Fatalf("tipo %s: ok = %v, n = %v, err = %v; want not projected", tipo, ok, n, err)
+			}
+		})
 	}
 }
 

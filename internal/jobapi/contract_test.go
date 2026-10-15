@@ -273,7 +273,7 @@ func TestContractDriftDetected(t *testing.T) {
 		t.Error("changed wake cell was not detected as drift")
 	}
 
-	removed := strings.Replace(original, "| 9 | job `timeout` |\n", "", 1)
+	removed := strings.Replace(original, "| 9 | job `timeout`: the active budget or the blocked ceiling was exhausted (`motivo` tells which) |\n", "", 1)
 	if removed == original {
 		t.Fatal("mutation did not change the doc (anchor missing)")
 	}
