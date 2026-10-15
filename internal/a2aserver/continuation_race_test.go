@@ -23,6 +23,7 @@ import (
 // real one; the hooks only block or signal.
 type hookedTaskStore struct {
 	taskstore.Store
+	reviewHook   func(context.Context, *taskstore.UpdateRequest)
 	afterGet     func(id a2a.TaskID)
 	beforeUpdate func(req *taskstore.UpdateRequest)
 	afterUpdate  func(req *taskstore.UpdateRequest)
@@ -39,6 +40,9 @@ func (h *hookedTaskStore) Get(ctx context.Context, id a2a.TaskID) (*taskstore.St
 
 // Update implements taskstore.Store.
 func (h *hookedTaskStore) Update(ctx context.Context, req *taskstore.UpdateRequest) (taskstore.TaskVersion, error) {
+	if h.reviewHook != nil {
+		h.reviewHook(ctx, req)
+	}
 	if h.beforeUpdate != nil {
 		h.beforeUpdate(req)
 	}

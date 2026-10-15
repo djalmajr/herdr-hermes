@@ -1,6 +1,7 @@
 package a2aserver
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/djalmajr/nau/internal/a2acore"
 	"github.com/djalmajr/nau/internal/a2astore"
@@ -225,5 +227,245 @@ func TestContentionVisibleParkedIsBusy(t *testing.T) {
 	task, ok := res.(*a2a.Task)
 	if !ok || task.ID != f.secret.ID {
 		t.Fatalf("resent continuation = %T %+v, want the same task", res, res)
+	}
+}
+
+// TestBusyAfterAdmission: a continuation whose admission commits before
+// its first event loses a write race gets the same stable busy answer as
+// the conflicts that are met before the admission, while the admission
+// stands: the ingress row of the message and the session fence advance
+// with it. A resend of the same message (same message id, session, epoch
+// and sequence) is not admitted again (no second ingress row, no second
+// delivery to the owner); the store answers it as a duplicate and the
+// answer comes back as the task itself, which the SDK leaves failed
+// because it does not accept a message answer on a task that is already
+// stored. The order is forced with the store hook: on the working
+// event's update a competing write of the same context and version lands
+// first, so the update loses the SDK optimistic version check and the
+// send's error is the contention the interceptor rewrites.
+func TestBusyAfterAdmission(t *testing.T) {
+	store, path := newTestStore(t)
+	auth := newTableAuth(testSubject("caller-1"))
+	routes := fakeRoutes{owner: "owner-ref-1"}
+	s1 := newTestServer(t, store, auth, routes)
+	c1 := dialClient(t, serveServer(t, s1).URL, auth, "caller-1")
+	task := sendTask(t, c1, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
+	waitTaskState(t, c1, string(task.ID), a2a.TaskStateWorking)
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAsk, "ba-ask", "question")
+	if applied, refused, err := s1.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply ask = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitTaskState(t, c1, string(task.ID), a2a.TaskStateInputRequired)
+	waitLive(t, s1, 0)
+
+	var once sync.Once
+	s2 := newHookedServer(t, store, auth, routes, &hookedTaskStore{
+		reviewHook: func(ctx context.Context, req *taskstore.UpdateRequest) {
+			if !isWorkingEvent(req) {
+				return
+			}
+			once.Do(func() {
+				competing := *req
+				competing.Event = nil
+				if _, err := store.Update(ctx, &competing); err != nil {
+					t.Errorf("competing write: %v", err)
+				}
+			})
+		},
+	})
+	rec := &pcRecorder{}
+	c2, err := Dial(ctxT(t), serveServer(t, s2).URL, staticCredential{value: auth.token("caller-1")}, &http.Client{Timeout: 10 * time.Second, Transport: rec})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { c2.Close() })
+
+	in := SendInput{TaskID: string(task.ID), ContextID: task.ContextID, Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-2", Text: "second"}
+	res, err := c2.Send(ctxT(t), in)
+	if err == nil || !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
+		t.Fatalf("send = %T, %v, want the internal error %q", res, err, taskBusyText)
+	}
+	wire := rec.wire()
+	if wire.status != http.StatusInternalServerError {
+		t.Fatalf("busy status = %d (%s), want 500", wire.status, wire.body)
+	}
+	if got := strings.TrimSpace(pcNorm(wire.body)); got != ctBusyBody {
+		t.Fatalf("busy body = %s, want %s", got, ctBusyBody)
+	}
+	for _, leak := range []string{string(task.ID), task.ContextID, "org/repo", "caller-1", "in progress", "concurrent modification", "exec ctx"} {
+		if strings.Contains(wire.body, leak) {
+			t.Errorf("busy body carries %q: %s", leak, wire.body)
+		}
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-2"); got != 1 {
+		t.Errorf("ingress rows of the busy message = %d, want 1 (the admission stands)", got)
+	}
+	if got := f1Count(t, path, `SELECT last_seq FROM a2a_fences WHERE subject = ? AND session = ?`, "caller-1", "s-1"); got != 2 {
+		t.Errorf("fence last_seq = %d, want 2 (the fence advanced with the admission)", got)
+	}
+	waitLive(t, s2, 0)
+
+	// What the documented check reads before a resend: the busy message
+	// is already in the task history, and the task is not failed.
+	before, err := c2.Get(ctxT(t), string(task.ID))
+	if err != nil {
+		t.Fatalf("get after the busy answer: %v", err)
+	}
+	inHistory := false
+	for _, m := range before.History {
+		if m.ID == "m-2" {
+			inHistory = true
+		}
+	}
+	if !inHistory {
+		t.Errorf("history after the busy answer does not carry m-2: %+v", before.History)
+	}
+	if before.Status.State == a2a.TaskStateFailed {
+		t.Errorf("task state after the busy answer = %s, want not failed", before.Status.State)
+	}
+	t.Logf("task state after the busy answer: %s", before.Status.State)
+
+	// The resend of the same message (same message id, session, epoch
+	// and sequence) is not admitted again: no second ingress row and no
+	// second delivery to the owner.
+	res, err = c2.Send(ctxT(t), in)
+	if err != nil {
+		t.Fatalf("resent the same message: %v", err)
+	}
+	resent, ok := res.(*a2a.Task)
+	if !ok {
+		t.Fatalf("resent result = %T, want *a2a.Task", res)
+	}
+	if resent.ID != task.ID {
+		t.Errorf("resent task id = %s, want %s", resent.ID, task.ID)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-2"); got != 1 {
+		t.Errorf("ingress rows after the resend = %d, want 1 (no second admission)", got)
+	}
+	ingressID := f1Count(t, path, `SELECT ingress_id FROM a2a_ingress WHERE message_id = ?`, "m-2")
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_deliveries WHERE ingress_id = ?`, ingressID); got != 1 {
+		t.Errorf("deliveries of the message after the resend = %d, want 1 (no second notice to the owner)", got)
+	}
+	tv, err := store.TaskView(ctxT(t), string(task.ID))
+	if err != nil || tv == nil {
+		t.Fatalf("task view after the resend: %v, %v", tv, err)
+	}
+	if resent.Status.State != a2a.TaskStateFailed {
+		t.Errorf("resent task state = %s, want failed (the SDK refuses the duplicate message answer on a stored task)", resent.Status.State)
+	}
+	if tv.State != a2acore.StateFailed {
+		t.Errorf("durable task state after the resend = %q, want %q (the SDK refuses the duplicate message answer on a stored task)", tv.State, a2acore.StateFailed)
+	}
+}
+
+// TestCancelationInProgressVisibleIsBusy: a cancelation that runs
+// without a live execution of the task (its store write is held by the
+// store hook, so the SDK keeps the cancelation keyed by the task id)
+// answers a permitted continuation of the visible task with the one
+// stable busy body — the same answer, status and reason as every other
+// contention, with no task id, owner, project or SDK internal text —
+// and a resend of the same message after the cancelation commits gets
+// the answer the canceled state asks for.
+func TestCancelationInProgressVisibleIsBusy(t *testing.T) {
+	store, path := newTestStore(t)
+	auth := newTableAuth(testSubject("caller-1"))
+	routes := fakeRoutes{owner: "owner-ref-1"}
+
+	var hold sync.Once
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWrite := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseWrite)
+
+	s := newHookedServer(t, store, auth, routes, &hookedTaskStore{
+		beforeUpdate: func(req *taskstore.UpdateRequest) {
+			ev, ok := req.Event.(*a2a.TaskStatusUpdateEvent)
+			if !ok || ev.Status.State != a2a.TaskStateCanceled {
+				return
+			}
+			hold.Do(func() { close(reached) })
+			awaitSignal(t, "the test to release the cancelation write", release)
+		},
+	})
+	rec := &pcRecorder{}
+	c, err := Dial(ctxT(t), serveServer(t, s).URL, staticCredential{value: auth.token("caller-1")}, &http.Client{Timeout: 10 * time.Second, Transport: rec})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	task := sendTask(t, c, SendInput{Project: "org/repo", Session: "s-1", Epoch: 1, Seq: 1, MessageID: "m-1", Text: "first"})
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateWorking)
+	waitLive(t, s, 1)
+	recordDecision(t, store, string(task.ID), a2acore.DecisionAsk, "ci-ask", "question")
+	if applied, refused, err := s.ApplyPendingDecisions(ctxT(t)); err != nil || applied != 1 || refused != 0 {
+		t.Fatalf("apply ask = %d/%d err=%v, want 1/0 nil", applied, refused, err)
+	}
+	waitTaskState(t, c, string(task.ID), a2a.TaskStateInputRequired)
+	waitLive(t, s, 0)
+
+	// The cancelation runs in a background call and its store write is
+	// held: while it runs the SDK keys the cancelation by the task id
+	// and a send of the task meets it.
+	cancelDone := make(chan struct{})
+	var cancelTask *a2a.Task
+	var cancelErr error
+	go func() {
+		defer close(cancelDone)
+		cancelTask, cancelErr = c.Cancel(ctxT(t), string(task.ID))
+	}()
+	awaitSignal(t, "the cancelation to reach its store write", reached)
+
+	in := SendInput{TaskID: string(task.ID), ContextID: task.ContextID, Session: "s-1", Epoch: 1, Seq: 2, MessageID: "m-2", Text: "second"}
+	res, err := c.Send(ctxT(t), in)
+	if err == nil || !errors.Is(err, a2a.ErrInternalError) || err.Error() != taskBusyText {
+		t.Fatalf("continuation during the cancelation = %T, %v, want the internal error %q", res, err, taskBusyText)
+	}
+	wire := rec.wire()
+	if wire.status != http.StatusInternalServerError {
+		t.Fatalf("busy status = %d (%s), want 500", wire.status, wire.body)
+	}
+	if got := strings.TrimSpace(pcNorm(wire.body)); got != ctBusyBody {
+		t.Fatalf("busy body = %s, want %s", got, ctBusyBody)
+	}
+	for _, leak := range []string{string(task.ID), task.ContextID, "org/repo", "caller-1", "in progress", "cancelation", "concurrent modification", "exec ctx"} {
+		if strings.Contains(wire.body, leak) {
+			t.Errorf("busy body carries %q: %s", leak, wire.body)
+		}
+	}
+	// The conflict was met before the admission: nothing was admitted.
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-2"); got != 0 {
+		t.Errorf("ingress rows of the busy send = %d, want 0 (the conflict was met before the admission)", got)
+	}
+	if got := f1Count(t, path, `SELECT last_seq FROM a2a_fences WHERE subject = ? AND session = ?`, "caller-1", "s-1"); got != 1 {
+		t.Errorf("fence last_seq = %d, want 1 (the fence stands)", got)
+	}
+
+	// The cancelation write releases: the cancelation commits the
+	// canceled state and its call answers the canceled task.
+	releaseWrite()
+	<-cancelDone
+	if cancelErr != nil || cancelTask == nil || cancelTask.Status.State != a2a.TaskStateCanceled {
+		t.Fatalf("cancel = %+v, %v, want the canceled task", cancelTask, cancelErr)
+	}
+	waitStoredState(t, store, string(task.ID), a2acore.StateCanceled)
+
+	// After the cancelation, the same message resent gets the answer
+	// the canceled state asks for: a continuation on a terminal task is
+	// refused by the SDK, and nothing of the resends was admitted.
+	res, err = c.Send(ctxT(t), in)
+	if err == nil || !errors.Is(err, a2a.ErrUnsupportedOperation) {
+		t.Fatalf("resent continuation on the canceled task = %T, %v, want the unsupported operation refusal", res, err)
+	}
+	wire = rec.wire()
+	if wire.status != http.StatusBadRequest || !strings.Contains(wire.body, `"reason":"UNSUPPORTED_OPERATION"`) {
+		t.Fatalf("resent wire = %d %s, want 400 unsupported operation", wire.status, wire.body)
+	}
+	if !strings.Contains(wire.body, "terminal state") {
+		t.Errorf("resent body lacks the terminal state cause: %s", wire.body)
+	}
+	if got := f1Count(t, path, `SELECT COUNT(*) FROM a2a_ingress WHERE message_id = ?`, "m-2"); got != 0 {
+		t.Errorf("ingress rows of the resends = %d, want 0 (nothing was admitted)", got)
 	}
 }

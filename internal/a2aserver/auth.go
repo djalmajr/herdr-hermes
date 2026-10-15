@@ -180,15 +180,20 @@ var errTaskNotVisible = fmt.Errorf("executor setup failed: failed to load exec c
 var errCancelNotVisible = fmt.Errorf("failed to cancel: cancelation failed: canceler setup failed: failed to load a task: %w", a2a.ErrTaskNotFound)
 
 // taskBusyText is the stable contention answer of a permitted send on a
-// visible task that meets another execution or write of the same task:
-// nothing was admitted, written or fenced, so the same message can be
-// sent again later.
+// visible task that meets another execution or write of the same task.
+// A conflict met before the admission leaves nothing admitted, written
+// or fenced, so the same message can be sent again; a conflict met
+// after the admission may have already stored the message and advanced
+// the fence, and the answer is the same in both cases.
 const taskBusyText = "a2a: task busy, retry later"
 
 // sdkExecutionInProgress and sdkCancelationInProgress copy the exact
 // texts of the two in-progress sentinels of the SDK internal taskexec
-// package, which is not exported and cannot be imported; the REST tests
-// break if the SDK changes either text.
+// package, which is not exported and cannot be imported; the REST test
+// of a continuation on a parked execution breaks if the SDK changes
+// sdkExecutionInProgress, and the REST test of a continuation during a
+// cancelation in progress breaks if the SDK changes
+// sdkCancelationInProgress.
 const (
 	sdkExecutionInProgress   = "task execution is already in progress"
 	sdkCancelationInProgress = "task cancelation is in progress"
