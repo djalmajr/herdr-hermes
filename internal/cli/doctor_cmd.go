@@ -100,11 +100,22 @@ func cmdDoctor(args []string, env Env) int {
 // herdr-soho base while soho is on the PATH, so deciding on the
 // effective value is the same as deciding on the stored one.
 func legacyBackendSelected(bin string) bool {
-	base := strings.TrimSuffix(filepath.Base(bin), ".exe")
-	if runtime.GOOS == "windows" {
+	return isLegacyBackendName(bin, runtime.GOOS == "windows")
+}
+
+// isLegacyBackendName is legacyBackendSelected for a given platform: on
+// Windows the .exe extension and the name are both compared without
+// case (HERDR-SOHO.EXE is the legacy binary there); on the unix
+// operating systems both are exact.
+func isLegacyBackendName(bin string, windows bool) bool {
+	base := filepath.Base(bin)
+	if windows {
+		if n := len(base) - len(".exe"); n > 0 && strings.EqualFold(base[n:], ".exe") {
+			base = base[:n]
+		}
 		return strings.EqualFold(base, "herdr-soho")
 	}
-	return base == "herdr-soho"
+	return strings.TrimSuffix(base, ".exe") == "herdr-soho"
 }
 
 // backendNowriteEnviron is the child environment of the doctor's

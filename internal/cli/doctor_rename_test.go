@@ -171,3 +171,35 @@ func TestDoctorLegacyNameWarning(t *testing.T) {
 		t.Errorf("an auto selection must not warn, stderr %q", stderr)
 	}
 }
+
+// TestLegacyBackendName: the doctor's legacy-name check strips the .exe
+// extension and compares the name without case on Windows, and is exact
+// on the unix operating systems.
+func TestLegacyBackendName(t *testing.T) {
+	cases := []struct {
+		bin     string
+		windows bool
+		want    bool
+	}{
+		{"herdr-soho", false, true},
+		{"/opt/bin/herdr-soho", false, true},
+		{"herdr-soho.exe", false, true},
+		{"HERDR-SOHO", false, false},
+		{"herdr-soho.EXE", false, false},
+		{"soho", false, false},
+		{"herdr-soho-dev", false, false},
+		{"herdr-soho", true, true},
+		{"herdr-soho.exe", true, true},
+		{"HERDR-SOHO.EXE", true, true},
+		{"herdr-soho.ExE", true, true},
+		{"Herdr-Soho", true, true},
+		{"soho.exe", true, false},
+		{".exe", true, false},
+		{"herdr-soho.exe.bak", true, false},
+	}
+	for _, c := range cases {
+		if got := isLegacyBackendName(c.bin, c.windows); got != c.want {
+			t.Errorf("isLegacyBackendName(%q, windows=%t) = %t, want %t", c.bin, c.windows, got, c.want)
+		}
+	}
+}

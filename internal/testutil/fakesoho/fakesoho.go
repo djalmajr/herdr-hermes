@@ -193,9 +193,16 @@ func warmRunOnce(exePath string) error {
 		code = exitErr.ExitCode()
 	}
 	if err != nil {
-		return fmt.Errorf("warm run %s: %v, exit %d, output %q", exePath, err, code, out.String())
+		return warmError(exePath, err, code, out.String())
 	}
 	return nil
+}
+
+// warmError is the warm-run failure: it names the copy, the exit code
+// and the combined output, and wraps the exec error so the retry's
+// busyExec check still reaches a busy-executable cause.
+func warmError(exePath string, err error, code int, out string) error {
+	return fmt.Errorf("warm run %s: %w, exit %d, output %q", exePath, err, code, out)
 }
 
 // busyExec reports whether the error is the busy-executable failure

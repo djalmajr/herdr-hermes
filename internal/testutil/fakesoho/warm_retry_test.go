@@ -105,6 +105,38 @@ func TestWarmRetryPauseFailure(t *testing.T) {
 	}
 }
 
+// TestWarmErrorKeepsTheBusyCause: the warm-run failure wraps the exec
+// error, so the default busy check recognizes a busy-executable start
+// error through it and the retry runs the warm run again; an ordinary
+// exec failure through the same wrapping is not retried.
+func TestWarmErrorKeepsTheBusyCause(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("the busy-executable error is a unix condition")
+	}
+	busy := warmError("/x", &os.PathError{Op: "fork/exec", Path: "/x", Err: syscall.ETXTBSY}, -1, "")
+	if !busyExec(busy) {
+		t.Fatalf("busyExec(%v) = false, want the wrapped ETXTBSY recognized", busy)
+	}
+	calls, pauses := 0, 0
+	run := func() error {
+		calls++
+		if calls == 1 {
+			return busy
+		}
+		return nil
+	}
+	pause := func(context.Context, time.Duration) error { pauses++; return nil }
+	if err := retryWarm(run, pause); err != nil || calls != 2 || pauses != 1 {
+		t.Fatalf("retryWarm = %v after %d calls and %d pauses, want nil after 2 calls and 1 pause", err, calls, pauses)
+	}
+	ordinary := warmError("/x", &os.PathError{Op: "fork/exec", Path: "/x", Err: syscall.ENOENT}, -1, "")
+	calls = 0
+	run = func() error { calls++; return ordinary }
+	if err := retryWarm(run, pause); err == nil || calls != 1 {
+		t.Fatalf("retryWarm = %v after %d calls, want the ordinary failure after 1 call", err, calls)
+	}
+}
+
 // TestBusyExecMatchesPlatformError: on the operating systems where the
 // busy-executable condition occurs, the default check recognizes
 // exactly the platform error, including a start error that wraps it,
