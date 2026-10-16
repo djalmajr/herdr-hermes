@@ -280,6 +280,22 @@ func TestContractDriftDetected(t *testing.T) {
 	if len(exitCodesDiff(removed)) == 0 {
 		t.Error("removed exit code was not detected as drift")
 	}
+
+	renamed := strings.Replace(original, "`SOHO_JOB_SEQ`", "`SOHO_JOB_SEQUENCE`", 1)
+	if renamed == original {
+		t.Fatal("mutation did not change the doc (anchor missing)")
+	}
+	if len(wakeEnvDiff(renamed)) == 0 {
+		t.Error("renamed wake variable was not detected as drift")
+	}
+
+	unlabeled := strings.Replace(original, wakeParagraphMark, "**Waking.**", 1)
+	if unlabeled == original {
+		t.Fatal("mutation did not change the doc (anchor missing)")
+	}
+	if len(wakeEnvDiff(unlabeled)) == 0 {
+		t.Error("missing waking paragraph was not detected as drift")
+	}
 }
 
 // TestContractDecode is lenient about unknown fields and unknown types.
@@ -350,11 +366,59 @@ func TestContractLimits(t *testing.T) {
 			t.Errorf("ValidBase(%q) = %v, want %v", base, got, ok)
 		}
 	}
+	// The legacy family is no longer in the vendored document (the
+	// current family is checked against it by TestContractWakeEnv); it
+	// stays fixed here for backends released before the rename.
 	if EnvJobID != "HERDR_SOHO_JOB_ID" || EnvJobSeq != "HERDR_SOHO_JOB_SEQ" ||
 		EnvJobEvent != "HERDR_SOHO_JOB_EVENT" || EnvJobIdempotencyKey != "HERDR_SOHO_JOB_IDEMPOTENCY_KEY" {
-		t.Error("wake hook environment names drifted")
+		t.Error("legacy wake hook environment names drifted")
 	}
 	if CapEphemeralJob != "ephemeral_job" || CapJobEvents != "job_events" {
 		t.Error("capability keys drifted")
+	}
+}
+
+// wakeParagraphMark opens the contract paragraph that names the wake hook
+// environment variables.
+const wakeParagraphMark = "**Waking (best effort).**"
+
+// wakeVariable is one backticked environment variable name, with an optional
+// "=<value>" description after it.
+var wakeVariable = regexp.MustCompile("`([A-Z][A-Z0-9_]*)(?:=[^`]*)?`")
+
+// wakeEnvDiff compares the job variables the waking paragraph names, in
+// order, with the current wake hook environment constants. A missing
+// paragraph is drift.
+func wakeEnvDiff(doc string) []string {
+	start := strings.Index(doc, wakeParagraphMark)
+	if start < 0 {
+		return []string{"waking paragraph not found"}
+	}
+	paragraph := doc[start:]
+	if end := strings.Index(paragraph, "\n\n"); end >= 0 {
+		paragraph = paragraph[:end]
+	}
+	var named []string
+	for _, m := range wakeVariable.FindAllStringSubmatch(paragraph, -1) {
+		if strings.Contains(m[1], "_JOB_") {
+			named = append(named, m[1])
+		}
+	}
+	want := []string{EnvJobIDCurrent, EnvJobSeqCurrent, EnvJobEventCurrent, EnvJobIdempotencyKeyCurrent}
+	if strings.Join(named, " ") == strings.Join(want, " ") {
+		return nil
+	}
+	return []string{fmt.Sprintf("document names %v, constants are %v", named, want)}
+}
+
+// TestContractWakeEnv checks the current wake hook environment names against
+// the waking paragraph of the vendored contract.
+func TestContractWakeEnv(t *testing.T) {
+	doc, err := os.ReadFile(findDoc(t))
+	if err != nil {
+		t.Fatalf("read contract document: %v", err)
+	}
+	if diff := wakeEnvDiff(string(doc)); len(diff) > 0 {
+		t.Errorf("wake hook environment names drift from docs/upstream/job-contract.md:\n  %s", strings.Join(diff, "\n  "))
 	}
 }

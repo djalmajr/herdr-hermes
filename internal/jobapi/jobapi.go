@@ -1,6 +1,6 @@
-// Package jobapi vendors the public surface of the herdr-soho ephemeral job
+// Package jobapi vendors the public surface of the soho ephemeral job
 // contract (docs/upstream/job-contract.md). Phase 1 duplicates the types
-// instead of importing herdr-soho; contract_test.go fails when the vendored
+// instead of importing soho; contract_test.go fails when the vendored
 // constants drift from the vendored document.
 package jobapi
 
@@ -11,7 +11,7 @@ import (
 
 // Event is one line of a job event log (jobs/<id>/events.jsonl). Decoding is
 // lenient: unknown fields are ignored and unknown types are kept, so events
-// gained by herdr-soho later still travel through the bridge.
+// gained by soho later still travel through the bridge.
 type Event struct {
 	Seq    int64          `json:"seq"`
 	TS     string         `json:"ts"`
@@ -149,7 +149,7 @@ var RefsKeys = []string{
 	"exit", "seq_ref", "path", "bytes",
 }
 
-// Exit codes of the herdr-soho job contract (docs/upstream/job-contract.md,
+// Exit codes of the soho job contract (docs/upstream/job-contract.md,
 // "### Exit codes"), in document order.
 const (
 	ExitSuccess      = 0
@@ -208,7 +208,7 @@ var (
 func ValidID(id string) bool { return IDPattern.MatchString(id) }
 
 // ValidRepo reports whether repo has the <org>/<repo> shape with each part
-// matching RepoPartPattern. The org membership in job_orgs is herdr-soho's
+// matching RepoPartPattern. The org membership in job_orgs is soho's
 // check, not a regex, and is not enforced here.
 func ValidRepo(repo string) bool {
 	org, name, ok := splitRepo(repo)
@@ -249,12 +249,11 @@ func containsDotDot(s string) bool {
 	return false
 }
 
-// Wake hook environment variable names (the contract "Waking" section).
-// These are the legacy HERDR_SOHO_JOB_* names the vendored job contract
-// defines; the renamed backend (soho) sets the SOHO_JOB_* names of the
-// current family instead. wake reads one family at a time: when any
-// current variable is present, only the current family is read; the two
-// families are never mixed.
+// Legacy wake hook environment variable names, set by the backend releases
+// before the rename (herdr-soho); the vendored job contract now names the
+// current SOHO_JOB_* family below. wake reads one family at a time: when
+// any current variable is present, only the current family is read; the
+// two families are never mixed.
 const (
 	EnvJobID             = "HERDR_SOHO_JOB_ID"
 	EnvJobSeq            = "HERDR_SOHO_JOB_SEQ"
@@ -262,8 +261,9 @@ const (
 	EnvJobIdempotencyKey = "HERDR_SOHO_JOB_IDEMPOTENCY_KEY"
 )
 
-// The current wake-hook environment family, named after the renamed
-// backend: the same four variables with the SOHO_JOB_* prefix.
+// The current wake hook environment family, the names the "Waking"
+// paragraph of the vendored job contract defines: the same four variables
+// with the SOHO_JOB_* prefix.
 const (
 	// EnvJobIDCurrent is set to the job id by the renamed backend.
 	EnvJobIDCurrent = "SOHO_JOB_ID"
@@ -276,7 +276,7 @@ const (
 	EnvJobIdempotencyKeyCurrent = "SOHO_JOB_IDEMPOTENCY_KEY"
 )
 
-// Capability keys of `herdr-soho capabilities --json`.
+// Capability keys of `soho capabilities --json`.
 const (
 	CapEphemeralJob = "ephemeral_job"
 	CapJobEvents    = "job_events"
