@@ -3,11 +3,21 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/djalmajr/nau/internal/config"
 )
+
+// exeName is the file name of an executable on the running platform:
+// on Windows the PATH lookup only finds names with a PATHEXT extension.
+func exeName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
+}
 
 // binPathDir builds a PATH directory that holds exactly the named
 // executable files (a non-runnable placeholder body is enough:
@@ -16,7 +26,7 @@ func binPathDir(t *testing.T, names ...string) string {
 	t.Helper()
 	dir := t.TempDir()
 	for _, n := range names {
-		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, exeName(n)), []byte("x"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -38,12 +48,12 @@ func TestResolveBin(t *testing.T) {
 		path   string
 		want   string
 	}{
-		{"auto: soho found", "", both, filepath.Join(both, "soho")},
-		{"auto: only the legacy is found", "", onlyLegacy, filepath.Join(onlyLegacy, "herdr-soho")},
+		{"auto: soho found", "", both, filepath.Join(both, exeName("soho"))},
+		{"auto: only the legacy is found", "", onlyLegacy, filepath.Join(onlyLegacy, exeName("herdr-soho"))},
 		{"auto: nothing found", "", empty, "soho"},
-		{"auto: only soho is found", "", onlySoho, filepath.Join(onlySoho, "soho")},
-		{"stored herdr-soho behaves as auto", "herdr-soho", both, filepath.Join(both, "soho")},
-		{"stored herdr-soho falls back to the legacy path", "herdr-soho", onlyLegacy, filepath.Join(onlyLegacy, "herdr-soho")},
+		{"auto: only soho is found", "", onlySoho, filepath.Join(onlySoho, exeName("soho"))},
+		{"stored herdr-soho behaves as auto", "herdr-soho", both, filepath.Join(both, exeName("soho"))},
+		{"stored herdr-soho falls back to the legacy path", "herdr-soho", onlyLegacy, filepath.Join(onlyLegacy, exeName("herdr-soho"))},
 		{"stored herdr-soho with nothing on PATH resolves to the new name", "herdr-soho", empty, "soho"},
 		{"explicit bare name passes through", "soho", onlyLegacy, "soho"},
 		{"explicit relative path passes through", "./custom", empty, "./custom"},
@@ -74,8 +84,8 @@ func TestLoadResolvesSohoBin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HerdrSohoBin != filepath.Join(both, "soho") {
-		t.Errorf("fresh config: HerdrSohoBin = %q, want %q", cfg.HerdrSohoBin, filepath.Join(both, "soho"))
+	if cfg.HerdrSohoBin != filepath.Join(both, exeName("soho")) {
+		t.Errorf("fresh config: HerdrSohoBin = %q, want %q", cfg.HerdrSohoBin, filepath.Join(both, exeName("soho")))
 	}
 
 	// A legacy file with the old default written by an older release.
@@ -89,8 +99,8 @@ func TestLoadResolvesSohoBin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HerdrSohoBin != filepath.Join(both, "soho") {
-		t.Errorf("legacy stored value: HerdrSohoBin = %q, want the resolved soho %q", cfg.HerdrSohoBin, filepath.Join(both, "soho"))
+	if cfg.HerdrSohoBin != filepath.Join(both, exeName("soho")) {
+		t.Errorf("legacy stored value: HerdrSohoBin = %q, want the resolved soho %q", cfg.HerdrSohoBin, filepath.Join(both, exeName("soho")))
 	}
 	// The legacy fallback: no soho on PATH, the legacy binary is used.
 	onlyLegacy := binPathDir(t, "herdr-soho")
@@ -99,8 +109,8 @@ func TestLoadResolvesSohoBin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HerdrSohoBin != filepath.Join(onlyLegacy, "herdr-soho") {
-		t.Errorf("legacy fallback: HerdrSohoBin = %q, want %q", cfg.HerdrSohoBin, filepath.Join(onlyLegacy, "herdr-soho"))
+	if cfg.HerdrSohoBin != filepath.Join(onlyLegacy, exeName("herdr-soho")) {
+		t.Errorf("legacy fallback: HerdrSohoBin = %q, want %q", cfg.HerdrSohoBin, filepath.Join(onlyLegacy, exeName("herdr-soho")))
 	}
 }
 
@@ -147,7 +157,7 @@ func TestSetStoresAutoEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HerdrSohoBin != filepath.Join(both, "soho") {
+	if cfg.HerdrSohoBin != filepath.Join(both, exeName("soho")) {
 		t.Errorf("effective after the idempotent set = %q, want the resolved soho", cfg.HerdrSohoBin)
 	}
 

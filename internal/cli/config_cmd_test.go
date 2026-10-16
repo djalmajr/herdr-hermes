@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -73,11 +75,27 @@ func TestConfigList(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("config list exit = %d", exit)
 	}
-	want := `{"config":{"machine_label":"","dispatcher_url":"set-value","herdr_soho_bin":"` + filepath.Join(sohoDir, "soho") + `","push_timeout_s":15,"herdr_bin":"herdr","route_machines":"","route_disabled":"","route_orchestrator_name":"orchestrator","route_probe_timeout_s":20}}
+	want := `{"config":{"machine_label":"","dispatcher_url":"set-value","herdr_soho_bin":"` + jsonText(filepath.Join(sohoDir, exeName("soho"))) + `","push_timeout_s":15,"herdr_bin":"herdr","route_machines":"","route_disabled":"","route_orchestrator_name":"orchestrator","route_probe_timeout_s":20}}
 `
 	if stdout != want {
 		t.Errorf("config list = %q, want %q", stdout, want)
 	}
+}
+
+// exeName is the file name of an executable on the running platform:
+// on Windows the PATH lookup only finds names with a PATHEXT extension.
+func exeName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
+}
+
+// jsonText is s as it appears inside a JSON string (a Windows path has
+// its backslashes escaped).
+func jsonText(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1])
 }
 
 // sohoPathDir builds a PATH directory that holds exactly a soho
@@ -86,7 +104,7 @@ func TestConfigList(t *testing.T) {
 func sohoPathDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "soho"), []byte("x"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, exeName("soho")), []byte("x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -102,7 +120,7 @@ func TestConfigGetSohoBinResolved(t *testing.T) {
 	dir := t.TempDir()
 	// A fresh config: get shows the resolved soho on the PATH.
 	stdout, _, exit := runCLI(t, dir, false, "config", "get", "herdr_soho_bin")
-	if exit != 0 || stdout != "{\"key\":\"herdr_soho_bin\",\"value\":\""+filepath.Join(sohoDir, "soho")+"\"}\n" {
+	if exit != 0 || stdout != "{\"key\":\"herdr_soho_bin\",\"value\":\""+jsonText(filepath.Join(sohoDir, exeName("soho")))+"\"}\n" {
 		t.Errorf("config get (fresh) = %q (exit %d), want the resolved soho", stdout, exit)
 	}
 	// Setting the empty value is auto: the file stores the empty form
@@ -119,7 +137,7 @@ func TestConfigGetSohoBinResolved(t *testing.T) {
 		t.Errorf("the file must store the empty auto form, got %q", data)
 	}
 	stdout, _, exit = runCLI(t, dir, false, "config", "get", "herdr_soho_bin")
-	if exit != 0 || stdout != "{\"key\":\"herdr_soho_bin\",\"value\":\""+filepath.Join(sohoDir, "soho")+"\"}\n" {
+	if exit != 0 || stdout != "{\"key\":\"herdr_soho_bin\",\"value\":\""+jsonText(filepath.Join(sohoDir, exeName("soho")))+"\"}\n" {
 		t.Errorf("config get after auto set = %q (exit %d), want the resolved soho", stdout, exit)
 	}
 	// Setting the legacy name is auto too (it was the old default that
