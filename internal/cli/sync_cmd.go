@@ -113,7 +113,7 @@ func runSync(ctx context.Context, env Env, jobID string, pushOnly bool) (syncRes
 	if !pushOnly {
 		caps, cerr := runner.Capabilities(ctx)
 		if cerr != nil || !caps.Has(jobapi.CapEphemeralJob) || !caps.Has(jobapi.CapJobEvents) {
-			motivo := "herdr-soho capabilities missing or unreadable"
+			motivo := "soho capabilities missing or unreadable"
 			if cerr != nil {
 				motivo = cerr.Error()
 			}

@@ -46,7 +46,7 @@ var (
 	startLine = `{"id":"J1","status":"running"}` + "\n"
 	// frictionDiag is the runner's stalled-consumer diagnostic for
 	// `job status` (the runner's grace period is 5s).
-	frictionDiag = "herdr-soho job status exited 0 but its output did not drain within 5s; output may be truncated"
+	frictionDiag = "soho job status exited 0 but its output did not drain within 5s; output may be truncated"
 )
 
 // cyclePayload returns n bytes cycling lo..lo+15 and one final newline.

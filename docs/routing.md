@@ -1,6 +1,6 @@
 # Routing
 
-`nau route` is the dispatcher-side machine choice. The job contract ([`docs/upstream/job-contract.md`](upstream/job-contract.md)) says that the dispatcher chooses the machine and runs the job subcommands on it through its own remote execution channel, and that `herdr-soho` never routes a job to another machine; `route` is the helper for that choice. It runs on the host the dispatcher uses to reach the fleet, probes the configured machines read-only, picks one and prints it. The choice is advisory: `route` never starts, moves or replays a job, and the dispatcher then runs `nau job start …` on the chosen machine through its own remote execution channel (the job forwarding is unchanged). A dispatch-only host that must never run jobs is simply not listed in the fleet.
+`nau route` is the dispatcher-side machine choice. The job contract ([`docs/upstream/job-contract.md`](upstream/job-contract.md)) says that the dispatcher chooses the machine and runs the job subcommands on it through its own remote execution channel, and that `soho` never routes a job to another machine; `route` is the helper for that choice. It runs on the host the dispatcher uses to reach the fleet, probes the configured machines read-only, picks one and prints it. The choice is advisory: `route` never starts, moves or replays a job, and the dispatcher then runs `nau job start …` on the chosen machine through its own remote execution channel (the job forwarding is unchanged). A dispatch-only host that must never run jobs is simply not listed in the fleet.
 
 ## Command
 
@@ -12,13 +12,13 @@ The keys are set with `nau config set <key> <value>`:
 
 - `route_machines` — the fleet: comma-separated machine labels in priority order (empty by default; `route` exits 2 until it is set). A label is a saved Herdr machine label (as listed by `herdr machine list`) or the reserved label `local` for the Herdr server of the host that runs `route`; the label form is `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, with no duplicates and at most 32 labels.
 - `route_disabled` — labels to exclude without editing the Herdr machine profiles (same form, empty by default).
-- `route_orchestrator_name` — the orchestrator agent base name to count (default `orchestrator`, the `herdr-soho` default `orchestrator_name`; form `^[a-z][a-z0-9_-]{0,31}$`).
+- `route_orchestrator_name` — the orchestrator agent base name to count (default `orchestrator`, the `soho` default `orchestrator_name`; form `^[a-z][a-z0-9_-]{0,31}$`).
 - `route_probe_timeout_s` — the bound of each probe, 1..120 seconds (default 20).
 - `herdr_bin` — the `herdr` executable (default `herdr`).
 
 ## Probe
 
-The probe is read-only and uses only the public Herdr CLI, as argv subprocesses with a context deadline — never a shell, and never the Herdr or `herdr-soho` state files.
+The probe is read-only and uses only the public Herdr CLI, as argv subprocesses with a context deadline — never a shell, and never the Herdr or `soho` state files.
 
 1. A label in `route_disabled` is `disabled` (`disabled_by_config`) and is not probed. A label that does not match the label form is `unsupported` (`unknown_machine`).
 2. When at least one remaining label is not `local`, `herdr machine list --json` runs once. If it fails, times out, or its output is not the expected array of `{id,label,enabled}` objects, every non-local label is `unavailable` (`catalog_unavailable`, `catalog_malformed`, or `herdr_unavailable` when the executable is missing). A label absent from the list is `unsupported` (`unknown_machine`), a label listed more than once is `unsupported` (`ambiguous_machine`), and a saved machine with `enabled: false` is `disabled` (`machine_disabled`).
@@ -31,13 +31,13 @@ The probe is read-only and uses only the public Herdr CLI, as argv subprocesses 
 - A machine's load is the number of recognized orchestrators in its agent list, whatever their `agent_status`: `idle`, `working`, `blocked`, `done` and `unknown` all count the same. Each recognized agent counts exactly once.
 - Load is therefore the number of orchestrator agents open on the machine, not the number working right now: a finished orchestrator whose pane is still open (usually `done` or `idle`) keeps counting until its agent leaves the Herdr agent list, that is until its pane or its workspace is closed. Close the workspaces of finished jobs to release their load. The set of counted statuses is not configurable.
 - A machine with four `done`, one `idle` and two `working` orchestrators has load 7; a machine with two `done` and two `working` orchestrators has load 4; `route` picks the second machine (`least_load`) although both have two working orchestrators.
-- An agent whose name does not match that rule is not counted, whatever it is doing: with the default base this covers the workers that `herdr-soho` spawns (for example `build`, `build-2`, `review-2`), unnamed agents (no `name`, or `name: null`) and every other agent. `route` recognizes orchestrators by name only; it never infers a role from a pane, its title, its command or its working directory.
+- An agent whose name does not match that rule is not counted, whatever it is doing: with the default base this covers the workers that `soho` spawns (for example `build`, `build-2`, `review-2`), unnamed agents (no `name`, or `name: null`) and every other agent. `route` recognizes orchestrators by name only; it never infers a role from a pane, its title, its command or its working directory.
 
 ## Orchestrator naming
 
-- An orchestrator is visible to `route` only through its Herdr agent name. Name it with the existing public interfaces: `herdr-soho init`, run from the orchestrator's own pane, names the calling agent after the `herdr-soho` `orchestrator_name` (`orchestrator` by default), or `<base>-<n>` such as `orchestrator-2` when that name is already taken on the same Herdr server; `herdr agent rename <target> <name>` names an agent by hand. An orchestrator started without either stays unnamed and does not count, even while it is working.
-- Workers that `herdr-soho` spawns are named after their lane or role (`build`, `review-2`, `implementer`), so they do not count as long as the base name is not one of those names; do not choose a lane or role name as the base.
-- Custom base name: when the fleet's orchestrators use another `herdr-soho` `orchestrator_name`, set `route_orchestrator_name` on the dispatcher host to the same value (`nau config set route_orchestrator_name <name>`). One base name applies to every machine in the fleet, so keep `orchestrator_name` the same on every node. With `route_orchestrator_name=<base>`, the recognized names are `<base>` and `<base>-<n>`: with `route_orchestrator_name=planner`, `planner`, `planner-1` and `planner-3` count and `orchestrator` does not.
+- An orchestrator is visible to `route` only through its Herdr agent name. Name it with the existing public interfaces: `herdr-soho init` (named `soho init` by the renamed release) run from the orchestrator's own pane names the calling agent after the backend's `orchestrator_name` (`orchestrator` by default), or `<base>-<n>` such as `orchestrator-2` when that name is already taken on the same Herdr server; `herdr agent rename <target> <name>` names an agent by hand. An orchestrator started without either stays unnamed and does not count, even while it is working.
+- Workers that `soho` spawns are named after their lane or role (`build`, `review-2`, `implementer`), so they do not count as long as the base name is not one of those names; do not choose a lane or role name as the base.
+- Custom base name: when the fleet's orchestrators use another `soho` `orchestrator_name`, set `route_orchestrator_name` on the dispatcher host to the same value (`nau config set route_orchestrator_name <name>`). One base name applies to every machine in the fleet, so keep `orchestrator_name` the same on every node. With `route_orchestrator_name=<base>`, the recognized names are `<base>` and `<base>-<n>`: with `route_orchestrator_name=planner`, `planner`, `planner-1` and `planner-3` count and `orchestrator` does not.
 - Read-only verification:
 
   ```text

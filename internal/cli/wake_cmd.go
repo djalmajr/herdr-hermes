@@ -18,8 +18,9 @@ import (
 const wakeStdinCap = jobapi.StdinCapAmend
 
 // cmdWake records one job event on stdin as a job_event outbox record and
-// attempts one bounded push. It is the `herdr-soho` wake hook (machine key
-// job_wake_cmd). It exits 0 as soon as the record is durable (or deduplicated),
+// attempts one bounded push. It is the backend wake hook (machine key
+// job_wake_cmd) of soho, whose pre-rename releases were named herdr-soho.
+// It exits 0 as soon as the record is durable (or deduplicated),
 // whatever the push result; it exits 2 only for malformed input.
 func cmdWake(args []string, env Env) int {
 	if len(args) != 0 {
@@ -44,9 +45,27 @@ func cmdWake(args []string, env Env) int {
 		fail(env, 2, "wake: reading stdin: "+err.Error())
 		return 2
 	}
-	id := env.Getenv(jobapi.EnvJobID)
+	// The backend sets the job identity in one environment family: the
+	// legacy HERDR_SOHO_JOB_* names the vendored job contract defines,
+	// or the current SOHO_JOB_* names of the renamed backend. When any
+	// of the four current variables is present and non-empty, only the
+	// current family is read (the legacy variables are ignored);
+	// otherwise only the legacy family is read. The two families are
+	// never mixed, and the error messages name the variable of the
+	// family in use.
+	current := env.Getenv(jobapi.EnvJobIDCurrent) != "" ||
+		env.Getenv(jobapi.EnvJobSeqCurrent) != "" ||
+		env.Getenv(jobapi.EnvJobEventCurrent) != "" ||
+		env.Getenv(jobapi.EnvJobIdempotencyKeyCurrent) != ""
+	var idKey, seqKey, keyKey string
+	if current {
+		idKey, seqKey, keyKey = jobapi.EnvJobIDCurrent, jobapi.EnvJobSeqCurrent, jobapi.EnvJobIdempotencyKeyCurrent
+	} else {
+		idKey, seqKey, keyKey = jobapi.EnvJobID, jobapi.EnvJobSeq, jobapi.EnvJobIdempotencyKey
+	}
+	id := env.Getenv(idKey)
 	if !jobapi.ValidID(id) {
-		fail(env, 2, "wake: "+jobapi.EnvJobID+" is missing or does not match the job id pattern")
+		fail(env, 2, "wake: "+idKey+" is missing or does not match the job id pattern")
 		return 2
 	}
 	var probe struct {
@@ -60,15 +79,15 @@ func cmdWake(args []string, env Env) int {
 		fail(env, 2, "wake: the event seq is missing or not a positive integer")
 		return 2
 	}
-	if s := env.Getenv(jobapi.EnvJobSeq); s != "" {
+	if s := env.Getenv(seqKey); s != "" {
 		if n, err := strconv.ParseInt(s, 10, 64); err != nil || n != probe.Seq {
-			fail(env, 2, "wake: "+jobapi.EnvJobSeq+" does not match the event seq")
+			fail(env, 2, "wake: "+seqKey+" does not match the event seq")
 			return 2
 		}
 	}
-	if k := env.Getenv(jobapi.EnvJobIdempotencyKey); k != "" {
+	if k := env.Getenv(keyKey); k != "" {
 		if k != id+":"+strconv.FormatInt(probe.Seq, 10) {
-			fail(env, 2, "wake: "+jobapi.EnvJobIdempotencyKey+" is not <id>:<seq> for this event")
+			fail(env, 2, "wake: "+keyKey+" is not <id>:<seq> for this event")
 			return 2
 		}
 	}

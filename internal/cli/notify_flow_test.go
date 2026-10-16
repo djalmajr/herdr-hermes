@@ -857,7 +857,7 @@ func TestNotifyFlowPluginStartup43(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("plugin startup exit = %d, stdout %q, want 0", exit, stdout)
 	}
-	if stdout != `{"status":"skipped","motivo":"herdr-soho capabilities missing or unreadable"}`+"\n" {
+	if stdout != `{"status":"skipped","motivo":"soho capabilities missing or unreadable"}`+"\n" {
 		t.Fatalf("plugin startup stdout = %q, want the unchanged skipped line", stdout)
 	}
 	if n := len(flowSendCalls(t, fakeDir)); n != 2 {

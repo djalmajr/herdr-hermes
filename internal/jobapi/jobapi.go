@@ -250,11 +250,30 @@ func containsDotDot(s string) bool {
 }
 
 // Wake hook environment variable names (the contract "Waking" section).
+// These are the legacy HERDR_SOHO_JOB_* names the vendored job contract
+// defines; the renamed backend (soho) sets the SOHO_JOB_* names of the
+// current family instead. wake reads one family at a time: when any
+// current variable is present, only the current family is read; the two
+// families are never mixed.
 const (
 	EnvJobID             = "HERDR_SOHO_JOB_ID"
 	EnvJobSeq            = "HERDR_SOHO_JOB_SEQ"
 	EnvJobEvent          = "HERDR_SOHO_JOB_EVENT"
 	EnvJobIdempotencyKey = "HERDR_SOHO_JOB_IDEMPOTENCY_KEY"
+)
+
+// The current wake-hook environment family, named after the renamed
+// backend: the same four variables with the SOHO_JOB_* prefix.
+const (
+	// EnvJobIDCurrent is set to the job id by the renamed backend.
+	EnvJobIDCurrent = "SOHO_JOB_ID"
+	// EnvJobSeqCurrent is set to the event seq as a decimal string.
+	EnvJobSeqCurrent = "SOHO_JOB_SEQ"
+	// EnvJobEventCurrent is set to the full event JSON.
+	EnvJobEventCurrent = "SOHO_JOB_EVENT"
+	// EnvJobIdempotencyKeyCurrent is set to the event idempotency key
+	// (<id>:<seq>), the key the outbox deduplicates on.
+	EnvJobIdempotencyKeyCurrent = "SOHO_JOB_IDEMPOTENCY_KEY"
 )
 
 // Capability keys of `herdr-soho capabilities --json`.

@@ -26,9 +26,9 @@ const sendMaxMessage = 2048
 // for classification; the rest is dropped.
 const sendCaptureLimit = 4096
 
-// NotifySender delivers notification messages with `herdr-soho send`.
+// NotifySender delivers notification messages with `soho send`.
 // The child never receives the process's HERDR_PANE_ID: the
-// notification is sent by Nau itself, not by a pane, so herdr-soho
+// notification is sent by Nau itself, not by a pane, so soho
 // must not attribute the message to the pane that fired the hook or
 // that runs the serve, and must not refuse it as a worker report when
 // that pane is a worker. Every other variable of Environ is forwarded
@@ -39,14 +39,14 @@ type NotifySender struct {
 	Timeout time.Duration // passed as --timeout <ms>; 0 means 5s
 	// Bound is the process bound handed to Runner.Run; 0 means Timeout
 	// plus sendGrace. A send to a busy target can take longer than its
-	// --timeout while herdr-soho observes the receipt, so a caller with
+	// --timeout while soho observes the receipt, so a caller with
 	// a larger budget passes it here instead of killing the send in
 	// flight.
 	Bound time.Duration
 }
 
 // Send implements notify.Sender. It refuses to run the command for an
-// invalid ref or message; otherwise it runs `herdr-soho send <ref>
+// invalid ref or message; otherwise it runs `soho send <ref>
 // <message> --now --timeout <ms>` as an argv subprocess on a fresh
 // Runner (the runner is not safe for concurrent use, and Send is)
 // with a copy of Environ without the HERDR_PANE_ID entry — the child
@@ -144,9 +144,9 @@ func statusWord(data []byte) string {
 	}
 }
 
-// paneIDKey is the environment variable herdr-soho uses to identify
+// paneIDKey is the environment variable the backend uses to identify
 // the sending pane. A notification is sent by Nau, not by a pane, so
-// the send child never receives it: herdr-soho must not attribute the
+// the send child never receives it: the backend must not attribute the
 // message to the pane that fired the hook or that runs the serve, and
 // must not refuse it as a worker report when that pane is a worker.
 const paneIDKey = "HERDR_PANE_ID"

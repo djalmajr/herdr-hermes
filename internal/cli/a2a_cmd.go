@@ -63,7 +63,7 @@ var (
 	a2aServeContext = func() (context.Context, context.CancelFunc) {
 		return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	}
-	// newA2aNoticeSender builds the herdr-soho notice sender of the
+	// newA2aNoticeSender builds the soho notice sender of the
 	// delivery loop; the tests replace it with an in-memory fake.
 	newA2aNoticeSender = func(bin string, environ []string) notify.Sender {
 		return soho.NotifySender{Bin: bin, Environ: environ}

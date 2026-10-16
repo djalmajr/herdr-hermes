@@ -5,7 +5,7 @@
 ## What it records
 
 - Active jobs per node: the owner agent, the card, the workspace, the phase (the type of the latest job event), the idle time, and whether the job waits for a person.
-- Nodes: online, the Herdr version, the `herdr-soho` version and the runners that work there (when reported), and a maintenance flag.
+- Nodes: online, the Herdr version, the `soho` version and the runners that work there (when reported), and a maintenance flag.
 - Panes waiting for a person: the panes Herdr reports as `blocked` (trust, permission and question dialogs) and the jobs whose latest event is a `question` or a `blocked`.
 - Branches and pull requests in use per job, so a new job never overlaps them.
 - Folders retained on a node, awaiting a person's decision: path, size and request. A record is never a permission to delete; the registry removes only the ended rows past the retention.
@@ -18,7 +18,7 @@ The registry infers nothing that no producer reports; an unknown value is `null`
 
 - **Bridge push.** `serve` accepts the push request of [`protocol.md`](protocol.md) ("Push") unchanged: `POST /v1/ingest` with one outbox record as the body. A node bridge pushes to it when its `dispatcher_url` is set to `http://<serve address>/v1/ingest`. Job events, dispatch, amend, session and decision records are projected into the current state (see "Projection"). The `Authorization` header is neither checked nor stored: authentication of the push is outside this release, which is why `serve` binds a loopback address only.
 - **Herdr inventory poll.** Every `--poll-interval` seconds `serve` runs, for each machine of `--machines` (default: the `route_machines` configuration), the read-only public Herdr CLI: `herdr [--machine <label>] workspace list`, `agent list` and `status server`, as argv subprocesses with a 20-second deadline each. It keeps only the workspace ids, labels and agent statuses, and the pane ids, workspace ids, agent names and statuses of the agent list: never working directories, titles or terminal content. The stored strings are bounded: a workspace id or label and a pane's workspace id at most 1024 bytes, a pane id or agent name at most 256 bytes; a longer value, or one that is not valid UTF-8, is cut to the bound with as much of its prefix as fits plus the marker `[truncated:<digest>]`, the 64 lower-case hex digits of the SHA-256 of the original bytes, so two values that share a prefix still differ. The classification runs on the bounded values: a truncated name never resolves to an owner, a type or a ref, a truncated `job-<id>` label never names a job id, and a truncated `hm-` label is still an `hm-*` workspace keyed by its bounded id with a `null` owner; nothing is ever forged. A `workspace list` or `agent list` answer that is not valid UTF-8 anywhere in its raw bytes is a malformed answer: the whole poll of that machine fails with `probe_malformed` and nothing of that answer is stored; an escaped unpaired surrogate such as `\ud800` is valid JSON and is decoded to U+FFFD, not refused.
-- **Operators and agents** report what no other producer can: holds and priorities (`jobs policy`), retained folders (`jobs folder`), and the node maintenance flag, `herdr-soho` version and runners (`jobs node set`).
+- **Operators and agents** report what no other producer can: holds and priorities (`jobs policy`), retained folders (`jobs folder`), and the node maintenance flag, `soho` version and runners (`jobs node set`).
 
 ## Ownership from the workspace name
 
@@ -99,5 +99,5 @@ The database is SQLite in WAL mode (a pure Go driver, no C toolchain), created w
 
 - This release binds loopback only and does not authenticate the push or the API; a central deployment on a private network needs that first and is not part of it.
 - The poll sees only what the public Herdr CLI reports: a worker that is stuck without being `blocked` is not detected, and the idle time is bounded by the poll interval.
-- The `herdr-soho` version and the runners of a node are known only when reported with `jobs node set`.
+- The `soho` version and the runners of a node are known only when reported with `jobs node set`.
 - The check prevents overlaps among agents that run it; it cannot stop work started without it.

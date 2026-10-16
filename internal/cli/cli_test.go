@@ -167,10 +167,14 @@ func TestNowrite(t *testing.T) {
 		}
 		assertDirEmpty(t, dir)
 	}
-	// config list under NOWRITE: defaults, nothing written.
+	// config list under NOWRITE: defaults, nothing written. The
+	// herdr_soho_bin value is the resolved effective one; the PATH is
+	// controlled so the resolution is deterministic.
 	dir := t.TempDir()
+	sohoDir := sohoPathDir(t)
+	t.Setenv("PATH", sohoDir)
 	stdout, _, exit := runCLI(t, dir, true, "config", "list")
-	if exit != 0 || !strings.Contains(stdout, `"herdr_soho_bin":"herdr-soho"`) || !strings.Contains(stdout, `"push_timeout_s":15`) {
+	if exit != 0 || !strings.Contains(stdout, `"herdr_soho_bin":"`+jsonText(filepath.Join(sohoDir, exeName("soho")))+`"`) || !strings.Contains(stdout, `"push_timeout_s":15`) {
 		t.Errorf("config list under NOWRITE: exit %d, stdout %q", exit, stdout)
 	}
 	assertDirEmpty(t, dir)

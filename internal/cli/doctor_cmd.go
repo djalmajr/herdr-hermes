@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -33,8 +35,11 @@ type doctorSoho struct {
 
 // cmdDoctor implements `doctor`: a read-only JSON line with the bridge
 // prerequisites. It works under HERDR_HERMES_NOWRITE=1 and creates no
-// files. It exits 43 when herdr-soho is missing or lacks either
-// capability, else 0.
+// files. It exits 43 when the backend is missing or lacks either
+// capability, else 0. When the selected backend binary still carries
+// the legacy herdr-soho name while the renamed soho binary is on the
+// machine's PATH, it adds one documented warning to stderr; the JSON
+// line and the exit code are unchanged by the warning.
 func cmdDoctor(args []string, env Env) int {
 	if len(args) != 0 {
 		badUsage(env, "usage: doctor")
@@ -75,11 +80,78 @@ func cmdDoctor(args []string, env Env) int {
 		Outbox:        doctorOutboxCounts(env),
 	}
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(line))
+	if _, lerr := exec.LookPath("soho"); legacyBackendSelected(cfg.HerdrSohoBin) && lerr == nil {
+		_, _ = fmt.Fprintf(env.Stderr, "%s: doctor: herdr_soho_bin points to the legacy herdr-soho binary while soho is on the PATH; '%s config set herdr_soho_bin soho' switches to soho\n",
+			env.program(), env.program())
+	}
 	if !so.EphemeralJob || !so.JobEvents {
-		_, _ = fmt.Fprintf(env.Stderr, "%s: herdr-soho capabilities missing\n", env.program())
+		_, _ = fmt.Fprintf(env.Stderr, "%s: soho capabilities missing\n", env.program())
 		return 43
 	}
 	return 0
+}
+
+// legacyBackendSelected reports whether the effective backend binary
+// carries the legacy herdr-soho name: the base name herdr-soho without
+// the windows extension, case-insensitively on Windows and exactly on
+// the unix operating systems. For a stored value that is not auto the
+// effective value is the stored one (the resolution passes explicit
+// selections through), and an auto stored value never resolves to a
+// herdr-soho base while soho is on the PATH, so deciding on the
+// effective value is the same as deciding on the stored one.
+func legacyBackendSelected(bin string) bool {
+	return isLegacyBackendName(bin, runtime.GOOS == "windows")
+}
+
+// isLegacyBackendName is legacyBackendSelected for a given platform: on
+// Windows the .exe extension and the name are both compared without
+// case (HERDR-SOHO.EXE is the legacy binary there); on the unix
+// operating systems both are exact.
+func isLegacyBackendName(bin string, windows bool) bool {
+	base := filepath.Base(bin)
+	if windows {
+		if n := len(base) - len(".exe"); n > 0 && strings.EqualFold(base[n:], ".exe") {
+			base = base[:n]
+		}
+		return strings.EqualFold(base, "herdr-soho")
+	}
+	return strings.TrimSuffix(base, ".exe") == "herdr-soho"
+}
+
+// backendNowriteEnviron is the child environment of the doctor's
+// `config` call: the parent environment minus the inherited values of
+// the two backend read-only flags (SOHO_NOWRITE and
+// HERDR_SOHO_NOWRITE, whatever their values), plus exactly one
+// SOHO_NOWRITE=1 and one HERDR_SOHO_NOWRITE=1: the renamed backend
+// reads the new flag and the legacy binary still running on the nodes
+// reads the old one, so the read-only guarantee holds on both. The key
+// comparison is exact on the unix operating systems and
+// case-insensitive on Windows, the same pattern as keyIsPaneID in
+// internal/soho.
+func backendNowriteEnviron(env Env) []string {
+	environ := childEnviron(env)
+	kept := make([]string, 0, len(environ)+2)
+	for _, kv := range environ {
+		if keyIsNowrite(kv) {
+			continue
+		}
+		kept = append(kept, kv)
+	}
+	return append(kept, "SOHO_NOWRITE=1", "HERDR_SOHO_NOWRITE=1")
+}
+
+// keyIsNowrite reports whether the environment entry kv has the key
+// SOHO_NOWRITE or HERDR_SOHO_NOWRITE: exact on the unix operating
+// systems, case-insensitive on Windows.
+func keyIsNowrite(kv string) bool {
+	key := kv
+	if i := strings.IndexByte(kv, '='); i >= 0 {
+		key = kv[:i]
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(key, "SOHO_NOWRITE") || strings.EqualFold(key, "HERDR_SOHO_NOWRITE")
+	}
+	return key == "SOHO_NOWRITE" || key == "HERDR_SOHO_NOWRITE"
 }
 
 // doctorOutboxCounts reads the outbox counts without creating any file.
@@ -106,23 +178,15 @@ func doctorOutboxCounts(env Env) doctorOutbox {
 	return doctorOutbox{UltimoSeq: last, EntregueSeq: delivered, Pendentes: pending}
 }
 
-// wakeHookConfigured runs `herdr-soho config` with HERDR_SOHO_NOWRITE=1 in
-// the child environment and classifies the job_wake_cmd value: "true"
+// wakeHookConfigured runs `soho config` with SOHO_NOWRITE=1 and
+// HERDR_SOHO_NOWRITE=1 in the child environment (see
+// backendNowriteEnviron) and classifies the job_wake_cmd value: "true"
 // when the trimmed value's first field is exactly "nau" and its second
 // field is exactly "wake", "false" when the output is parseable but
-// shows no such hook, "unknown" on a non-zero exit or unparseable output.
+// shows no such hook, "unknown" on a non-zero exit or unparseable
+// output.
 func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string {
-	environ := childEnviron(env)
-	// The child gets HERDR_SOHO_NOWRITE=1; any inherited value is replaced
-	// so the read-only flag is guaranteed.
-	filtered := environ[:0]
-	for _, kv := range environ {
-		if !strings.HasPrefix(kv, "HERDR_SOHO_NOWRITE=") {
-			filtered = append(filtered, kv)
-		}
-	}
-	filtered = append(filtered, "HERDR_SOHO_NOWRITE=1")
-	wakeRunner := soho.Runner{Bin: runner.Bin, Environ: filtered, Now: runner.Now}
+	wakeRunner := soho.Runner{Bin: runner.Bin, Environ: backendNowriteEnviron(env), Now: runner.Now}
 	var out bytes.Buffer
 	exit, err := wakeRunner.Run(ctx, []string{"config"}, nil, &out, io.Discard, 120*time.Second)
 	if err != nil {
@@ -141,7 +205,7 @@ func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string
 	return parseWakeHook(out.String())
 }
 
-// parseWakeHook classifies the `herdr-soho config` output. A line whose
+// parseWakeHook classifies the `soho config` output. A line whose
 // first whitespace-separated field is job_wake_cmd decides the result:
 // true when the trimmed value's first field is exactly nau and its second
 // field is exactly wake; fields after the second, extra whitespace and the

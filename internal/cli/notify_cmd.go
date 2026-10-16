@@ -3,7 +3,7 @@ package cli
 // The notify command (slice 5): the registration subcommands, the
 // read-only list and status, the deliver/ingest/raise/ack writing
 // subcommands and runNotify — the one place that composes the notify
-// package with the herdr-soho send sender. The one-shot wake, sync and
+// package with the soho send sender. The one-shot wake, sync and
 // plugin hooks call runNotify between their existing steps; their
 // output lines and exit codes are unchanged.
 
@@ -28,7 +28,7 @@ import (
 // bound the contract gives the `job amend` body.
 const notifyStdinCap = jobapi.StdinCapAmend
 
-// notifySendTimeout is the per-send herdr-soho timeout of runNotify.
+// notifySendTimeout is the per-send soho timeout of runNotify.
 const notifySendTimeout = 5 * time.Second
 
 // notifySendMin is the floor of the per-send timeout clipped to the
@@ -38,7 +38,7 @@ const notifySendMin = time.Second
 // notifyHookBound bounds the delivery run of the one-shot paths (wake, the
 // plugin event hooks, ingest, raise, retry). The notification is durable
 // before any send; the bound only limits how long the hook waits for the
-// endpoints. herdr-soho send to a busy recipient answers "queued" only
+// endpoints. soho send to a busy recipient answers "queued" only
 // after observing the receipt, measured at about 15 s, so a shorter bound
 // would kill such sends in flight and leave them uncertain.
 const notifyHookBound = 20 * time.Second
@@ -124,7 +124,7 @@ func runNotify(ctx context.Context, env Env, cfg config.Config, bound time.Durat
 	}
 	dctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
-	// The send process may use the whole remaining budget: herdr-soho can
+	// The send process may use the whole remaining budget: soho can
 	// take longer than its --timeout to observe the receipt on a busy
 	// target, and a send killed in flight is uncertain (never resent).
 	sendBound := bound - time.Since(start)

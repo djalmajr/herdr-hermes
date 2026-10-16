@@ -1,5 +1,6 @@
 .agents/
 .herdr-soho/
+.soho/
 .worktrees/
 coverage/
 *.log

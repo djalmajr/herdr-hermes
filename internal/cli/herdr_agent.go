@@ -7,7 +7,7 @@ package cli
 // process, never a shell; on the bound the child's whole process tree is
 // terminated (the graceful step on the cancel and the force after the
 // wait), and a child that exits on its own leaves its descendants
-// untouched — the same proctree wiring as the herdr-soho runner. The
+// untouched — the same proctree wiring as the backend runner. The
 // parser of the one JSON line the binary prints is pure and is tested
 // without a subprocess.
 

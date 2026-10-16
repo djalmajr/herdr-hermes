@@ -57,7 +57,7 @@ A repeated event is a duplicate. Each true open or close gets the next per-works
 
 ## Not derived
 
-The following are never inferred from any source. Each would need a new producer in `herdr-soho` (upstream of this bridge) and is out of scope:
+The following are never inferred from any source. Each would need a new producer in `soho` (upstream of this bridge) and is out of scope:
 
 - Execution start — never inferred from `accepted` or `preparing`: they mean the job was validated and preparation began, not that the work started.
 - Implementation done — never inferred from `worker_done`, `checkpoint`, a report landing or an agent `done`: a worker finishing a turn or a report arriving is not the job's acceptance.
@@ -74,8 +74,8 @@ Each source is listed with the strongest evidence it has; fixture evidence and l
 
 | source | how it was verified |
 |---|---|
-| Job contract events | Adapter tested with fixture events that follow the vendored job contract. The reference node's `herdr-soho` has no `job` command (no `ephemeral_job` or `job_events` capability), so no live job event exists there; fixture events were also fed to `wake` on a live node and delivered through the real `herdr-soho send` transport to stand-in recipient agents — a fixture source with a real transport, not a live producer. |
-| Herdr agent status, socket subscription | Captured live: the socket subscription line `{"event":"pane.agent_status_changed","data":{"agent_status":…,"pane_id":…,"workspace_id":…,"agent":…}}` of a real agent, including real `blocked` (approval and trust dialogs), `working`, `done` and `idle` transitions, was ingested unchanged by `notify ingest agent-status` and delivered through `herdr-soho send` to stand-in recipient agents in the same workspace. The recipients were stand-ins, not real project owners or coordinators. |
+| Job contract events | Adapter tested with fixture events that follow the vendored job contract. The reference node's backend (`herdr-soho` under its pre-rename release) has no `job` command (no `ephemeral_job` or `job_events` capability), so no live job event exists there; fixture events were also fed to `wake` on a live node and delivered through the real `soho send` transport to stand-in recipient agents — a fixture source with a real transport, not a live producer. |
+| Herdr agent status, socket subscription | Captured live: the socket subscription line `{"event":"pane.agent_status_changed","data":{"agent_status":…,"pane_id":…,"workspace_id":…,"agent":…}}` of a real agent, including real `blocked` (approval and trust dialogs), `working`, `done` and `idle` transitions, was ingested unchanged by `notify ingest agent-status` and delivered through `soho send` to stand-in recipient agents in the same workspace. The recipients were stand-ins, not real project owners or coordinators. |
 | Herdr agent status, plugin hook | Unverified: the `HERDR_PLUGIN_EVENT_JSON` payload of plugin hooks is not documented by Herdr and no plugin was installed to observe it. The parser accepts the socket subscription line, the event-stream form `pane_agent_status_changed` and the flat data object. |
 | Herdr workspace events, socket and plugin hook | Unverified live: capturing them needs a workspace to be opened and closed, outside the single workspace the verification ran in. The shapes come from the bundled Herdr API schema (`workspace_created` carries the workspace info; `workspace_closed` carries the workspace id and possibly `workspace: null`); the adapter is tested with fixtures of those shapes and of the existing plugin payload shapes. |
 | Raises | Local command, tested end to end. |
