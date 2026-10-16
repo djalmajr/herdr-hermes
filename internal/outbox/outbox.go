@@ -419,6 +419,78 @@ func (s *Store) JobEventCursor(jobID string) (prefix, maxStored int64, err error
 	return contiguousPrefix(present), maxStoredSeq(present), nil
 }
 
+// JobEventTail reports the close-tail evidence of the job's stored job
+// events without writing anything: hasTail is true when one of the job's
+// stored tail-type records carries an event seq greater than the highest
+// event seq of the job's stored terminal records (or when the job has no
+// terminal record at all, so any tail-type record closes the job). The
+// comparison uses the event seq read from the record idempotency keys —
+// the same field JobEventCursor uses — never the file position: the
+// outbox accepts out-of-order events (wake appends the latest event at
+// once and the sync backfills the gaps after). Records whose dados is
+// not a JSON object with a tipo are skipped. It reuses the jobEventsLocked
+// scan convention; a read-only store reads without the lock, like
+// LoadJobs.
+func (s *Store) JobEventTail(jobID, terminal string, tailTypes []string) (bool, error) {
+	if !s.readOnly {
+		l, err := s.lock()
+		if err != nil {
+			return false, err
+		}
+		defer l.unlock()
+	}
+	return s.jobEventTailLocked(jobID, terminal, tailTypes)
+}
+
+// jobEventTailLocked scans outbox.jsonl once and reports the close-tail
+// evidence of the job's stored job events: a tail-type record closes the
+// job only when its event seq (the key part after <job_id>:) is greater
+// than the highest event seq of the job's stored terminal records, or
+// when the job has no terminal record at all. The event seq, not the
+// file position, decides the relation between the terminal and the tail.
+// The caller holds the lock.
+func (s *Store) jobEventTailLocked(jobID, terminal string, tailTypes []string) (bool, error) {
+	data, err := s.readOutbox()
+	if err != nil {
+		return false, err
+	}
+	tail := make(map[string]bool, len(tailTypes))
+	for _, t := range tailTypes {
+		tail[t] = true
+	}
+	prefix := jobID + ":"
+	var maxTerminal, maxTail int64
+	for _, line := range completeLines(data) {
+		var r Record
+		if err := json.Unmarshal(line, &r); err != nil {
+			continue
+		}
+		if r.Tipo != TipoJobEvent || r.JobID == nil || *r.JobID != jobID {
+			continue
+		}
+		if !strings.HasPrefix(r.IdempotencyKey, prefix) {
+			continue
+		}
+		seq, err := strconv.ParseInt(strings.TrimPrefix(r.IdempotencyKey, prefix), 10, 64)
+		if err != nil || seq <= 0 {
+			continue
+		}
+		var ev struct {
+			Tipo string `json:"tipo"`
+		}
+		if err := json.Unmarshal(r.Dados, &ev); err != nil {
+			continue
+		}
+		if ev.Tipo == terminal && seq > maxTerminal {
+			maxTerminal = seq
+		}
+		if tail[ev.Tipo] && seq > maxTail {
+			maxTail = seq
+		}
+	}
+	return maxTail > 0 && (maxTerminal == 0 || maxTail > maxTerminal), nil
+}
+
 // syncCursorLocked tracks the job in jobs.json when unknown, sets its
 // last_event_seq to the contiguous stored prefix, and writes jobs.json
 // when the value or the job entry changed. The caller holds the lock.
@@ -676,7 +748,14 @@ type Job struct {
 	Estado       string `json:"estado"`
 	CreatedAt    string `json:"created_at"`
 	UpdatedAt    string `json:"updated_at"`
-	Closed       bool   `json:"closed"`
+	// TerminalSeenAt is the instant (TSLayout) the sync anchored the
+	// post-terminal grace with the clock of the update that made the job
+	// terminal (or rewrote an invalid stored value); the grace counts
+	// from this value alone, never from the ts of a stored terminal
+	// record. It is cleared when the job stops being terminal and is
+	// empty while the job is not terminal.
+	TerminalSeenAt string `json:"terminal_seen_at,omitempty"`
+	Closed         bool   `json:"closed"`
 }
 
 // Jobs is the jobs.json content.

@@ -339,6 +339,84 @@ func TestWakePushOutcome(t *testing.T) {
 	}
 }
 
+// TestWakeBlockedWarningNotification: a synthetic blocked_warning event on
+// the wake hook projects one pending notification (class blocked_warning)
+// for the registered owner and orchestrator; the transient send failure
+// keeps both deliveries pending, and the rendered message the fake
+// herdr-soho receives carries event=blocked_warning, never event=?.
+func TestWakeBlockedWarningNotification(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t, sendRule(17, 0))
+	dir := t.TempDir()
+	setSohoConfig(t, dir, exe, "m1")
+	seedJob(t, dir, "job-1", "example-org/example-repo", 0, "running")
+	for _, args := range [][]string{
+		{"notify", "register", "owner", "--projeto", "example-org/example-repo", "--to", "local/w1:p1"},
+		{"notify", "register", "orchestrator", "--job", "job-1", "--to", "agent-1"},
+		{"notify", "register", "coordinator", "--to", "local/w1:p9"},
+	} {
+		stdout, stderr, exit := runCLIStdin(t, dir, "", map[string]string{}, args...)
+		if exit != 0 {
+			t.Fatalf("%v: exit = %d, stderr %q", args, exit, stderr)
+		}
+		_ = stdout
+	}
+	stdin := `{"seq":4,"ts":"2026-01-01T12:00:00-03:00","tipo":"blocked_warning","resumo":"80% of the blocked ceiling used"}`
+	vars := map[string]string{
+		jobapi.EnvJobID:             "job-1",
+		jobapi.EnvJobSeq:            "4",
+		jobapi.EnvJobIdempotencyKey: "job-1:4",
+	}
+	stdout, stderr, exit := runCLIStdin(t, dir, stdin, vars, "wake")
+	if exit != 0 {
+		t.Fatalf("wake exit = %d, stderr %q", exit, stderr)
+	}
+	if !strings.Contains(stdout, `"duplicado":false`) {
+		t.Fatalf("wake stdout = %q, want the event appended", stdout)
+	}
+	// The event is recorded and projects one pending notification.
+	lines := outboxLines(t, dir)
+	if len(lines) != 1 || !strings.Contains(lines[0], `"tipo":"job_event"`) {
+		t.Fatalf("outbox lines = %v", lines)
+	}
+	led := readLedger(t, dir)
+	if len(led.Notifications) != 1 {
+		t.Fatalf("ledger notifications = %d, want 1", len(led.Notifications))
+	}
+	n := led.Notifications[0]
+	if n.Class != "blocked_warning" || n.EventTipo != "blocked_warning" {
+		t.Errorf("notification = class %q tipo %q, want blocked_warning", n.Class, n.EventTipo)
+	}
+	if len(n.Deliveries) != 2 {
+		t.Fatalf("deliveries = %d, want 2 (owner, orchestrator): %+v", len(n.Deliveries), n.Deliveries)
+	}
+	for i, d := range n.Deliveries {
+		if d.State != "pending" {
+			t.Errorf("delivery %d state = %q, want pending", i, d.State)
+		}
+	}
+	// The list counts the pending notification.
+	stdout, stderr, exit = runCLIStdin(t, dir, "", map[string]string{}, "notify", "list")
+	if exit != 0 {
+		t.Fatalf("notify list exit = %d, stderr %q", exit, stderr)
+	}
+	if !strings.Contains(stdout, `"notifications":1`) || !strings.Contains(stdout, `"pending":2`) {
+		t.Fatalf("notify list = %q, want 1 notification with 2 pending deliveries", stdout)
+	}
+	// The rendered message the fake received carries the event tipo.
+	sends := flowSendCalls(t, fakeDir)
+	if len(sends) != 2 {
+		t.Fatalf("send calls = %d, want 2 (owner, orchestrator): %v", len(sends), sends)
+	}
+	for i, s := range sends {
+		if len(s) < 3 {
+			t.Fatalf("send argv %d = %v", i, s)
+		}
+		if !strings.Contains(s[2], "event=blocked_warning") || strings.Contains(s[2], "event=?") {
+			t.Errorf("send %d message lacks event=blocked_warning: %q", i, s[2])
+		}
+	}
+}
+
 func TestWakeNowrite(t *testing.T) {
 	dir := t.TempDir()
 	setConfig(t, dir, map[string]string{"machine_label": "m1"})

@@ -16,6 +16,11 @@ import (
 	"github.com/djalmajr/nau/internal/jobapi"
 )
 
+// ClassBlockedWarning is the class of the blocked_warning contract event:
+// 80% of the job's blocked ceiling used. Like timeout_warning it has no
+// escalation, so the recipients are the owner and the orchestrator only.
+const ClassBlockedWarning = "blocked_warning"
+
 // ProjectJobEvent projects one stored job_event. ok=false (and a nil
 // notification) when the event tipo is not notifiable; err != nil when the
 // event is not a JSON object, has no positive integer seq or an empty tipo,
@@ -102,6 +107,8 @@ func classifyJobEvent(ev jobapi.Event) (class string, escs []string, exit *int, 
 		}
 	case jobapi.TypeTimeoutWarning:
 		return ClassTimeoutWarning, nil, nil, true
+	case jobapi.TypeBlockedWarning:
+		return ClassBlockedWarning, nil, nil, true
 	case jobapi.TypeReviewVerdict:
 		return ClassReviewVerdict, nil, nil, true
 	case jobapi.TypePrOpened:

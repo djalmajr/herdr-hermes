@@ -35,35 +35,42 @@ func DecodeEvent(data []byte) (Event, error) {
 
 // Event types, in the order the contract document lists them.
 const (
-	TypeAccepted       = "accepted"
-	TypePreparing      = "preparing"
-	TypeWorkerSpawned  = "worker_spawned"
-	TypeWorkerDone     = "worker_done"
-	TypeCommit         = "commit"
-	TypePush           = "push"
-	TypePrOpened       = "pr_opened"
-	TypeCheckpoint     = "checkpoint"
-	TypeReviewVerdict  = "review_verdict"
-	TypeQuestion       = "question"
-	TypeBlocked        = "blocked"
-	TypeUnblocked      = "unblocked"
-	TypeAmendReceived  = "amend_received"
-	TypeDecision       = "decision"
-	TypeDecisionAcked  = "decision_acked"
-	TypeTimeoutWarning = "timeout_warning"
-	TypeFailure        = "failure"
-	TypeNote           = "note"
-	TypeTerminal       = "terminal"
-	TypeCleanup        = "cleanup"
+	TypeAccepted          = "accepted"
+	TypePreparing         = "preparing"
+	TypeWorkerSpawned     = "worker_spawned"
+	TypeWorkerDone        = "worker_done"
+	TypeCommit            = "commit"
+	TypePush              = "push"
+	TypePrOpened          = "pr_opened"
+	TypeCheckpoint        = "checkpoint"
+	TypeReviewVerdict     = "review_verdict"
+	TypeQuestion          = "question"
+	TypeBlocked           = "blocked"
+	TypeUnblocked         = "unblocked"
+	TypeAmendReceived     = "amend_received"
+	TypeDeliveryUncertain = "delivery_uncertain"
+	TypeControlHeld       = "control_held"
+	TypeDecision          = "decision"
+	TypeDecisionAcked     = "decision_acked"
+	TypeTimeoutWarning    = "timeout_warning"
+	TypeBlockedWarning    = "blocked_warning"
+	TypeFailure           = "failure"
+	TypeNote              = "note"
+	TypeTerminal          = "terminal"
+	TypeCleanup           = "cleanup"
+	TypeNeedsAttention    = "needs_attention"
+	TypeWorkspaceClosed   = "workspace_closed"
+	TypeFolderRetained    = "folder_retained"
 )
 
-// EventTypes lists the 20 contract event types in document order.
+// EventTypes lists the 26 contract event types in document order.
 var EventTypes = []string{
 	TypeAccepted, TypePreparing, TypeWorkerSpawned, TypeWorkerDone, TypeCommit,
 	TypePush, TypePrOpened, TypeCheckpoint, TypeReviewVerdict, TypeQuestion,
-	TypeBlocked, TypeUnblocked, TypeAmendReceived, TypeDecision,
-	TypeDecisionAcked, TypeTimeoutWarning, TypeFailure, TypeNote, TypeTerminal,
-	TypeCleanup,
+	TypeBlocked, TypeUnblocked, TypeAmendReceived, TypeDeliveryUncertain,
+	TypeControlHeld, TypeDecision, TypeDecisionAcked, TypeTimeoutWarning,
+	TypeBlockedWarning, TypeFailure, TypeNote, TypeTerminal, TypeCleanup,
+	TypeNeedsAttention, TypeWorkspaceClosed, TypeFolderRetained,
 }
 
 // WakeMode says whether an event wakes the dispatcher.
@@ -85,7 +92,8 @@ func WakesDispatcher(tipo string) WakeMode {
 	case TypePush:
 		return WakeOnFailure
 	case TypePrOpened, TypeReviewVerdict, TypeQuestion, TypeBlocked,
-		TypeDecision, TypeTimeoutWarning, TypeFailure, TypeTerminal:
+		TypeDecision, TypeTimeoutWarning, TypeBlockedWarning, TypeFailure,
+		TypeTerminal, TypeNeedsAttention:
 		return WakeYes
 	default:
 		return WakeNo
@@ -138,7 +146,7 @@ func IsTerminalState(state string) bool {
 // RefsKeys are the known keys of an event refs object.
 var RefsKeys = []string{
 	"agente", "papel", "pane", "sha", "pr", "report", "brief", "motivo",
-	"exit", "seq_ref",
+	"exit", "seq_ref", "path", "bytes",
 }
 
 // Exit codes of the herdr-soho job contract (docs/upstream/job-contract.md,

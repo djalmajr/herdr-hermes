@@ -158,12 +158,15 @@ func TestSyncAppendsNewEvents(t *testing.T) {
 	}
 }
 
-// TestSyncTrailerTerminalSkipped: a trailer that reaches a terminal state
-// marks the job so the next sync skips it (no events call for it).
-func TestSyncTrailerTerminalSkipped(t *testing.T) {
+// TestSyncTrailerTerminalSyncedWithinGrace: a trailer that reaches a
+// terminal state marks the job; the next sync keeps querying it within
+// the post-terminal grace (no new events), so a close tail that arrives
+// later still reaches the outbox.
+func TestSyncTrailerTerminalSyncedWithinGrace(t *testing.T) {
 	exe, fakeDir := installFakeSoho(t,
 		capsRule(capsJSON, 0),
 		eventsRule("J1", 2, eventLine(3, "terminal", ""), trailer(3, "done"), 0),
+		eventsRule("J1", 3, "", trailer(3, "done"), 0),
 	)
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
@@ -197,12 +200,14 @@ func TestSyncTrailerTerminalSkipped(t *testing.T) {
 	if j := jobs.Jobs["J1"]; j == nil || j.Estado != "done" || j.LastEventSeq != 3 {
 		t.Fatalf("job J1 = %+v, want estado done, last 3", j)
 	}
-	// The next sync skips the terminal job: no events call for it.
+	// The next sync keeps querying the terminal job within the
+	// post-terminal grace: it asks from the contiguous stored prefix and
+	// appends nothing new.
 	stdout, _, exit = runHermes(t, cfgDir, false, "", "sync")
 	if exit != 0 {
 		t.Fatalf("second sync: exit = %d, stdout %q", exit, stdout)
 	}
-	if stdout != `{"jobs":0,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
+	if stdout != `{"jobs":1,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
 		t.Fatalf("second sync stdout = %q", stdout)
 	}
 	calls, err := fakesoho.ReadCalls(fakeDir)
@@ -215,8 +220,8 @@ func TestSyncTrailerTerminalSkipped(t *testing.T) {
 			eventsCalls++
 		}
 	}
-	if eventsCalls != 1 {
-		t.Errorf("events calls = %d, want 1 (the terminal job was skipped)", eventsCalls)
+	if eventsCalls != 2 {
+		t.Errorf("events calls = %d, want 2 (the terminal job is still queried within the grace)", eventsCalls)
 	}
 }
 
@@ -771,11 +776,13 @@ func TestSyncLegacyHighCursorRefetches(t *testing.T) {
 // terminal event 9 (prefix 0) of a job whose estado is already terminal;
 // the sync still fetches from the contiguous stored prefix, stores 1..8 in
 // upstream order after the wake record and converges the cursor; a second
-// sync skips the job because the gap is closed.
+// sync keeps querying the gapless terminal job within the post-terminal
+// grace and appends nothing.
 func TestSyncSparseTerminalWakeThenSync(t *testing.T) {
 	exe, fakeDir := installFakeSoho(t,
 		capsRule(capsJSON, 0),
 		eventsRule("J1", 0, eventsUpTo(9), trailer(9, "done"), 0),
+		eventsRule("J1", 9, "", trailer(9, "done"), 0),
 	)
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
@@ -840,17 +847,17 @@ func TestSyncSparseTerminalWakeThenSync(t *testing.T) {
 	if j := jobs.Jobs["J1"]; j == nil || j.LastEventSeq != 9 || j.Estado != "done" {
 		t.Fatalf("job J1 = %+v, want last_event_seq 9, estado done", j)
 	}
-	// The gap is closed and the job is terminal: the second sync skips
-	// it, with no job events call for it.
+	// The gap is closed and the job is terminal: the second sync keeps
+	// querying it within the post-terminal grace and appends nothing.
 	stdout, _, exit = runHermes(t, cfgDir, false, "", "sync")
 	if exit != 0 {
 		t.Fatalf("second sync: exit = %d, stdout %q", exit, stdout)
 	}
-	if stdout != `{"jobs":0,"novos":0,"enviados":0,"pendentes":9}`+"\n" {
+	if stdout != `{"jobs":1,"novos":0,"enviados":0,"pendentes":9}`+"\n" {
 		t.Fatalf("second sync stdout = %q", stdout)
 	}
-	if n := len(eventsSinceArgs(t, fakeDir)); n != 1 {
-		t.Errorf("events calls = %d, want 1 (the second sync skipped the gapless terminal job)", n)
+	if n := len(eventsSinceArgs(t, fakeDir)); n != 2 {
+		t.Errorf("events calls = %d, want 2 (the second sync still queried the gapless terminal job within the grace)", n)
 	}
 }
 
@@ -1000,24 +1007,34 @@ func TestSyncTerminalLegacyCursorStillSynced(t *testing.T) {
 	}
 }
 
-// TestSyncTerminalNoGapSkipped (control): a terminal job whose stored
-// events cover its recorded cursor (no gap) is still skipped: no job
-// events call for it.
-func TestSyncTerminalNoGapSkipped(t *testing.T) {
-	exe, fakeDir := installFakeSoho(t, capsRule(capsJSON, 0))
+// TestSyncTerminalNoGapSyncedWithinGrace (control): a terminal job whose
+// stored events cover its recorded cursor (no gap) and whose anchor is
+// fresh is still queried: the post-terminal grace, counted from
+// terminal_seen_at, keeps it open until the close tail is durable.
+func TestSyncTerminalNoGapSyncedWithinGrace(t *testing.T) {
+	exe, fakeDir := installFakeSoho(t,
+		capsRule(capsJSON, 0),
+		eventsRule("J1", 3, "", trailer(3, "done"), 0),
+	)
 	cfgDir := t.TempDir()
 	setSohoConfig(t, cfgDir, exe, "machine-a")
-	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{})
+	// The job's anchor is stamped with the test clock, so the grace is
+	// fresh (within the post-terminal grace).
+	s, err := outbox.Open(outbox.StateDir(cfgDir), outbox.Options{Now: postTerminalTestNow})
 	if err != nil {
 		t.Fatalf("open state: %v", err)
 	}
-	for i := 1; i <= 3; i++ {
+	for i := 1; i <= 2; i++ {
 		if _, appended, err := s.AppendJobEvent("machine-a", "org/repo", "J1", json.RawMessage(eventLine(i, "accepted", ""))); err != nil || !appended {
 			t.Fatalf("event %d: appended=%v err=%v, want true,nil", i, appended, err)
 		}
 	}
+	if _, appended, err := s.AppendJobEvent("machine-a", "org/repo", "J1", json.RawMessage(eventLine(3, "terminal", ""))); err != nil || !appended {
+		t.Fatalf("event 3: appended=%v err=%v, want true,nil", appended, err)
+	}
 	err = s.UpdateJobs(func(js *outbox.Jobs) error {
 		js.Jobs["J1"].Estado = "done"
+		js.Jobs["J1"].TerminalSeenAt = postTerminalTestNow().Format(outbox.TSLayout)
 		return nil
 	})
 	if err != nil {
@@ -1027,11 +1044,11 @@ func TestSyncTerminalNoGapSkipped(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("sync: exit = %d, stdout %q", exit, stdout)
 	}
-	if stdout != `{"jobs":0,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
+	if stdout != `{"jobs":1,"novos":0,"enviados":0,"pendentes":3}`+"\n" {
 		t.Fatalf("stdout = %q", stdout)
 	}
-	if n := len(eventsSinceArgs(t, fakeDir)); n != 0 {
-		t.Fatalf("events calls = %d, want 0 (no gap: the terminal job is skipped)", n)
+	if got := eventsSinceArgs(t, fakeDir); len(got) != 1 || got[0] != "3" {
+		t.Fatalf("events --since args = %v, want [3] (the gapless terminal job is queried within the grace)", got)
 	}
 }
 

@@ -14,7 +14,7 @@ var notificationIDPattern = regexp.MustCompile(`^n[0-9a-f]{20}$`)
 
 // renderable classes, roles, escalations and the contract event tipos.
 var (
-	renderClasses     = []string{ClassQuestion, ClassBlocked, ClassFailed, ClassTerminal, ClassTimeoutWarning, ClassReviewVerdict, ClassPROpened, ClassDecision, ClassAgentBlocked, ClassAgentDone, ClassCrossProject, ClassStuck, ClassWorkspaceOpened, ClassWorkspaceClosed}
+	renderClasses     = []string{ClassQuestion, ClassBlocked, ClassFailed, ClassTerminal, ClassTimeoutWarning, ClassBlockedWarning, ClassReviewVerdict, ClassPROpened, ClassDecision, ClassAgentBlocked, ClassAgentDone, ClassCrossProject, ClassStuck, ClassWorkspaceOpened, ClassWorkspaceClosed}
 	renderRoles       = []string{RoleOwner, RoleOrchestrator, RoleCoordinator}
 	renderEscalations = []string{EscBlocked, EscFailed, EscMissingOwner, EscCrossProject, EscStuck}
 )
