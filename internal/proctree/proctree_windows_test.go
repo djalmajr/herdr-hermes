@@ -23,13 +23,15 @@ const stillActive = 259
 
 // processAlive reports whether pid is running, the way the regression
 // asserts on Windows: OpenProcess plus GetExitCodeProcess, with
-// anything but STILL_ACTIVE as the "gone" answer. A process that never
-// existed is a "gone" answer, not a probe failure; any other OpenProcess
+// anything but STILL_ACTIVE as the "gone" answer. A process that no
+// longer exists is a "gone" answer, not a probe failure: OpenProcess
+// reports ERROR_INVALID_PARAMETER for a pid with no process (and
+// ERROR_FILE_NOT_FOUND is accepted as well); any other OpenProcess
 // error is a probe failure, reported as such (never folded into "gone").
 func processAlive(pid int) (bool, error) {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
-		if err == windows.ERROR_FILE_NOT_FOUND {
+		if err == windows.ERROR_INVALID_PARAMETER || err == windows.ERROR_FILE_NOT_FOUND {
 			return false, nil
 		}
 		return false, err
