@@ -38,13 +38,13 @@ Until the URL is set, push is disabled and the outbox still works for a dispatch
 
 ## Register the wake hook
 
-In the `herdr-soho` machine configuration, set the key:
+In the `soho` machine configuration (legacy name `herdr-soho` on nodes that still run the pre-rename release), set the key:
 
 ```text
 job_wake_cmd=nau wake
 ```
 
-With this set, every job event that wakes the dispatcher is also recorded in the outbox as soon as it happens.
+With this set, every job event that wakes the dispatcher is also recorded in the outbox as soon as it happens. The backend passes the event on one family of environment variables: the renamed release sets `SOHO_JOB_ID`, `SOHO_JOB_SEQ`, `SOHO_JOB_EVENT` and `SOHO_JOB_IDEMPOTENCY_KEY`, and the pre-rename releases set the legacy `HERDR_SOHO_JOB_*` variables; `nau wake` reads the current family when any of its variables is present and otherwise the legacy family, so the same hook works for both.
 
 ## Register notification recipients (optional)
 
@@ -58,7 +58,7 @@ nau notify register watch --pane <ws:pane> --job <id>
 nau notify register workspace --workspace <ws> --job <id>
 ```
 
-`<ref>` is a `herdr-soho send` reference `<machine>/<ws>:<pane>` or a local agent name; it is validated, never guessed. `notify list` and `notify status` are read-only; `notify deliver`, `notify ingest agent-status|workspace`, `notify raise`, `notify ack` and `notify retry` write the ledger and are refused under `HERDR_HERMES_NOWRITE=1` with exit 2.
+`<ref>` is a `soho send` reference `<machine>/<ws>:<pane>` or a local agent name; it is validated, never guessed. `notify list` and `notify status` are read-only; `notify deliver`, `notify ingest agent-status|workspace`, `notify raise`, `notify ack` and `notify retry` write the ledger and are refused under `HERDR_HERMES_NOWRITE=1` with exit 2.
 
 ## Dispatcher host (optional)
 
@@ -79,7 +79,7 @@ nau config get route_machines
 nau route
 ```
 
-An orchestrator counts toward its machine's load only when its Herdr agent is named after the orchestrator base — `orchestrator` or `orchestrator-<n>` by default, `<base>` or `<base>-<n>` when `route_orchestrator_name` sets another base — as `herdr-soho init` names the calling agent; agents whose name does not match the base (with the default base, the workers `herdr-soho` spawns and unnamed agents) do not count, and a finished orchestrator counts until its pane or workspace closes.
+An orchestrator counts toward its machine's load only when its Herdr agent is named after the orchestrator base — `orchestrator` or `orchestrator-<n>` by default, `<base>` or `<base>-<n>` when `route_orchestrator_name` sets another base — as `soho init` names the calling agent; agents whose name does not match the base (with the default base, the workers `soho` spawns and unnamed agents) do not count, and a finished orchestrator counts until its pane or workspace closes.
 
 ## Verify
 
@@ -87,4 +87,4 @@ An orchestrator counts toward its machine's load only when its Herdr agent is na
 nau doctor
 ```
 
-It reports, in one JSON line: whether `herdr-soho` is found and has the `ephemeral_job` and `job_events` capabilities, whether the machine label and the dispatcher URL are set, whether the key is configured (boolean only), whether the wake hook is configured (`true`, `false` or `unknown`) and the outbox counts. It exits 43 when a capability is missing and 0 otherwise, and writes nothing.
+It reports, in one JSON line: whether the backend is found and has the `ephemeral_job` and `job_events` capabilities (the backend is now `soho`; the pre-rename name `herdr-soho` is still accepted while the nodes upgrade, and `herdr_soho_bin` empty or set to `herdr-soho` resolves to the first of `soho` and `herdr-soho` on the `PATH`), whether the machine label and the dispatcher URL are set, whether the key is configured (boolean only), whether the wake hook is configured (`true`, `false` or `unknown`) and the outbox counts. It exits 43 when a capability is missing and 0 otherwise, and writes nothing; when the stored `herdr_soho_bin` still points at the legacy `herdr-soho` binary and a `soho` is on the `PATH`, it prints a `stderr` warning with the config command that switches to `soho`, leaving the JSON line and the exit code unchanged.

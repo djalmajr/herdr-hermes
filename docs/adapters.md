@@ -12,7 +12,7 @@ Hermes is the remote job dispatcher boundary. On the node it is the two-way brid
 
 ## Herdr
 
-Herdr is the node boundary: the forwarding of the dispatcher-facing job subcommands to the `herdr-soho` public CLI, the optional Herdr plugin and the Herdr agent-status notification sources. `herdr-soho` stays an independent project; Nau uses only its public CLI. Status: implemented.
+Herdr is the node boundary: the forwarding of the dispatcher-facing job subcommands to the `soho` public CLI (the backend, legacy name `herdr-soho`), the optional Herdr plugin and the Herdr agent-status notification sources. `soho` stays an independent project; Nau uses only its public CLI. Status: implemented.
 
 ## Grok Bot
 

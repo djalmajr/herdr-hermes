@@ -13,7 +13,7 @@ const usageTemplate = `%s - universal messaging and registry core; this build br
 usage: %s <command> [args]
 
 commands:
-  job <sub> [args]                  forward a dispatcher-facing job subcommand to herdr-soho
+  job <sub> [args]                  forward a dispatcher-facing job subcommand to soho
                                     (start, status, wait, events, collect, amend, send, ack,
                                     cancel, close, list)
   route [--machine <label>]         choose the machine for a new job (dispatcher side, read-only)
@@ -93,20 +93,20 @@ commands:
                                     re-queue once an uncertain or exhausted delivery
 
 exit codes:
-  0   success (forwarded commands: whatever herdr-soho returned)
+  0   success (forwarded commands: whatever soho returned)
   2   bad usage, input limit exceeded, unknown config key, internal job
       subcommand refused, registry usage or field rejected (serve, jobs),
       A2A request or decision refused (a2a)
   3   unknown job id in %s bookkeeping (sync --job) and unknown
       notification id (notify status --id, notify ack, notify retry), unknown
       claim, policy or folder (jobs), unknown A2A task (a2a)
-  4   herdr-soho not found or not runnable; no eligible machine available
+  4   soho not found or not runnable; no eligible machine available
       (route); registry unreachable or unavailable (serve, jobs); A2A
       server unreachable or database unavailable (a2a)
   40  no API key configured (push required)
   41  API key rejected by the dispatcher (401/403)
   42  dispatcher unreachable or retries exhausted; records stay pending
-  43  herdr-soho lacks the ephemeral_job or job_events capability
+  43  soho lacks the ephemeral_job or job_events capability
       (doctor, sync)
   44  the pre-dispatch check refused: duplicate work or a hold (jobs check)
 `

@@ -175,12 +175,10 @@ func maxHoldPipeMs(rules []Rule) int {
 	return hold
 }
 
-// warmRun runs the installed copy once with the warm marker as its only
-// argument, bounded at 120s with a 1s kill grace; it fails the test when
-// the copy does not exit 0 in time, with the exit code and the combined
-// output. The copy gets no stdin and keeps the test process' environment.
-func warmRun(t testing.TB, exePath string) {
-	t.Helper()
+// warmRunOnce runs the installed copy once with the warm marker as its
+// only argument, bounded at 120s with a 1s kill grace; it reports the
+// exit code and the combined output in the error.
+func warmRunOnce(exePath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	var out bytes.Buffer
@@ -195,7 +193,72 @@ func warmRun(t testing.TB, exePath string) {
 		code = exitErr.ExitCode()
 	}
 	if err != nil {
-		t.Fatalf("fakesoho: warm run %s: %v, exit %d, output %q", exePath, err, code, out.String())
+		return fmt.Errorf("warm run %s: %v, exit %d, output %q", exePath, err, code, out.String())
+	}
+	return nil
+}
+
+// busyExec reports whether the error is the busy-executable failure
+// (syscall.ETXTBSY, "text file busy"): on Linux a parallel fork can
+// inherit the write descriptor of the executable that was just copied
+// (golang/go#22315), and the first exec of the fresh binary fails. The
+// platform files install the check; on the operating systems where the
+// condition does not occur it never matches and the retry never runs.
+var busyExec func(error) bool = func(error) bool { return false }
+
+// retryWarm runs run until it reports success, retrying a
+// busy-executable failure (per busyExec) at most warmRetries attempts
+// with a warmRetryPause pause between them; the pause is injected so
+// tests keep real time out of the loop. Any other failure, or a busy
+// failure after the last attempt, is returned.
+const (
+	// warmRetries is the number of warm-run attempts when the exec
+	// fails with the busy-executable error.
+	warmRetries = 5
+	// warmRetryPause is the pause between warm-run attempts.
+	warmRetryPause = 100 * time.Millisecond
+)
+
+func retryWarm(run func() error, pause func(context.Context, time.Duration) error) error {
+	var err error
+	for attempt := 1; attempt <= warmRetries; attempt++ {
+		err = run()
+		if err == nil || !busyExec(err) || attempt == warmRetries {
+			return err
+		}
+		if perr := pause(context.Background(), warmRetryPause); perr != nil {
+			return perr
+		}
+	}
+	return err
+}
+
+// systemPause is the context-aware pause between warm-run retries.
+func systemPause(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// warmRun warms the installed copy once before Install returns its
+// path: the first run of a fresh executable can be slow (on a Windows
+// node the system scan of a new executable takes tens of seconds), and
+// that cost must not land inside a test's deadline measurement. The
+// warm run exits 0 without reading the script, stdin or the call log,
+// so it leaves no trace in the log. The first exec of a just-copied
+// binary can fail with the busy-executable error, so the run goes
+// through retryWarm: at most warmRetries attempts, warmRetryPause
+// between them, an ordinary failure at once.
+func warmRun(t testing.TB, exePath string) {
+	t.Helper()
+	err := retryWarm(func() error { return warmRunOnce(exePath) }, systemPause)
+	if err != nil {
+		t.Fatalf("fakesoho: %v", err)
 	}
 }
 

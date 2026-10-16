@@ -38,14 +38,16 @@ func TestConfigSetGet(t *testing.T) {
 		t.Errorf("config get after set = %q (exit %d)", stdout, exit)
 	}
 	// Other keys keep their defaults; the file holds the nine keys as
-	// key=value lines in canonical order.
+	// key=value lines in canonical order. The herdr_soho_bin key is
+	// stored in its empty auto form, never the resolved name, so a soho
+	// installed later is found.
 	data, err := os.ReadFile(filepath.Join(dir, "config"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := "machine_label=lab-1\n" +
 		"dispatcher_url=\n" +
-		"herdr_soho_bin=herdr-soho\n" +
+		"herdr_soho_bin=\n" +
 		"push_timeout_s=15\n" +
 		"herdr_bin=herdr\n" +
 		"route_machines=\n" +
@@ -58,6 +60,11 @@ func TestConfigSetGet(t *testing.T) {
 }
 
 func TestConfigList(t *testing.T) {
+	// The list shows the effective (resolved) value of herdr_soho_bin;
+	// the PATH is controlled so the resolution is deterministic: a soho
+	// executable in a known directory resolves to its path.
+	sohoDir := sohoPathDir(t)
+	t.Setenv("PATH", sohoDir)
 	dir := t.TempDir()
 	if _, _, exit := runCLI(t, dir, false, "config", "set", "dispatcher_url", "set-value"); exit != 0 {
 		t.Fatal("setup: config set dispatcher_url")
@@ -66,10 +73,83 @@ func TestConfigList(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("config list exit = %d", exit)
 	}
-	want := `{"config":{"machine_label":"","dispatcher_url":"set-value","herdr_soho_bin":"herdr-soho","push_timeout_s":15,"herdr_bin":"herdr","route_machines":"","route_disabled":"","route_orchestrator_name":"orchestrator","route_probe_timeout_s":20}}
+	want := `{"config":{"machine_label":"","dispatcher_url":"set-value","herdr_soho_bin":"` + filepath.Join(sohoDir, "soho") + `","push_timeout_s":15,"herdr_bin":"herdr","route_machines":"","route_disabled":"","route_orchestrator_name":"orchestrator","route_probe_timeout_s":20}}
 `
 	if stdout != want {
 		t.Errorf("config list = %q, want %q", stdout, want)
+	}
+}
+
+// sohoPathDir builds a PATH directory that holds exactly a soho
+// executable (a placeholder body is enough: resolution only looks the
+// name up).
+func sohoPathDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "soho"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestConfigGetSohoBinResolved: `config get` and `config list` show the
+// effective (resolved) value of herdr_soho_bin, and `config set
+// herdr_soho_bin ""` is the auto form: the file stores the empty value
+// and the get shows the resolved one.
+func TestConfigGetSohoBinResolved(t *testing.T) {
+	sohoDir := sohoPathDir(t)
+	t.Setenv("PATH", sohoDir)
+	dir := t.TempDir()
+	// A fresh config: get shows the resolved soho on the PATH.
+	stdout, _, exit := runCLI(t, dir, false, "config", "get", "herdr_soho_bin")
+	if exit != 0 || stdout != "{\"key\":\"herdr_soho_bin\",\"value\":\""+filepath.Join(sohoDir, "soho")+"\"}\n" {
+		t.Errorf("config get (fresh) = %q (exit %d), want the resolved soho", stdout, exit)
+	}
+	// Setting the empty value is auto: the file stores the empty form
+	// and the get still shows the resolved soho.
+	stdout, _, exit = runCLI(t, dir, false, "config", "set", "herdr_soho_bin", "")
+	if exit != 0 {
+		t.Fatalf("config set herdr_soho_bin empty exit = %d, stdout %q", exit, stdout)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "herdr_soho_bin=\n") {
+		t.Errorf("the file must store the empty auto form, got %q", data)
+	}
+	stdout, _, exit = runCLI(t, dir, false, "config", "get", "herdr_soho_bin")
+	if exit != 0 || stdout != "{\"key\":\"herdr_soho_bin\",\"value\":\""+filepath.Join(sohoDir, "soho")+"\"}\n" {
+		t.Errorf("config get after auto set = %q (exit %d), want the resolved soho", stdout, exit)
+	}
+	// Setting the legacy name is auto too (it was the old default that
+	// the old config set stored), and stores the empty form.
+	stdout, _, exit = runCLI(t, dir, false, "config", "set", "herdr_soho_bin", "herdr-soho")
+	if exit != 0 {
+		t.Fatalf("config set herdr_soho_bin legacy exit = %d, stdout %q", exit, stdout)
+	}
+	data, err = os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "herdr_soho_bin=\n") {
+		t.Errorf("the legacy auto value must store the empty form, got %q", data)
+	}
+	// An explicit selection is stored and shown unchanged.
+	stdout, _, exit = runCLI(t, dir, false, "config", "set", "herdr_soho_bin", "/opt/soho")
+	if exit != 0 {
+		t.Fatalf("config set explicit exit = %d, stdout %q", exit, stdout)
+	}
+	data, err = os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "herdr_soho_bin=/opt/soho\n") {
+		t.Errorf("the explicit value must be stored unchanged, got %q", data)
+	}
+	stdout, _, exit = runCLI(t, dir, false, "config", "get", "herdr_soho_bin")
+	if exit != 0 || stdout != "{\"key\":\"herdr_soho_bin\",\"value\":\"/opt/soho\"}\n" {
+		t.Errorf("config get after explicit set = %q (exit %d)", stdout, exit)
 	}
 }
 
@@ -138,7 +218,7 @@ func TestConfigCommentsAndBlanks(t *testing.T) {
 	if strings.Contains(s, "#") || strings.Contains(s, "lab-9") {
 		t.Errorf("rewritten file keeps old content:\n%s", s)
 	}
-	for _, want := range []string{"machine_label=lab-10", "dispatcher_url=", "herdr_soho_bin=herdr-soho", "push_timeout_s=15", "herdr_bin=herdr", "route_machines=", "route_disabled=", "route_orchestrator_name=orchestrator", "route_probe_timeout_s=20"} {
+	for _, want := range []string{"machine_label=lab-10", "dispatcher_url=\n", "herdr_soho_bin=\n", "push_timeout_s=15", "herdr_bin=herdr", "route_machines=\n", "route_disabled=\n", "route_orchestrator_name=orchestrator", "route_probe_timeout_s=20\n"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("rewritten file missing %q:\n%s", want, s)
 		}

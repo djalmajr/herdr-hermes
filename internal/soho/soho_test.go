@@ -367,7 +367,7 @@ func TestSohoRunZeroExitPastWaitDelay(t *testing.T) {
 	if len(diags) != 1 {
 		t.Fatalf("diagnostics = %d, want exactly 1: %v", len(diags), diags)
 	}
-	want := "herdr-soho job status exited 0 but its output did not drain within 5s; output may be truncated"
+	want := "soho job status exited 0 but its output did not drain within 5s; output may be truncated"
 	if diags[0] != want {
 		t.Errorf("diagnostic = %q, want %q", diags[0], want)
 	}

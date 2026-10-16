@@ -9,6 +9,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,7 +19,8 @@ import (
 )
 
 // Config is the machine configuration with effective values (defaults
-// applied for absent keys).
+// applied for absent keys). HerdrSohoBin is effective: the auto value is
+// resolved (see ResolveBin) by Load and by Set.
 type Config struct {
 	MachineLabel          string `json:"machine_label"`
 	DispatcherURL         string `json:"dispatcher_url"`
@@ -29,6 +31,11 @@ type Config struct {
 	RouteDisabled         string `json:"route_disabled"`
 	RouteOrchestratorName string `json:"route_orchestrator_name"`
 	RouteProbeTimeoutS    int    `json:"route_probe_timeout_s"`
+
+	// herdrSohoBinStored is the raw value the configuration file holds
+	// for herdr_soho_bin (the empty value is the auto form); Set rewrites
+	// the file with this form, never with the resolved path.
+	herdrSohoBinStored string
 }
 
 // ErrUnknownKey marks an attempt to set or read a key the configuration does
@@ -45,12 +52,11 @@ const (
 )
 
 // defaultConfig returns the defaults: machine_label and dispatcher_url
-// empty, herdr_soho_bin "herdr-soho", push_timeout_s 15, herdr_bin "herdr",
-// route_machines and route_disabled empty, route_orchestrator_name
-// "orchestrator", route_probe_timeout_s 20.
+// empty, herdr_soho_bin the empty auto form (resolved on load),
+// push_timeout_s 15, herdr_bin "herdr", route_machines and route_disabled
+// empty, route_orchestrator_name "orchestrator", route_probe_timeout_s 20.
 func defaultConfig() Config {
 	return Config{
-		HerdrSohoBin:          "herdr-soho",
 		PushTimeoutS:          15,
 		HerdrBin:              "herdr",
 		RouteOrchestratorName: router.DefaultOrchestratorName,
@@ -63,13 +69,46 @@ func Keys() []string {
 	return []string{"machine_label", "dispatcher_url", "herdr_soho_bin", "push_timeout_s", "herdr_bin", "route_machines", "route_disabled", "route_orchestrator_name", "route_probe_timeout_s"}
 }
 
+// IsAutoBin reports whether a stored herdr_soho_bin value is the auto
+// value: the empty value or exactly herdr-soho. The legacy name counts
+// as auto because the old `config set` wrote every key's default into
+// the file, so that stored value is never a user selection; a missing
+// key stores the empty value and is auto too. Any other value (a path
+// or another name) is an explicit selection and passes through
+// unchanged.
+func IsAutoBin(stored string) bool {
+	return stored == "" || stored == "herdr-soho"
+}
+
+// ResolveBin resolves a stored herdr_soho_bin value to the effective
+// executable: the auto value resolves to the first of soho and
+// herdr-soho found on the machine's PATH, else to the bare name soho
+// (the not-found reporting is left to the caller, which looks the value
+// up again); an explicit value (a bare name, a relative or an absolute
+// path) passes through unchanged.
+func ResolveBin(stored string) string {
+	if !IsAutoBin(stored) {
+		return stored
+	}
+	if p, err := exec.LookPath("soho"); err == nil {
+		return p
+	}
+	if p, err := exec.LookPath("herdr-soho"); err == nil {
+		return p
+	}
+	return "soho"
+}
+
 // Load reads <dir>/config and returns the effective configuration. A missing
 // file or directory yields the defaults without error and without creating
-// anything, so read-only commands never create the config directory.
+// anything, so read-only commands never create the config directory. The
+// herdr_soho_bin value is resolved: the field holds the effective
+// executable, the stored form is kept for the next Set rewrite.
 func Load(dir string) (Config, error) {
 	cfg := defaultConfig()
 	data, err := os.ReadFile(filepath.Join(dir, "config"))
 	if os.IsNotExist(err) {
+		cfg.HerdrSohoBin = ResolveBin(cfg.HerdrSohoBin)
 		return cfg, nil
 	}
 	if err != nil {
@@ -93,6 +132,7 @@ func Load(dir string) (Config, error) {
 			cfg.DispatcherURL = value
 		case "herdr_soho_bin":
 			cfg.HerdrSohoBin = value
+			cfg.herdrSohoBinStored = value
 		case "push_timeout_s":
 			n, err := strconv.Atoi(value)
 			if err != nil || n <= 0 {
@@ -129,13 +169,16 @@ func Load(dir string) (Config, error) {
 			return cfg, fmt.Errorf("%w: %q", ErrUnknownKey, key)
 		}
 	}
+	cfg.HerdrSohoBin = ResolveBin(cfg.HerdrSohoBin)
 	return cfg, nil
 }
 
 // Set writes one key of the configuration file atomically. Unknown keys and
 // invalid values are refused with an error before anything is read or
-// written. The stored form is normalized: herdr_bin is trimmed and the
-// route lists are joined with "," without spaces.
+// written. The stored form is normalized: herdr_bin is trimmed, the
+// route lists are joined with "," without spaces, and the auto value of
+// herdr_soho_bin (the empty value or a legacy name) is stored as the
+// empty value.
 func Set(dir, key, value string) error {
 	stored, err := storedValue(key, value)
 	if err != nil {
@@ -151,7 +194,8 @@ func Set(dir, key, value string) error {
 	case "dispatcher_url":
 		cfg.DispatcherURL = stored
 	case "herdr_soho_bin":
-		cfg.HerdrSohoBin = stored
+		cfg.HerdrSohoBin = ResolveBin(stored)
+		cfg.herdrSohoBinStored = stored
 	case "push_timeout_s":
 		cfg.PushTimeoutS = atoi(stored)
 	case "herdr_bin":
@@ -179,7 +223,8 @@ func Set(dir, key, value string) error {
 }
 
 // Value returns the effective value of a known key as a string, or
-// ErrUnknownKey for an unknown key.
+// ErrUnknownKey for an unknown key. For herdr_soho_bin the effective
+// value is the resolved executable (Load and Set resolve it).
 func (c Config) Value(key string) (string, error) {
 	switch key {
 	case "machine_label":
@@ -209,7 +254,14 @@ func (c Config) Value(key string) (string, error) {
 // lists).
 func storedValue(key, value string) (string, error) {
 	switch key {
-	case "machine_label", "dispatcher_url", "herdr_soho_bin":
+	case "machine_label", "dispatcher_url":
+		return value, nil
+	case "herdr_soho_bin":
+		// The auto form (the empty value or a legacy name) stores empty;
+		// an explicit selection stores unchanged.
+		if IsAutoBin(value) {
+			return "", nil
+		}
 		return value, nil
 	case "push_timeout_s":
 		if n, err := strconv.Atoi(value); err != nil || n <= 0 {
@@ -243,6 +295,12 @@ func storedValue(key, value string) (string, error) {
 }
 
 func valueOf(cfg Config, key string) string {
+	// The file keeps the stored form of the backend binary, never the
+	// resolved path: a machine moved or a PATH change must not rewrite
+	// the operator's stored selection.
+	if key == "herdr_soho_bin" {
+		return cfg.herdrSohoBinStored
+	}
 	v, err := cfg.Value(key)
 	if err != nil {
 		return ""

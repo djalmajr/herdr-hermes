@@ -1,4 +1,5 @@
-// Package soho runs the herdr-soho CLI as an argv subprocess: the bounded
+// Package soho runs the soho backend CLI (legacy name herdr-soho) as an
+// argv subprocess: the bounded
 // runner, the capabilities client and the job events reader. No shell is
 // ever involved; every subprocess gets a context deadline and a WaitDelay.
 // When the deadline cancels a run, the child's whole process tree is
@@ -34,7 +35,7 @@ const waitDelay = proctree.Grace
 // (capabilities, events and the job forwarder subs without a wait).
 const defaultBound = 120 * time.Second
 
-// ErrUnavailable reports that the herdr-soho executable could not be
+// ErrUnavailable reports that the backend executable could not be
 // found or started.
 type ErrUnavailable struct {
 	Bin string
@@ -42,7 +43,7 @@ type ErrUnavailable struct {
 }
 
 func (e *ErrUnavailable) Error() string {
-	return "soho: herdr-soho unavailable: " + e.Err.Error()
+	return "soho: backend unavailable: " + e.Err.Error()
 }
 
 // ErrDeadline reports that the bound expired and the cancel reached a
@@ -55,7 +56,7 @@ func (e *ErrDeadline) Error() string {
 	return "soho: child killed after " + e.Bound.String()
 }
 
-// Runner executes the herdr-soho binary. Bin is an argv0 (a bare name on
+// Runner executes the backend binary. Bin is an argv0 (a bare name on
 // PATH or an absolute path); Environ is the exact child environment, and
 // nothing else is inherited by the child. Run is not safe for
 // concurrent use on one Runner.
@@ -114,7 +115,8 @@ func joinDone(a, b chan struct{}) chan struct{} {
 	return c
 }
 
-// Run executes Bin with args (an argv array, never a shell) under a
+// Run executes the backend binary with args (an argv array, never a
+// shell) under a
 // context deadline of bound plus the WaitDelay grace period. stdin is
 // streamed to the child; the child's stdout and stderr are copied
 // unchanged to the given writers. The writers are guarded: a consumer
@@ -371,11 +373,11 @@ func (r *Runner) diagWaitDelay(args []string) {
 	if len(args) > 1 {
 		sub += " " + args[1]
 	}
-	r.Diag("herdr-soho " + sub + " exited 0 but its output did not drain within " +
+	r.Diag("soho " + sub + " exited 0 but its output did not drain within " +
 		waitDelay.String() + "; output may be truncated")
 }
 
-// Caps is the parsed `herdr-soho capabilities --json` output. Raw keeps
+// Caps is the parsed `soho capabilities --json` output. Raw keeps
 // the original line so doctor can report it.
 type Caps struct {
 	Raw  string
@@ -389,7 +391,7 @@ func (c Caps) Has(key string) bool {
 	return ok && v >= 1
 }
 
-// Capabilities runs `herdr-soho capabilities --json` (bounded) and parses
+// Capabilities runs `soho capabilities --json` (bounded) and parses
 // the last line leniently: unknown fields are ignored, numeric values are
 // recorded and a boolean true counts as 1. A non-JSON line or a non-zero
 // exit is an error.
@@ -427,14 +429,14 @@ func (r *Runner) Capabilities(ctx context.Context) (Caps, error) {
 	return c, nil
 }
 
-// EventsResult is the output of `herdr-soho job events --id <id> --since
+// EventsResult is the output of `soho job events --id <id> --since
 // <n>`: the raw event lines (without the trailer) and the parsed trailer.
 type EventsResult struct {
 	Lines   []string
 	Trailer jobapi.EventsTrailer
 }
 
-// Events runs `herdr-soho job events --id <id> --since <since>` without
+// Events runs `soho job events --id <id> --since <since>` without
 // --wait (bounded) and returns the event lines plus the trailer. The
 // trailer must be the last line with eventos "fim"; anything else is an
 // error.

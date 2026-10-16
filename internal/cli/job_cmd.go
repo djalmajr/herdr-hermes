@@ -18,7 +18,7 @@ import (
 )
 
 // jobPublicSubs are the dispatcher-facing subcommands forwarded to
-// herdr-soho job with the same arguments.
+// soho job with the same arguments. The backend is now soho (legacy name herdr-soho).
 var jobPublicSubs = map[string]bool{
 	"start": true, "status": true, "wait": true, "events": true,
 	"collect": true, "amend": true, "send": true, "ack": true,
@@ -54,7 +54,7 @@ var (
 )
 
 // cmdJob implements `job <sub> [args]`: it validates the contract input
-// limits, forwards the subcommand to herdr-soho as an argv subprocess and
+// limits, forwards the subcommand to the backend (soho, legacy name herdr-soho) as an argv subprocess and
 // does the local bookkeeping after a successful forward. The forwarded
 // exit code and stdout are never changed by the bookkeeping.
 //
@@ -172,7 +172,7 @@ func cmdJob(args []string, env Env) int {
 	// context deadline plus the runner's WaitDelay), so what it wrote is
 	// finite, and the delivery of it follows the consumer: a consumer
 	// that never reads holds the CLI exactly as it would hold
-	// herdr-soho run directly. No byte the child wrote is dropped and
+	// soho run directly. No byte the child wrote is dropped and
 	// no exit code is returned before the delivery ends.
 	awaitDelivery := func() {
 		<-runner.DrainDone()
@@ -195,7 +195,7 @@ func cmdJob(args []string, env Env) int {
 			// stays in the stderr diagnostic. The child never ran, so
 			// there is no delivery to await.
 			_, _ = fmt.Fprintf(env.Stderr, "%s: %v\n", env.program(), rerr)
-			_, _ = fmt.Fprintf(env.Stdout, `{"status":"unavailable","motivo":"herdr-soho not found"}`+"\n")
+			_, _ = fmt.Fprintf(env.Stdout, `{"status":"unavailable","motivo":"soho not found"}`+"\n")
 			return jobapi.ExitUnavailable
 		}
 		var de *soho.ErrDeadline
@@ -209,14 +209,14 @@ func cmdJob(args []string, env Env) int {
 			// they are written synchronously on this goroutine once the
 			// delivery is done.
 			awaitDelivery()
-			_, _ = fmt.Fprintf(env.Stderr, "%s: herdr-soho job %s killed after %s\n", env.program(), sub, de.Bound)
+			_, _ = fmt.Fprintf(env.Stderr, "%s: soho job %s killed after %s\n", env.program(), sub, de.Bound)
 			if stdoutBuf.Len() == 0 {
-				_, _ = fmt.Fprintf(env.Stdout, `{"status":"timeout","motivo":"herdr-soho job %s did not finish within %s"}`+"\n", sub, de.Bound)
+				_, _ = fmt.Fprintf(env.Stdout, `{"status":"timeout","motivo":"soho job %s did not finish within %s"}`+"\n", sub, de.Bound)
 			}
 			return jobapi.ExitUnavailable
 		}
 		awaitDelivery()
-		motivo := "herdr-soho job " + sub + ": " + rerr.Error()
+		motivo := "soho job " + sub + ": " + rerr.Error()
 		_, _ = io.WriteString(env.Stderr, env.program()+": "+motivo+"\n")
 		_, _ = io.WriteString(env.Stdout, mustJSON(errorLine{Status: itoa(2), Motivo: motivo})+"\n")
 		return 2

@@ -393,7 +393,7 @@ func TestJobForwardMissingBinary(t *testing.T) {
 	if exit != 4 {
 		t.Fatalf("exit = %d, want 4", exit)
 	}
-	if stdout != `{"status":"unavailable","motivo":"herdr-soho not found"}`+"\n" {
+	if stdout != `{"status":"unavailable","motivo":"soho not found"}`+"\n" {
 		t.Errorf("stdout = %q", stdout)
 	}
 }
@@ -723,7 +723,7 @@ func TestJobForwardNotRunnable(t *testing.T) {
 	if exit != 4 {
 		t.Fatalf("exit = %d, want 4", exit)
 	}
-	if stdout != `{"status":"unavailable","motivo":"herdr-soho not found"}`+"\n" {
+	if stdout != `{"status":"unavailable","motivo":"soho not found"}`+"\n" {
 		t.Errorf("stdout = %q, want the single unavailable line", stdout)
 	}
 }
@@ -782,7 +782,7 @@ func TestJobForwardDeadlineNoOutput(t *testing.T) {
 	if exit != 4 {
 		t.Fatalf("no-output deadline: exit = %d, stdout %q, stderr %q", exit, stdout, stderr)
 	}
-	if want := `{"status":"timeout","motivo":"herdr-soho job status did not finish within 500ms"}` + "\n"; stdout != want {
+	if want := `{"status":"timeout","motivo":"soho job status did not finish within 500ms"}` + "\n"; stdout != want {
 		t.Errorf("no-output deadline stdout = %q, want %q", stdout, want)
 	}
 	if stderr == "" {
@@ -870,7 +870,7 @@ func TestJobForwardDeadlineStartDelay(t *testing.T) {
 	if exit != 4 {
 		t.Fatalf("start-delay deadline: exit = %d, stdout %q, stderr %q", exit, stdout, stderr)
 	}
-	if want := `{"status":"timeout","motivo":"herdr-soho job status did not finish within 500ms"}` + "\n"; stdout != want {
+	if want := `{"status":"timeout","motivo":"soho job status did not finish within 500ms"}` + "\n"; stdout != want {
 		t.Errorf("start-delay deadline stdout = %q, want %q", stdout, want)
 	}
 	if stderr == "" {
@@ -1006,7 +1006,7 @@ func TestJobForwardStartSlowStdoutBookkeeping(t *testing.T) {
 	if string(recs[0].Dados) != `{"id":"J1","status":"running"}` {
 		t.Errorf("dispatch dados = %s", recs[0].Dados)
 	}
-	wantDiag := "herdr-soho job start exited 0 but its output did not drain within 5s; output may be truncated"
+	wantDiag := "soho job start exited 0 but its output did not drain within 5s; output may be truncated"
 	fb, err := os.ReadFile(filepath.Join(outbox.StateDir(cfgDir), "friction.log"))
 	if err != nil {
 		t.Fatalf("friction.log: %v", err)
@@ -1313,7 +1313,7 @@ func TestJobForwardNowriteGraceDiagAfterDelivery(t *testing.T) {
 	if out.String() != `{"id":"J1","estado":"running"}`+"\n" {
 		t.Fatalf("stdout = %q, want the complete child line", out.String())
 	}
-	wantDiag := "herdr-soho job status exited 0 but its output did not drain within 5s; output may be truncated"
+	wantDiag := "soho job status exited 0 but its output did not drain within 5s; output may be truncated"
 	// The stderr line is written synchronously after the delivery, so
 	// it is here when Run returned: no waitFor.
 	if n := strings.Count(errb.String(), "did not drain within"); n != 1 {
@@ -1382,7 +1382,7 @@ func TestJobForwardFreshNodeGraceFriction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read friction.log: %v", err)
 	}
-	wantDiag := "herdr-soho job status exited 0 but its output did not drain within 5s; output may be truncated"
+	wantDiag := "soho job status exited 0 but its output did not drain within 5s; output may be truncated"
 	if n := strings.Count(string(data), wantDiag); n != 1 {
 		t.Errorf("friction.log = %q, want the WaitDelay diagnostic exactly once", data)
 	}
