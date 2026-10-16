@@ -1,6 +1,9 @@
 // Package soho runs the herdr-soho CLI as an argv subprocess: the bounded
 // runner, the capabilities client and the job events reader. No shell is
 // ever involved; every subprocess gets a context deadline and a WaitDelay.
+// When the deadline cancels a run, the child's whole process tree is
+// terminated (internal/proctree), not only the direct child; a child that
+// exits on its own leaves its descendants untouched.
 package soho
 
 import (
@@ -10,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -18,11 +22,13 @@ import (
 	"time"
 
 	"github.com/djalmajr/nau/internal/jobapi"
+	"github.com/djalmajr/nau/internal/proctree"
 )
 
 // waitDelay gives a child that ignores the cancel signal a bounded grace
-// period before the process is killed.
-const waitDelay = 5 * time.Second
+// period before the process is killed; it is the process tree's one
+// grace, the same the first forwarded terminal signal gives the group.
+const waitDelay = proctree.Grace
 
 // defaultBound bounds the subprocesses without a caller-specific bound
 // (capabilities, events and the job forwarder subs without a wait).
@@ -119,11 +125,17 @@ func joinDone(a, b chan struct{}) chan struct{} {
 // or past the grace period — and ErrDeadline when the cancel reached a
 // live child; the deadline is decided from the cancel, because on
 // Windows the kill surfaces as an ordinary exit code (TerminateProcess).
-// ErrUnavailable is returned when the executable is missing or not
-// runnable. Every byte Run read from the child is handed to the given
-// writers, but that delivery may still be in flight when Run returns,
-// so a caller that must not lose output waits on DrainDone after Run
-// returned.
+// When the cancel reaches a live child, the child's whole process tree
+// is terminated: the graceful step on the cancel (SIGTERM to the group,
+// or the job terminate on Windows) and the force after Wait returned
+// (the group's SIGKILL on Windows, where the job terminate already
+// ended the tree); a child that exits on its own keeps the descendants
+// it left on purpose, because the tree steps run only when the cancel
+// fired. ErrUnavailable is returned when the executable is missing or
+// not runnable. Every byte Run read from the child is handed to the
+// given writers, but that delivery may still be in flight when Run
+// returns, so a caller that must not lose output waits on DrainDone
+// after Run returned.
 func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, bound time.Duration) (int, error) {
 	// DrainDone is an already-closed channel from the first line, so it
 	// is never nil and never refers to a previous run after any early
@@ -141,6 +153,9 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	// Put the child in its own tree scope before Start, so the cancel
+	// below can end the whole tree, not only the direct child.
+	proctree.Prepare(cmd)
 	cmd.Env = r.Environ
 	var interrupted atomic.Bool
 	if stdin != nil {
@@ -157,12 +172,43 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 		cmd.Stderr = errOut
 	}
 	cmd.WaitDelay = waitDelay
-	boundedCancel(cmd, &interrupted)
+	// The cancel ends the child's whole process tree (internal/proctree),
+	// not only the direct child; the flag is set only when the signal or
+	// kill reached a live child, so a child that had already finished is
+	// reported as os.ErrProcessDone and leaves the flag unset, keeping
+	// its own exit code unchanged.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := proctree.Terminate(cmd); err != nil {
+			return err
+		}
+		interrupted.Store(true)
+		return nil
+	}
 	r.drainDone = joinDone(out.done, errOut.done)
 	if err := cmd.Start(); err != nil {
 		return -1, &ErrUnavailable{Bin: r.Bin, Err: err}
 	}
+	// Attach right after Start binds the tree to the cancel (the job
+	// object on Windows). It fails only where the platform cannot
+	// track the tree; then the run continues and the cancel falls back
+	// to the child alone, the behavior before internal/proctree.
+	release, _ := proctree.Attach(cmd)
+	defer release()
+	// The relay forwards the terminal's signals (SIGINT, SIGTERM and
+	// SIGHUP on unix) to the child's group while the child runs, so an
+	// interrupted run does not leave the tree behind as orphans; on
+	// Windows the relay is inert and the console's Ctrl-C keeps
+	// reaching the child. The first forwarded signal starts the relay's
+	// fixed grace: the child's group that survives it is forced down
+	// (SIGKILL) so the wait returns. The stop runs after the wait: it
+	// ends the relay, stops the signal reception and reports the last
+	// signal received, if any.
+	stopForward := proctree.ForwardSignals(cmd)
 	waitErr := cmd.Wait()
+	sig, hadSignal := stopForward()
 	// The writers are closed (deferred, not awaited) once the wait
 	// machinery has decided the run: a delivery that is still in flight
 	// may finish into the wrapped writer after Run returned.
@@ -172,7 +218,22 @@ func (r *Runner) Run(ctx context.Context, args []string, stdin io.Reader, stdout
 	// deadline whatever exit code it ended with — the Windows
 	// TerminateProcess code 1 and a unix child that exits on SIGTERM
 	// both stay deadlines.
+	if hadSignal {
+		// The relay forwarded the terminal's signal to the child's
+		// group and the run ended on it: the process must die on the
+		// very signal it would have died on without the group
+		// isolation, so the default handling is restored and the signal
+		// re-sent on the process itself. The child's exit code is not
+		// translated; the re-raise ends the process, so the return
+		// below is the fallback only when the re-raise did not.
+		proctree.ReRaise(sig)
+		return -1, waitErr
+	}
 	if interrupted.Load() {
+		// The cancel reached a live child: end whatever the graceful
+		// step left behind in the tree before the run is reported, so a
+		// deadline never leaves a descendant running.
+		proctree.Kill(cmd)
 		return -1, &ErrDeadline{Bound: bound}
 	}
 	// Whatever Wait returned (nil, the child's own ExitError, the
