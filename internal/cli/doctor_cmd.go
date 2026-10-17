@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -344,7 +345,10 @@ func wakeProgramAccepted(first string, windows bool) bool {
 			name = name[i+1:]
 		}
 	} else {
-		name = filepath.Base(first)
+		// path.Base, not filepath.Base: the unix rules must not depend on
+		// the host, so a Windows host running this branch (the tests do)
+		// does not drop a volume prefix or treat a backslash as a separator.
+		name = path.Base(first)
 	}
 	if name == ProgramNau {
 		return true
