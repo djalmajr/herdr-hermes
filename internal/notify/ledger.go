@@ -175,7 +175,7 @@ func normalizeRegistry(reg *Registry) {
 // registry with non-nil maps and Schema LedgerSchema.
 func (s *Store) loadRegistryLocked() (Registry, error) {
 	var reg Registry
-	data, err := os.ReadFile(s.registryPath())
+	data, err := outbox.ReadReplacedFile(s.registryPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return emptyRegistry(), nil
 	}
@@ -199,7 +199,7 @@ func (s *Store) LoadRegistry() (Registry, error) { return s.loadRegistryLocked()
 // loadLedgerLocked reads the ledger; a missing file is an empty ledger
 // with a non-nil Panes map and a non-nil empty Workspaces map.
 func (s *Store) loadLedgerLocked() (*Ledger, error) {
-	data, err := os.ReadFile(s.ledgerPath())
+	data, err := outbox.ReadReplacedFile(s.ledgerPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return emptyLedger(), nil
 	}
@@ -338,7 +338,7 @@ func (s *Store) UpdateRegistry(mutate func(*Registry) error) error {
 		}
 		// The missing ledger is created before the registry enables
 		// notifications: no window with notifications on and no cursor.
-		if _, err := os.ReadFile(s.ledgerPath()); err != nil {
+		if _, err := outbox.ReadReplacedFile(s.ledgerPath()); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
