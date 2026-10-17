@@ -106,7 +106,7 @@ func ResolveBin(stored string) string {
 // executable, the stored form is kept for the next Set rewrite.
 func Load(dir string) (Config, error) {
 	cfg := defaultConfig()
-	data, err := os.ReadFile(filepath.Join(dir, "config"))
+	data, err := outbox.ReadReplacedFile(filepath.Join(dir, "config"))
 	if os.IsNotExist(err) {
 		cfg.HerdrSohoBin = ResolveBin(cfg.HerdrSohoBin)
 		return cfg, nil

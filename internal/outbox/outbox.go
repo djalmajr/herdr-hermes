@@ -656,7 +656,7 @@ type PushResult struct {
 // cursorLocked reads the cursor file; an absent file is (zero, nil).
 func (s *Store) cursorLocked() (cursor, error) {
 	var c cursor
-	data, err := os.ReadFile(s.cursorPath())
+	data, err := ReadReplacedFile(s.cursorPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return c, nil
 	}
@@ -798,7 +798,7 @@ func (s *Store) LoadJobs() (*Jobs, error) {
 }
 
 func (s *Store) loadJobsLocked() (*Jobs, error) {
-	data, err := os.ReadFile(s.jobsPath())
+	data, err := ReadReplacedFile(s.jobsPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return &Jobs{Jobs: map[string]*Job{}}, nil
 	}
@@ -859,7 +859,7 @@ func (s *Store) LoadSessions() (*Sessions, error) {
 }
 
 func (s *Store) loadSessionsLocked() (*Sessions, error) {
-	data, err := os.ReadFile(s.sessionsPath())
+	data, err := ReadReplacedFile(s.sessionsPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return &Sessions{Sessions: map[string]*Session{}}, nil
 	}
@@ -942,7 +942,10 @@ func (s *Store) UpdateSessionsAndAppend(build func(*Sessions) (Record, error)) (
 var atomicWriteSync = func(f *os.File) error { return f.Sync() }
 
 // WriteFileAtomic writes data to path atomically: a temp file in the same
-// directory, fsync, then rename. The final file has mode 0600.
+// directory, fsync, then rename. The final file has mode 0600. The rename
+// goes through replaceFile, which on Windows asks for a POSIX-semantics
+// replace so a reader holding the file with FILE_SHARE_DELETE does not
+// block it; on the other systems it is os.Rename.
 func WriteFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
@@ -969,7 +972,7 @@ func WriteFileAtomic(path string, data []byte) error {
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := replaceFile(tmp, path); err != nil {
 		return err
 	}
 	tmp = ""

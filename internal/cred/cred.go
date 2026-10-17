@@ -35,7 +35,7 @@ func (s *FileStore) Kind() string { return "file" }
 // whose content is only the trailing newline is an error, never an empty
 // key.
 func (s *FileStore) Get() (string, error) {
-	data, err := os.ReadFile(s.Path)
+	data, err := outbox.ReadReplacedFile(s.Path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", ErrNotConfigured
 	}
