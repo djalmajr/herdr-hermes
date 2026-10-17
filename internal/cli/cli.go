@@ -16,7 +16,8 @@ import (
 )
 
 // version is set for release builds with -ldflags. Dev builds keep "dev"
-// and get the VCS revision recorded by the Go toolchain appended.
+// and get the VCS revision recorded by the Go toolchain appended, or the
+// module version of a "go install" build (which records no VCS info).
 var version = "dev"
 
 // nowriteVar is the read-only gate.
@@ -168,14 +169,33 @@ func cmdVersion(args []string, env Env) int {
 		v = "dev"
 	}
 	if v == "dev" {
-		if rev := vcsRevision(); rev != "" {
-			v += "+" + rev
-		}
+		info, ok := debug.ReadBuildInfo()
+		v = devVersion(info, ok)
 	}
 	_, _ = fmt.Fprintf(env.Stdout, "%s\n", mustJSON(struct {
 		Version string `json:"version"`
 	}{Version: v}))
 	return 0
+}
+
+// devVersion derives the dev version from the build info: the VCS
+// revision recorded by the Go toolchain wins when present (nothing
+// changes for builds that carry it); without it, a "go install" build
+// records the module version instead, used when it is a real version
+// and not (devel); otherwise the version stays plain "dev".
+func devVersion(info *debug.BuildInfo, ok bool) string {
+	if !ok || info == nil {
+		return "dev"
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.revision" && setting.Value != "" {
+			return "dev+" + setting.Value
+		}
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return "dev+" + v
+	}
+	return "dev"
 }
 
 // vcsRevision returns the VCS revision recorded by the Go toolchain for

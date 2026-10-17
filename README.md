@@ -21,7 +21,23 @@ Status: under development. Nothing here is stable yet.
 
 ## Install
 
-With Go 1.26 or newer, from a checkout of the module `github.com/djalmajr/nau`:
+The recommended path is the install script: it puts the `nau` binary in the bin directory and the optional Herdr plugin in place, both from the same ref. Prerequisites: Go 1.26 or newer on the `PATH` and, for the plugin step, Herdr on the `PATH`.
+
+On macOS and Linux:
+
+```text
+sh scripts/install.sh [--ref main] [--bin-dir $HOME/.local/bin] [--machine-label <label>] [--no-plugin]
+```
+
+On Windows (PowerShell):
+
+```text
+powershell -File scripts\install.ps1 [-Ref main] [-BinDir $env:USERPROFILE\.local\bin] [-MachineLabel <label>] [-NoPlugin]
+```
+
+Updating is re-running the same script with another `--ref`. The script sets `machine_label` only when it is still empty, never installs over a plugin linked to a local path (run `herdr plugin unlink djalmajr.herdr-hermes` first), and finishes with `nau version` and the informational `nau doctor`.
+
+For development, from a checkout of the module `github.com/djalmajr/nau`:
 
 ```text
 go build -o <dir>/nau ./cmd/nau
