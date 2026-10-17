@@ -57,6 +57,39 @@ const (
 
 // Test seams: the serve context, the notice sender constructor and the
 // loop intervals, like serveContext/newServeExec of the registry serve.
+// The bounds of one owner or guardian notice send. The serve delivers in
+// the background, so a generous bound costs no caller a wait, while a
+// send killed in flight is uncertain and never resent: soho can take
+// longer than its --timeout to observe the receipt on a slow or busy
+// recipient (a pi pane on a Windows node took 8 to 12 s while idle).
+// The whole attempt, the agent_not_ready retries included, stays under
+// notify.LeaseDuration, so a claim never expires while its send runs
+// and the same notice is never claimed and sent twice.
+const (
+	// a2aNoticeSendTimeout is the soho send --timeout of a notice.
+	a2aNoticeSendTimeout = 15 * time.Second
+	// a2aNoticeSendBound bounds one soho send process.
+	a2aNoticeSendBound = 40 * time.Second
+	// a2aNoticeSendTotal bounds one delivery attempt, retries included.
+	a2aNoticeSendTotal = 50 * time.Second
+)
+
+// a2aNoticeSender bounds every notice send of the delivery loop by
+// total, through the context: the inner soho sender then skips an
+// agent_not_ready retry that would not fit and kills a send that
+// reaches the deadline.
+type a2aNoticeSender struct {
+	inner notify.Sender
+	total time.Duration
+}
+
+// Send delivers one notice within s.total.
+func (s a2aNoticeSender) Send(ctx context.Context, ref, message string) notify.SendResult {
+	ctx, cancel := context.WithTimeout(ctx, s.total)
+	defer cancel()
+	return s.inner.Send(ctx, ref, message)
+}
+
 var (
 	// a2aServeContext is the signal-bound context of the a2a serve loop;
 	// the tests replace it with a context they cancel.
@@ -66,7 +99,10 @@ var (
 	// newA2aNoticeSender builds the soho notice sender of the
 	// delivery loop; the tests replace it with an in-memory fake.
 	newA2aNoticeSender = func(bin string, environ []string) notify.Sender {
-		return soho.NotifySender{Bin: bin, Environ: environ}
+		return a2aNoticeSender{
+			inner: soho.NotifySender{Bin: bin, Environ: environ, Timeout: a2aNoticeSendTimeout, Bound: a2aNoticeSendBound},
+			total: a2aNoticeSendTotal,
+		}
 	}
 	// a2aDefaultDeliverInterval is the delivery interval of the serve
 	// when --deliver-interval is absent; the tests replace it to run the
