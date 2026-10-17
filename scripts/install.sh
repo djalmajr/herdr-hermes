@@ -84,7 +84,8 @@ fi
 # A dedicated temp dir, removed on any exit: the fresh binary is built
 # there before the installed one is touched.
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+STAGE=""
+trap 'rm -rf "$TMP"; if [ -n "$STAGE" ]; then rm -f "$STAGE"; fi' EXIT
 
 echo "nau install: installing $MODULE_PATH@$REF"
 GOBIN="$TMP" GOPROXY=direct go install "$MODULE_PATH@$REF"
@@ -102,6 +103,7 @@ mkdir -p "$BIN_DIR"
 STAGE="$BIN_DIR/.nau.new.$$"
 cp "$TMP/nau" "$STAGE"
 mv "$STAGE" "$BIN_DIR/nau"
+STAGE=""
 NAU="$BIN_DIR/nau"
 
 # Set machine_label only when it is still empty; never print the value.
@@ -109,7 +111,7 @@ if [ -n "$MACHINE_LABEL" ]; then
     CURRENT="$("$NAU" config get machine_label 2>/dev/null)" || CURRENT=""
     CURRENT_VALUE="$(printf '%s\n' "$CURRENT" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')"
     if [ -z "$CURRENT_VALUE" ]; then
-        "$NAU" config set machine_label "$MACHINE_LABEL"
+        "$NAU" config set machine_label "$MACHINE_LABEL" >/dev/null
         echo "nau install: machine_label set" >&2
     else
         echo "nau install: machine_label is already set; keeping the current value" >&2
@@ -128,7 +130,7 @@ else
         *'"plugin_id":"djalmajr.herdr-hermes"'*)
             # Installed: a local origin (herdr plugin link) is refused,
             # a GitHub origin is updated in place.
-            KIND="$(printf '%s\n' "$LIST" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')"
+            KIND="$(printf '%s\n' "$LIST" | sed -n 's/.*"source":{[^}]*"kind":"\([^"]*\)".*/\1/p')"
             if [ -z "$KIND" ]; then
                 echo "nau install: could not determine the source of the installed herdr plugin $PLUGIN_ID; if it is linked to a local path, run 'herdr plugin unlink $PLUGIN_ID' first" >&2
                 exit 1
