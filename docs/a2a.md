@@ -132,6 +132,33 @@ A subscription is bound to the recorded reference, never to a token, because Nau
 - Levels of evidence: the hermetic tests prove the documented behaviour against a temporary database and loopback HTTP calls; a local run of `nau a2a serve` proves that the agent starts, binds the loopback address and serves the card and the task calls against a real database on that machine; remote callers, real push deliveries to a caller's webhook and an injected identity provider would be proven only in a production environment, and none of that has been proven in production in this release.
 - Future work: an authenticated ingress and a private-network policy are future work and are not part of this release.
 
+### Running the agent as a service
+
+The install scripts can run `nau a2a serve` as a user service on macOS and Windows, and restart it on every update, so the node never keeps running an old binary: `sh scripts/install.sh --serve` and `powershell -File scripts\install.ps1 -Serve` install the service (or rewrite it when it already exists) and (re)start it, a re-run without the option restarts the already-installed service after the binary swap, and a re-run on a node without the service creates nothing. `--serve-dry-run` / `-ServeDryRun` print what the service would install (the whole LaunchAgent plist on macOS; the executable, the action arguments, the triggers and the settings, one per line, on Windows) and exit 0 before touching anything.
+
+- On macOS the service is the LaunchAgent `djalmajr.nau.a2a-serve` in `$HOME/Library/LaunchAgents` (`RunAtLoad` and `KeepAlive`, `ThrottleInterval` 10); the log is `$HOME/Library/Logs/nau/a2a-serve.log` (stdout and stderr); the `PATH` it gets is the bin directory, the `soho` and the `herdr` directories (resolved on the PATH at install time) and `/usr/bin:/bin:/usr/sbin:/sbin`, in that order and without duplication — a missing `soho` or `herdr` only warns, and the serve runs without sending its notices.
+- On Windows the service is the scheduled task `nau a2a serve` in the root task path, running as the current user in the interactive session (principal `Interactive` / `Limited`), with a logon trigger and a once-now trigger that repeats every 5 minutes without a repetition duration (so a dead serve is re-erected); the action is `conhost.exe --headless cmd.exe /d /c "…"` so no console window opens in the session; the log is `%LOCALAPPDATA%\nau\a2a-serve.log`; a bin dir or `LOCALAPPDATA` containing a `"` or a `%` is refused (exit 2), because `cmd.exe` cannot quote those characters safely, and either containing a character above `0x7F` is refused as well (exit 2), because the wrapper `.cmd` is written in ASCII.
+- After (re)starting, the script repeats `nau a2a card --server http://127.0.0.1:7430` for up to 20 s and fails (exit 1) when the serve does not answer; on Windows the task is stopped first (which kills the `conhost` root only — a child can survive) and the process that still listens on `127.0.0.1:7430` is stopped only when its path is the bin dir's `nau.exe` (or a `nau.exe.old-*`): a process of another program is never stopped, the script warns and exits 1.
+- Removing the service: on macOS, `launchctl bootout gui/$(id -u)/djalmajr.nau.a2a-serve` and delete `$HOME/Library/LaunchAgents/djalmajr.nau.a2a-serve.plist`; on Windows, `Unregister-ScheduledTask -TaskName 'nau a2a serve' -Confirm:$false` and stop the process that listens on `127.0.0.1:7430`.
+
+The one-server-per-database rule above holds for the service as well: do not run a manual `nau a2a serve` while the service is installed, on the same database.
+
+### Calling a node over ssh
+
+The A2A client runs on the node itself (the agent binds loopback only), so a call to a node is an ssh command that runs the client with its quoted absolute path: the non-interactive PATH of an ssh session does not include the bin directory (for example `$HOME/.local/bin`), and the quoting keeps a remote `$HOME` with a space from splitting the path. Use `ssh -o BatchMode=yes` (no interactive password prompt) and `-n` when the command reads no stdin. For an arbitrary message text, pipe the text on stdin with `-` as the text argument, so the text is never quoted into the remote shell:
+
+```text
+printf '%s' "$TEXT" | ssh -o BatchMode=yes <node> '"$HOME/.local/bin/nau" a2a send --server http://127.0.0.1:7430 --session <id> --epoch 1 --seq 1 --project <org/repo> -'
+```
+
+A call that reads no stdin (for example the state of a task) runs with `-n`; on a Windows node the remote shell is `cmd.exe` and the expanded path is quoted (the `%USERPROFILE%` form, not the `$USERPROFILE` one):
+
+```text
+ssh -n -o BatchMode=yes <node> '"%USERPROFILE%\.local\bin\nau.exe" a2a get --server http://127.0.0.1:7430 --task <task id>'
+```
+
+Do not tunnel the loopback address (`ssh -L`): the request would then arrive at the agent from the node's own loopback and be admitted as the local operator (the subject `local`, every action on every project); the "No reverse proxy" deployment assumption above explains why that admission is reserved for the node's own loopback peer.
+
 ## Limitations
 
 - The binding is HTTP+JSON only: no gRPC, no streaming (a subscribe request is refused as unsupported), and the non-streaming `send` always returns immediately after the task is committed.

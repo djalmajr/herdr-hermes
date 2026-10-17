@@ -32,10 +32,12 @@ sh scripts/install.sh [--ref main] [--bin-dir $HOME/.local/bin] [--machine-label
 On Windows (PowerShell):
 
 ```text
-powershell -File scripts\install.ps1 [-Ref main] [-BinDir $env:USERPROFILE\.local\bin] [-MachineLabel <label>] [-NoPlugin]
+powershell -File scripts\install.ps1 [-Ref main] [-BinDir $env:USERPROFILE\.local\bin] [-MachineLabel <label>] [-NoPlugin] [-Serve]
 ```
 
 Updating is re-running the same script with another `--ref`. The script sets `machine_label` only when it is still empty, never installs over a plugin linked to a local path (run `herdr plugin unlink djalmajr.herdr-hermes` first), and finishes with `nau version` and the informational `nau doctor`.
+
+The script can also install `nau a2a serve` as a user service on macOS and Windows only — a LaunchAgent on macOS, the `nau a2a serve` scheduled task on Windows — with `--serve` (macOS) / `-Serve` (Windows), which installs or rewrites the service and (re)starts it; a re-run without the option restarts the already-installed service after the binary swap, so the node never keeps running an old binary, and `--serve-dry-run` / `-ServeDryRun` print what the service would install and exit 0 without touching anything (see [`docs/a2a.md`](docs/a2a.md#running-the-agent-as-a-service)).
 
 For development, from a checkout of the module `github.com/djalmajr/nau`:
 
