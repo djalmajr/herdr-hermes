@@ -311,7 +311,7 @@ type SendResult struct {
 	Exit int
 	// Category is a fixed error category on failure: "unavailable",
 	// "deadline", "busy", "uncertain", "refused", "usage", "unknown_agent",
-	// "exit".
+	// "not_ready", "exit".
 	Category string
 }
 
