@@ -67,9 +67,12 @@ const (
 // stop a killed child. One attempt, the agent_not_ready retries
 // included, is cancelled at a2aNoticeSendTotal, under
 // notify.LeaseDuration. A claim that waits behind the concurrent sends
-// of its pass can still outlive its lease; that is harmless because one
-// serve runs one pass at a time and completes every claim of a pass
-// before it claims again, and only one serve runs per database.
+// of its pass can still outlive its lease. Within one serve that leads
+// to no second send: passes do not overlap, and each send's result is
+// written before the next pass claims. Only a failed write of that
+// result leaves the claim in flight, to be claimed again after its
+// lease, as for a serve that stops mid-send. One serve runs per
+// database.
 const (
 	// a2aNoticeSendTimeout is the soho send --timeout of a notice.
 	a2aNoticeSendTimeout = 15 * time.Second
