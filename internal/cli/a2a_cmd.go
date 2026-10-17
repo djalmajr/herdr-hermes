@@ -61,10 +61,15 @@ const (
 // the background, so a generous bound costs no caller a wait, while a
 // send killed in flight is uncertain and never resent: soho can take
 // longer than its --timeout to observe the receipt on a slow or busy
-// recipient (a pi pane on a Windows node took 8 to 12 s while idle).
-// The whole attempt, the agent_not_ready retries included, stays under
-// notify.LeaseDuration, so a claim never expires while its send runs
-// and the same notice is never claimed and sent twice.
+// recipient (an idle agent pane on a Windows node took 8 to 12 s).
+// These are cancellation deadlines, measured from the start of each
+// send, not exact return times: the runner adds its own short grace to
+// stop a killed child. One attempt, the agent_not_ready retries
+// included, is cancelled at a2aNoticeSendTotal, under
+// notify.LeaseDuration. A claim that waits behind the concurrent sends
+// of its pass can still outlive its lease; that is harmless because one
+// serve runs one pass at a time and completes every claim of a pass
+// before it claims again, and only one serve runs per database.
 const (
 	// a2aNoticeSendTimeout is the soho send --timeout of a notice.
 	a2aNoticeSendTimeout = 15 * time.Second

@@ -77,7 +77,7 @@ The delivery states keep the notify semantics:
 - `no_route`, `self`: no registered recipient / the loop guard (final).
 - `obsolete`: the task ended (or never committed) before the send.
 
-Each notice send runs `soho send <ref> <notice> --now --timeout 15000`; the `soho` process is bounded at 40 s and the whole attempt, the `agent_not_ready` retries included, at 50 s, under the 60 s claim lease, so a claim never expires while its send runs. The serve delivers in the background, so this bound keeps no caller waiting, and `soho` can take longer than its `--timeout` to observe the receipt on a slow or busy recipient; a send killed at the bound is `uncertain`.
+Each notice send runs `soho send <ref> <notice> --now --timeout 15000`. The `soho` process is cancelled at 40 s, and the whole attempt, the `agent_not_ready` retries included, at 50 s, both counted from the start of the send and below the 60 s claim lease; they are cancellation deadlines, and stopping a killed child can take a few more seconds. The serve delivers in the background, so this bound keeps no caller waiting, and `soho` can take longer than its `--timeout` to observe the receipt on a slow or busy recipient; a send killed at the bound is `uncertain`. A claim that waits behind the concurrent sends of its pass can outlive its lease, which is harmless because a serve runs one delivery pass at a time and completes its claims before it claims again (one server per database, see Deployment assumptions).
 
 ## Durability
 
