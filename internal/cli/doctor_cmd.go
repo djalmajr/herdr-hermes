@@ -5,11 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/djalmajr/nau/internal/config"
 	"github.com/djalmajr/nau/internal/jobapi"
@@ -178,15 +181,21 @@ func doctorOutboxCounts(env Env) doctorOutbox {
 	return doctorOutbox{UltimoSeq: last, EntregueSeq: delivered, Pendentes: pending}
 }
 
-// wakeHookConfigured runs `soho config` with SOHO_NOWRITE=1 and
-// HERDR_SOHO_NOWRITE=1 in the child environment (see
-// backendNowriteEnviron) and classifies the job_wake_cmd value: "true"
-// when the trimmed value's first field is exactly "nau" and its second
-// field is exactly "wake", "false" when the output is parseable but
-// shows no such hook, "unknown" on a non-zero exit or unparseable
-// output.
+// wakeHookConfigured classifies the job_wake_cmd value the way the
+// backend's job reads it, in this order, each probe in the read-only
+// child environment (see backendNowriteEnviron): first
+// `soho config get job_wake_cmd`, whose trimmed first stdout line is
+// the effective value and an empty line means unset; then, on any
+// other exit or a run that did not finish, `soho config`, whose listed
+// job_wake_cmd row wins, else whose `user file:` path is read with the
+// backend's single-file config rules. It returns "true" or "false" for
+// a decided value and "unknown" when neither probe could be read or
+// parsed.
 func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string {
 	wakeRunner := soho.Runner{Bin: runner.Bin, Environ: backendNowriteEnviron(env), Now: runner.Now}
+	if value, ok := wakeConfigGet(ctx, &wakeRunner); ok {
+		return wakeValueClass(strings.Fields(value))
+	}
 	var out bytes.Buffer
 	exit, err := wakeRunner.Run(ctx, []string{"config"}, nil, &out, io.Discard, 120*time.Second)
 	if err != nil {
@@ -205,14 +214,44 @@ func wakeHookConfigured(ctx context.Context, runner soho.Runner, env Env) string
 	return parseWakeHook(out.String())
 }
 
+// wakeConfigGet runs `soho config get job_wake_cmd` and reports the
+// trimmed first line of its stdout. ok is false when the run failed,
+// the output did not drain or the child exited non-zero, so the caller
+// falls back to the plain `config` listing: the backend release that
+// cannot read a single key rejects the call with exit 2.
+func wakeConfigGet(ctx context.Context, wakeRunner *soho.Runner) (string, bool) {
+	var out bytes.Buffer
+	exit, err := wakeRunner.Run(ctx, []string{"config", "get", "job_wake_cmd"}, nil, &out, io.Discard, 120*time.Second)
+	if err != nil {
+		return "", false
+	}
+	select {
+	case <-wakeRunner.DrainDone():
+	case <-time.After(10 * time.Second):
+		return "", false
+	}
+	if exit != 0 {
+		return "", false
+	}
+	value := out.String()
+	if i := strings.IndexByte(value, '\n'); i >= 0 {
+		value = value[:i]
+	}
+	return sohoConfigTrim(value), true
+}
+
 // parseWakeHook classifies the `soho config` output. A line whose
-// first whitespace-separated field is job_wake_cmd decides the result:
-// true when the trimmed value's first field is exactly nau and its second
-// field is exactly wake; fields after the second, extra whitespace and the
-// source column are allowed. The rest of the output must be parseable as
-// key-value lines for the result to be false; otherwise it is unknown.
+// first whitespace-separated field is job_wake_cmd decides the result
+// with the value that follows the key (fields after the second, extra
+// whitespace and the source column allowed), which keeps the behavior
+// with a backend that lists the key. When no such row is present but a
+// `user file:` line is, the path after the prefix is read with the
+// backend's single-file config rules (the applyConfigText mirror) and
+// classified. The rest of the output must be parseable as key-value
+// lines for the result to be false; otherwise it is unknown.
 func parseWakeHook(output string) string {
 	parseable := false
+	userFile := ""
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
@@ -220,15 +259,235 @@ func parseWakeHook(output string) string {
 		}
 		parseable = true
 		if fields[0] == "job_wake_cmd" {
-			value := strings.Fields(line[len(fields[0]):])
-			if len(value) >= 2 && value[0] == ProgramNau && value[1] == "wake" {
-				return "true"
-			}
-			return "false"
+			return wakeValueClass(strings.Fields(line[len(fields[0]):]))
 		}
+		if rest, ok := strings.CutPrefix(sohoConfigTrim(line), "user file:"); ok {
+			userFile = sohoConfigTrim(rest)
+		}
+	}
+	if userFile != "" {
+		return wakeHookFromUserFile(userFile)
 	}
 	if parseable {
 		return "false"
 	}
 	return "unknown"
+}
+
+// wakeHookFromUserFile reads the backend user config file at path with
+// the backend's own single-file rules (sohoUserConfigValue) and
+// classifies the job_wake_cmd value: an absent file or a file without
+// the key gives false, a read error that is not a missing file gives
+// unknown.
+func wakeHookFromUserFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "false"
+		}
+		return "unknown"
+	}
+	return wakeValueClass(strings.Fields(sohoUserConfigValue(data, "job_wake_cmd")))
+}
+
+// wakeValueClass classifies the whitespace-separated fields of a
+// job_wake_cmd value on the operating system the doctor runs on.
+func wakeValueClass(fields []string) string {
+	return wakeValueClassFor(fields, runtime.GOOS == "windows")
+}
+
+// wakeValueClassFor is wakeValueClass for a given platform: on Windows
+// the .exe form of the program name in any casing counts and the
+// backslash is a separator.
+func wakeValueClassFor(fields []string, windows bool) string {
+	if wakeValueAccepted(fields, windows) {
+		return "true"
+	}
+	return "false"
+}
+
+// wakeValueAccepted reports whether the whitespace-separated fields of
+// a job_wake_cmd value name the nau wake hook: the first field is
+// accepted by wakeProgramAccepted and the second field is exactly
+// wake. Fields after the second are allowed; the retired herdr-hermes
+// name, nau-wake, nauwake and wakeup, and any other program are
+// rejected.
+func wakeValueAccepted(fields []string, windows bool) bool {
+	return len(fields) >= 2 && fields[1] == "wake" && wakeProgramAccepted(fields[0], windows)
+}
+
+// wakeProgramAccepted reports whether the first field of a
+// job_wake_cmd value names the nau binary: exactly nau, or a path
+// whose last element is nau (the separators of the platform named by
+// windows, where the backslash counts too); on Windows the last
+// element also counts in the .exe form in any casing. A first field
+// that ends in a separator (a forward slash on the unix operating
+// systems, a forward or back slash on Windows) names a directory, not
+// an executable, and is rejected before the last element is taken; on
+// Windows a leading letter volume prefix (C:) is dropped before the
+// last element is taken, the standard library's Windows volume-name
+// handling for the letter form (UNC and the long-path prefix are out
+// of scope). The file's existence is not checked: the doctor only
+// reports.
+func wakeProgramAccepted(first string, windows bool) bool {
+	if first == ProgramNau {
+		return true
+	}
+	if strings.HasSuffix(first, "/") || (windows && strings.HasSuffix(first, "\\")) {
+		return false
+	}
+	name := first
+	if windows {
+		if len(name) >= 2 && name[1] == ':' && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')) {
+			name = name[2:]
+		}
+		if i := strings.LastIndexAny(name, "/\\"); i >= 0 {
+			name = name[i+1:]
+		}
+	} else {
+		// path.Base, not filepath.Base: the unix rules must not depend on
+		// the host, so a Windows host running this branch (the tests do)
+		// does not drop a volume prefix or treat a backslash as a separator.
+		name = path.Base(first)
+	}
+	if name == ProgramNau {
+		return true
+	}
+	return windows && strings.EqualFold(name, ProgramNau+".exe")
+}
+
+// sohoUserConfigValue extracts the last value of key from the raw bytes
+// of a backend user config file, mirroring the rules of the backend's
+// own single-file parser exactly as its job reads the file: the bytes
+// are decoded like the backend decodes them (WHATWG UTF-8 with
+// U+FFFD for malformed sequences, then CRLF line endings as LF), a line
+// is cut at its first # wherever that is, the remainder is trimmed with
+// the backend's whitespace set, a blank line or a line without = is
+// ignored, the key before the first = is trimmed and normalized (the
+// JavaScript whitespace removed, . and - become _, only letters, digits
+// and _ remain, and the case is not changed), an empty key is ignored,
+// the value after the = is trimmed and a value of two or more
+// characters that starts and ends with a double quote loses one pair
+// of quotes, and the last occurrence of the normalized key wins.
+func sohoUserConfigValue(data []byte, key string) string {
+	value := ""
+	for _, rawLine := range strings.Split(sohoDecodeText(data), "\n") {
+		if hash := strings.IndexByte(rawLine, '#'); hash >= 0 {
+			rawLine = rawLine[:hash]
+		}
+		line := sohoConfigTrim(rawLine)
+		if line == "" {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		normKey := sohoNormalizeKey(sohoConfigTrim(line[:eq]))
+		v := sohoConfigTrim(line[eq+1:])
+		if len(v) >= 2 && strings.HasPrefix(v, "\"") && strings.HasSuffix(v, "\"") {
+			v = v[1 : len(v)-1]
+		}
+		if normKey == key {
+			value = v
+		}
+	}
+	return value
+}
+
+// sohoNormalizeKey normalizes a raw config key the way the backend
+// normalizes it: the JavaScript whitespace is removed, . and - become
+// _, only the letters, digits and _ survive, and the case is kept as
+// written.
+func sohoNormalizeKey(raw string) string {
+	var b strings.Builder
+	for _, r := range raw {
+		if isSohoConfigWhitespace(r) {
+			continue
+		}
+		if r == '.' || r == '-' {
+			b.WriteByte('_')
+			continue
+		}
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// sohoDecodeText decodes the raw bytes of a backend text file the way
+// the backend decodes them: WHATWG UTF-8 with the replacement character
+// for a malformed sequence, then CRLF line endings as LF. A leading byte
+// order mark survives the decode as a character: the backend's
+// whitespace trim removes it from a line.
+func sohoDecodeText(data []byte) string {
+	return strings.ReplaceAll(sohoDecodeWHATWGUTF8(data), "\r\n", "\n")
+}
+
+// sohoDecodeWHATWGUTF8 is the backend's UTF-8 decode: ASCII bytes pass
+// through, a multi-byte lead byte (the two-, three- and four-byte forms
+// without overlong, surrogate or out-of-range encodings) passes with
+// its continuation bytes, and any malformed byte or sequence yields one
+// U+FFFD and advances past the bytes it consumed.
+func sohoDecodeWHATWGUTF8(data []byte) string {
+	var out strings.Builder
+	for i := 0; i < len(data); {
+		b := data[i]
+		if b < 0x80 {
+			out.WriteByte(b)
+			i++
+			continue
+		}
+		n := 0
+		if b >= 0xC2 && b <= 0xDF {
+			n = 2
+		} else if b >= 0xE0 && b <= 0xEF {
+			n = 3
+		} else if b >= 0xF0 && b <= 0xF4 {
+			n = 4
+		}
+		if n == 0 {
+			out.WriteRune('\uFFFD')
+			i++
+			continue
+		}
+		consumed := 1
+		valid := true
+		for j := 1; j < n; j++ {
+			if i+j >= len(data) {
+				valid = false
+				break
+			}
+			c := data[i+j]
+			if c < 0x80 || c > 0xBF || (j == 1 && ((b == 0xE0 && c < 0xA0) || (b == 0xED && c > 0x9F) || (b == 0xF0 && c < 0x90) || (b == 0xF4 && c > 0x8F))) {
+				valid = false
+				break
+			}
+			consumed++
+		}
+		if !valid {
+			out.WriteRune('\uFFFD')
+			i += consumed
+			continue
+		}
+		out.Write(data[i : i+n])
+		i += n
+	}
+	return out.String()
+}
+
+// sohoConfigTrim trims the whitespace set the backend's config parser
+// uses: the JavaScript whitespace class (tab, line terminators, the
+// unicode space separators, the line and paragraph separators and the
+// byte order mark).
+func sohoConfigTrim(value string) string {
+	return strings.TrimFunc(value, isSohoConfigWhitespace)
+}
+
+// isSohoConfigWhitespace reports whether r is in the backend's config
+// whitespace set.
+func isSohoConfigWhitespace(r rune) bool {
+	return r == '\t' || r == '\n' || r == '\v' || r == '\f' || r == '\r' || r == ' ' ||
+		unicode.Is(unicode.Zs, r) || r == '\u2028' || r == '\u2029' || r == '\ufeff'
 }
